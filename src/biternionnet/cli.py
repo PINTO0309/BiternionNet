@@ -11,6 +11,7 @@ from .converters import (
     convert_idiap_pickle,
     convert_pickle_classification,
     convert_tosato_classification,
+    convert_towncentre_raw,
     convert_towncentre_pickle,
 )
 from .experiments import list_experiments
@@ -68,16 +69,20 @@ def eval_command(
 
 def convert_command(
     source: Path = typer.Option(..., exists=True, readable=True, help="Source dataset metadata."),
-    kind: str = typer.Option(..., help="tosato-classification, pickle-classification, towncentre-pickle, idiap-pickle, caviar-pickle."),
+    kind: str = typer.Option(..., help="tosato-classification, pickle-classification, towncentre-raw, towncentre-pickle, idiap-pickle, caviar-pickle."),
     output: Path = typer.Option(..., help="Output JSONL manifest."),
     train_root: str = typer.Option("", help="Training image root for CAVIAR-like pickles."),
     test_root: str = typer.Option("", help="Test image root for CAVIAR-like pickles."),
     image_root: str = typer.Option("TownCentreHeadImages", help="Image root for TownCentre pickle conversion."),
+    train_split: float = typer.Option(0.9, min=0.0, max=1.0, help="Train split ratio for raw TownCentre conversion."),
+    seed: int = typer.Option(0, help="Random seed for raw TownCentre person-level split."),
 ) -> None:
     if kind == "tosato-classification":
         convert_tosato_classification(source, output)
     elif kind == "pickle-classification":
         convert_pickle_classification(source, output)
+    elif kind == "towncentre-raw":
+        convert_towncentre_raw(source, output, train_split=train_split, seed=seed)
     elif kind == "towncentre-pickle":
         convert_towncentre_pickle(source, output, image_root=image_root)
     elif kind == "idiap-pickle":
@@ -128,8 +133,10 @@ def convert_subcommand(
     train_root: str = typer.Option(""),
     test_root: str = typer.Option(""),
     image_root: str = typer.Option("TownCentreHeadImages"),
+    train_split: float = typer.Option(0.9, min=0.0, max=1.0),
+    seed: int = typer.Option(0),
 ) -> None:
-    convert_command(source, kind, output, train_root, test_root, image_root)
+    convert_command(source, kind, output, train_root, test_root, image_root, train_split, seed)
 
 
 def main_train() -> None:

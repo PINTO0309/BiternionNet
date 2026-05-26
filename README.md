@@ -79,24 +79,15 @@ List experiment presets:
 uv run --locked biternion list-experiments
 ```
 
-Train:
+Create a TownCentre manifest from the dataset extracted by `download_data.py`:
 
 ```bash
-uv run --locked biternion-train \
---experiment towncentre-biternion \
---manifest data/custom/manifest.jsonl \
---backbone-activation relu \
---output runs/towncentre-biternion
-```
-
-Use `--backbone-activation swish` to replace backbone ReLU activations with Swish/SiLU for ablation runs.
-
-Evaluate:
-
-```bash
-uv run --locked biternion-eval \
---checkpoint runs/towncentre-biternion/best.pt \
---manifest data/custom/manifest.jsonl
+uv run --locked biternion-convert \
+--source data/TownCentreHeadImages \
+--kind towncentre-raw \
+--output data/towncentre/manifest.jsonl \
+--train-split 0.9 \
+--seed 0
 ```
 
 Convert existing Tosato JSON metadata:
@@ -106,6 +97,33 @@ uv run --locked biternion-convert \
 --source data/QMULPoseHeads.json \
 --kind tosato-classification \
 --output data/qmul/manifest.jsonl
+```
+
+Train after creating a manifest:
+
+```bash
+uv run --locked biternion-train \
+--experiment towncentre-biternion \
+--manifest data/towncentre/manifest.jsonl \
+--backbone-activation relu \
+--output runs/towncentre-biternion
+```
+```bash
+uv run --locked biternion-train \
+--experiment towncentre-biternion-vonmises \
+--manifest data/towncentre/manifest.jsonl \
+--backbone-activation relu \
+--output runs/towncentre-biternion-vonmises
+```
+
+Use `--backbone-activation swish` to replace backbone ReLU activations with Swish/SiLU for ablation runs.
+
+Evaluate:
+
+```bash
+uv run --locked biternion-eval \
+--checkpoint runs/towncentre-biternion/best.pt \
+--manifest data/towncentre/manifest.jsonl
 ```
 
 ## Experiment Presets
