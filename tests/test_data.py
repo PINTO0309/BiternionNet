@@ -14,6 +14,12 @@ def _write_image(path: Path, value: int = 127) -> None:
     cv2.imwrite(str(path), image)
 
 
+def _write_sized_image(path: Path, size: tuple[int, int], value: int = 127) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image = np.full((size[0], size[1], 3), value, dtype=np.uint8)
+    cv2.imwrite(str(path), image)
+
+
 def test_flip_label_classification_and_angle():
     assert flip_label({"task": "classification", "label": "left"}, {"left": "right"})["label"] == "right"
     assert flip_label({"task": "angle_deg", "angle_deg": 30.0})["angle_deg"] == 330.0
@@ -41,3 +47,15 @@ def test_manifest_dataset_shapes_for_tasks(tmp_path):
     assert tuple(image.shape) == (3, 46, 46)
     assert target.dtype == torch.long
 
+
+def test_manifest_dataset_resizes_small_images_before_crop(tmp_path):
+    _write_sized_image(tmp_path / "images" / "small.jpg", (25, 23))
+    manifest = tmp_path / "manifest.jsonl"
+    write_manifest(
+        [{"split": "train", "image": "images/small.jpg", "task": "angle_deg", "angle_deg": 90.0}],
+        manifest,
+    )
+    dataset = ManifestDataset(manifest, "train", "angle_deg", crop=CropConfig((46, 46)))
+    image, target = dataset[0]
+    assert tuple(image.shape) == (3, 46, 46)
+    assert target.item() == 90.0

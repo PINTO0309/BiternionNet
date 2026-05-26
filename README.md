@@ -178,7 +178,7 @@ uv run --locked python scripts/inspect_dataset.py data/custom/manifest.jsonl
 
 ## Notes
 
-- Images are loaded with OpenCV, converted from BGR to RGB, scaled to `float32` in `[0, 1]`, cropped, and returned as `C,H,W` tensors.
+- Images are loaded with OpenCV, converted from BGR to RGB, scaled to `float32` in `[0, 1]`, resized if needed to satisfy the requested crop, cropped, and returned as `C,H,W` tensors.
 - The `uv` interpreter is pinned to Python `3.13.11` in `.python-version`; package metadata allows Python `>=3.11`.
 - Direct runtime dependencies and the build backend are pinned exactly in `pyproject.toml`; resolved transitive dependencies and artifact hashes are recorded in `uv.lock`.
 - Checkpoints contain `model_state_dict`, `optimizer_state_dict`, the experiment config, `class_to_idx`, and metric history. Quantization borders/centres are included inside the experiment config for quantized presets.

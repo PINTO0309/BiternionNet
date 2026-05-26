@@ -67,7 +67,10 @@ def crop_image(image: np.ndarray, crop: CropConfig | None) -> np.ndarray:
     crop_h, crop_w = crop.size
     h, w = image.shape[:2]
     if h < crop_h or w < crop_w:
-        raise ValueError(f"Image shape {(h, w)} is smaller than requested crop {(crop_h, crop_w)}")
+        resize_h = max(h, crop_h)
+        resize_w = max(w, crop_w)
+        image = cv2.resize(image, (resize_w, resize_h), interpolation=cv2.INTER_LANCZOS4)
+        h, w = image.shape[:2]
     if crop.random_crop:
         top = random.randint(0, h - crop_h)
         left = random.randint(0, w - crop_w)
@@ -170,4 +173,3 @@ def open_pickle(path: str | Path):
             return pickle.load(f)
     with path.open("rb") as f:
         return pickle.load(f)
-
