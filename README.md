@@ -83,26 +83,26 @@ Train:
 
 ```bash
 uv run --locked biternion-train \
-  --experiment towncentre-biternion \
-  --manifest data/custom/manifest.jsonl \
-  --output runs/towncentre-biternion
+--experiment towncentre-biternion \
+--manifest data/custom/manifest.jsonl \
+--output runs/towncentre-biternion
 ```
 
 Evaluate:
 
 ```bash
 uv run --locked biternion-eval \
-  --checkpoint runs/towncentre-biternion/best.pt \
-  --manifest data/custom/manifest.jsonl
+--checkpoint runs/towncentre-biternion/best.pt \
+--manifest data/custom/manifest.jsonl
 ```
 
 Convert existing Tosato JSON metadata:
 
 ```bash
 uv run --locked biternion-convert \
-  --source data/QMULPoseHeads.json \
-  --kind tosato-classification \
-  --output data/qmul/manifest.jsonl
+--source data/QMULPoseHeads.json \
+--kind tosato-classification \
+--output data/qmul/manifest.jsonl
 ```
 
 ## Experiment Presets
@@ -145,8 +145,8 @@ Run TownCentre experiments:
 
 ```bash
 uv run --locked python scripts/run_towncentre.py \
-  --manifest data/towncentre/manifest.jsonl \
-  --output-root runs/towncentre
+--manifest data/towncentre/manifest.jsonl \
+--output-root runs/towncentre
 ```
 
 Inspect a manifest:
