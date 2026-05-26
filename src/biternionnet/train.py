@@ -160,13 +160,14 @@ def train_model(
     epochs: int | None = None,
     batch_size: int | None = None,
     lr: float | None = None,
+    backbone_activation: str | None = None,
     seed: int = 0,
     device_name: str | None = None,
     num_workers: int = 0,
     train_flip_probability: float = 0.5,
 ) -> dict[str, Any]:
     set_seed(seed)
-    config = with_overrides(get_experiment(experiment), epochs, batch_size, lr)
+    config = with_overrides(get_experiment(experiment), epochs, batch_size, lr, backbone_activation)
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     device = torch.device(device_name or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -181,6 +182,7 @@ def train_model(
             head=config.model_head,
             variant=config.model_variant,
             input_size=config.input_size,
+            backbone_activation=config.backbone_activation,
         )
     ).to(device)
     criterion = _loss(config)
@@ -267,10 +269,15 @@ def evaluate_checkpoint(
     )
     loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=False, num_workers=num_workers)
     model = build_model(
-        ModelConfig(_output_dim(config, class_to_idx), config.model_head, config.model_variant, config.input_size)
+        ModelConfig(
+            _output_dim(config, class_to_idx),
+            config.model_head,
+            config.model_variant,
+            config.input_size,
+            config.backbone_activation,
+        )
     ).to(device)
     model.load_state_dict(checkpoint_data["model_state_dict"])
     metrics = evaluate_model(model, loader, config, device)
     print(json.dumps(metrics, sort_keys=True))
     return metrics
-

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Annotated, Optional
 
 import typer
 
@@ -17,6 +17,7 @@ from .experiments import list_experiments
 from .train import evaluate_checkpoint, train_model
 
 app = typer.Typer(help="PyTorch BiternionNet training utilities.")
+BackboneActivation = Annotated[str, typer.Option(help="Backbone activation: relu or swish.")]
 
 
 @app.command("list-experiments")
@@ -32,6 +33,7 @@ def train_command(
     epochs: Optional[int] = typer.Option(None, help="Override epoch count."),
     batch_size: Optional[int] = typer.Option(None, help="Override batch size."),
     lr: Optional[float] = typer.Option(None, help="Override learning rate."),
+    backbone_activation: BackboneActivation = "relu",
     seed: int = typer.Option(0, help="Random seed."),
     device: Optional[str] = typer.Option(None, help="Torch device, e.g. cpu or cuda."),
     num_workers: int = typer.Option(0, help="DataLoader worker count."),
@@ -44,6 +46,7 @@ def train_command(
         epochs=epochs,
         batch_size=batch_size,
         lr=lr,
+        backbone_activation=backbone_activation,
         seed=seed,
         device_name=device,
         num_workers=num_workers,
@@ -96,12 +99,13 @@ def train_subcommand(
     epochs: Optional[int] = typer.Option(None),
     batch_size: Optional[int] = typer.Option(None),
     lr: Optional[float] = typer.Option(None),
+    backbone_activation: BackboneActivation = "relu",
     seed: int = typer.Option(0),
     device: Optional[str] = typer.Option(None),
     num_workers: int = typer.Option(0),
     train_flip_probability: float = typer.Option(0.5, min=0.0, max=1.0),
 ) -> None:
-    train_command(experiment, manifest, output, epochs, batch_size, lr, seed, device, num_workers, train_flip_probability)
+    train_command(experiment, manifest, output, epochs, batch_size, lr, backbone_activation, seed, device, num_workers, train_flip_probability)
 
 
 @app.command("eval")
@@ -138,4 +142,3 @@ def main_eval() -> None:
 
 def main_convert() -> None:
     typer.run(convert_command)
-

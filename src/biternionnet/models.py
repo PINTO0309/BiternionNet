@@ -14,6 +14,7 @@ class ModelConfig:
     head: str
     variant: str = "standard"
     input_size: tuple[int, int] = (46, 46)
+    backbone_activation: str = "relu"
 
 
 class BiternionHead(nn.Module):
@@ -21,37 +22,45 @@ class BiternionHead(nn.Module):
         return normalize_biternion(x)
 
 
-def _conv_block(in_channels: int, out_channels: int) -> list[nn.Module]:
+def _activation(name: str) -> nn.Module:
+    if name == "relu":
+        return nn.ReLU(inplace=True)
+    if name == "swish":
+        return nn.SiLU(inplace=True)
+    raise ValueError(f"Unsupported backbone activation: {name}")
+
+
+def _conv_block(in_channels: int, out_channels: int, activation: str) -> list[nn.Module]:
     return [
         nn.Conv2d(in_channels, out_channels, kernel_size=3),
         nn.BatchNorm2d(out_channels),
-        nn.ReLU(inplace=True),
+        _activation(activation),
     ]
 
 
-def standard_backbone(extra_pool: bool = False) -> nn.Sequential:
+def standard_backbone(extra_pool: bool = False, activation: str = "relu") -> nn.Sequential:
     layers: list[nn.Module] = []
-    layers += _conv_block(3, 24)
-    layers += [nn.Conv2d(24, 24, kernel_size=3), nn.BatchNorm2d(24), nn.MaxPool2d(2), nn.ReLU(inplace=True)]
-    layers += _conv_block(24, 48)
-    layers += [nn.Conv2d(48, 48, kernel_size=3), nn.BatchNorm2d(48), nn.MaxPool2d(2), nn.ReLU(inplace=True)]
-    layers += _conv_block(48, 64)
-    layers += _conv_block(64, 64)
+    layers += _conv_block(3, 24, activation)
+    layers += [nn.Conv2d(24, 24, kernel_size=3), nn.BatchNorm2d(24), nn.MaxPool2d(2), _activation(activation)]
+    layers += _conv_block(24, 48, activation)
+    layers += [nn.Conv2d(48, 48, kernel_size=3), nn.BatchNorm2d(48), nn.MaxPool2d(2), _activation(activation)]
+    layers += _conv_block(48, 64, activation)
+    layers += _conv_block(64, 64, activation)
     if extra_pool:
         layers += [nn.MaxPool2d(2)]
     return nn.Sequential(*layers)
 
 
-def hoc_backbone() -> nn.Sequential:
+def hoc_backbone(activation: str = "relu") -> nn.Sequential:
     layers: list[nn.Module] = []
-    layers += _conv_block(3, 24)
-    layers += _conv_block(24, 24)
-    layers += [nn.Conv2d(24, 24, kernel_size=3), nn.BatchNorm2d(24), nn.MaxPool2d((3, 2)), nn.ReLU(inplace=True)]
-    layers += _conv_block(24, 48)
-    layers += _conv_block(48, 48)
-    layers += [nn.Conv2d(48, 48, kernel_size=3), nn.BatchNorm2d(48), nn.MaxPool2d(3), nn.ReLU(inplace=True)]
-    layers += _conv_block(48, 64)
-    layers += _conv_block(64, 64)
+    layers += _conv_block(3, 24, activation)
+    layers += _conv_block(24, 24, activation)
+    layers += [nn.Conv2d(24, 24, kernel_size=3), nn.BatchNorm2d(24), nn.MaxPool2d((3, 2)), _activation(activation)]
+    layers += _conv_block(24, 48, activation)
+    layers += _conv_block(48, 48, activation)
+    layers += [nn.Conv2d(48, 48, kernel_size=3), nn.BatchNorm2d(48), nn.MaxPool2d(3), _activation(activation)]
+    layers += _conv_block(48, 64, activation)
+    layers += _conv_block(64, 64, activation)
     return nn.Sequential(*layers)
 
 
@@ -60,11 +69,11 @@ class HeadPoseNet(nn.Module):
         super().__init__()
         self.config = config
         if config.variant == "hoc":
-            self.backbone = hoc_backbone()
+            self.backbone = hoc_backbone(config.backbone_activation)
         elif config.variant == "idiap":
-            self.backbone = standard_backbone(extra_pool=True)
+            self.backbone = standard_backbone(extra_pool=True, activation=config.backbone_activation)
         elif config.variant == "standard":
-            self.backbone = standard_backbone(extra_pool=False)
+            self.backbone = standard_backbone(extra_pool=False, activation=config.backbone_activation)
         else:
             raise ValueError(f"Unsupported model variant: {config.variant}")
 
@@ -101,4 +110,3 @@ class HeadPoseNet(nn.Module):
 
 def build_model(config: ModelConfig) -> HeadPoseNet:
     return HeadPoseNet(config)
-

@@ -14,6 +14,7 @@ class ExperimentConfig:
     loss: str
     input_size: tuple[int, int] = (46, 46)
     model_variant: str = "standard"
+    backbone_activation: str = "relu"
     output_dim: int | None = None
     epochs: int = 50
     batch_size: int = 100
@@ -99,7 +100,13 @@ def get_experiment(name: str) -> ExperimentConfig:
         raise KeyError(f"Unknown experiment {name!r}. Known experiments: {known}") from exc
 
 
-def with_overrides(config: ExperimentConfig, epochs: int | None, batch_size: int | None, lr: float | None) -> ExperimentConfig:
+def with_overrides(
+    config: ExperimentConfig,
+    epochs: int | None,
+    batch_size: int | None,
+    lr: float | None,
+    backbone_activation: str | None = None,
+) -> ExperimentConfig:
     changes = {}
     if epochs is not None:
         changes["epochs"] = epochs
@@ -107,6 +114,10 @@ def with_overrides(config: ExperimentConfig, epochs: int | None, batch_size: int
         changes["batch_size"] = batch_size
     if lr is not None:
         changes["lr"] = lr
+    if backbone_activation is not None:
+        if backbone_activation not in {"relu", "swish"}:
+            raise ValueError("backbone_activation must be 'relu' or 'swish'")
+        changes["backbone_activation"] = backbone_activation
     return replace(config, **changes)
 
 
@@ -114,4 +125,3 @@ def quantization_arrays(config: ExperimentConfig) -> tuple[np.ndarray | None, np
     borders = None if config.quantization_borders is None else np.array(config.quantization_borders, dtype=np.float32)
     centres = None if config.quantization_centres is None else np.array(config.quantization_centres, dtype=np.float32)
     return borders, centres
-

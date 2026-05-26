@@ -85,8 +85,11 @@ Train:
 uv run --locked biternion-train \
 --experiment towncentre-biternion \
 --manifest data/custom/manifest.jsonl \
+--backbone-activation relu \
 --output runs/towncentre-biternion
 ```
+
+Use `--backbone-activation swish` to replace backbone ReLU activations with Swish/SiLU for ablation runs.
 
 Evaluate:
 
