@@ -15,6 +15,7 @@ from .converters import (
     convert_towncentre_pickle,
 )
 from .experiments import list_experiments
+from .onnx_export import export_checkpoint_to_onnx
 from .train import evaluate_checkpoint, train_model
 
 app = typer.Typer(help="PyTorch BiternionNet training utilities.")
@@ -65,6 +66,27 @@ def eval_command(
     num_workers: int = typer.Option(0, help="DataLoader worker count."),
 ) -> None:
     evaluate_checkpoint(checkpoint, manifest, split=split, device_name=device, batch_size=batch_size, num_workers=num_workers)
+
+
+def export_onnx_command(
+    checkpoint: Path = typer.Option(..., exists=True, readable=True, help="PyTorch checkpoint path."),
+    output_dir: Path = typer.Option(Path("onnx"), help="Directory for exported ONNX files."),
+    prefix: Optional[str] = typer.Option(None, help="Output filename prefix."),
+    opset: int = typer.Option(17, help="ONNX opset version."),
+    batch_size: int = typer.Option(1, min=1, help="Static export batch size and simplifier check batch size."),
+    device: str = typer.Option("cpu", help="Torch device used for export."),
+    simplify: bool = typer.Option(True, help="Run onnxsim-prebuilt optimization after export."),
+) -> None:
+    outputs = export_checkpoint_to_onnx(
+        checkpoint,
+        output_dir,
+        prefix=prefix,
+        opset=opset,
+        batch_size=batch_size,
+        device_name=device,
+        simplify_models=simplify,
+    )
+    typer.echo(json.dumps(outputs, indent=2, sort_keys=True))
 
 
 def convert_command(
@@ -125,6 +147,19 @@ def eval_subcommand(
     eval_command(checkpoint, manifest, split, device, batch_size, num_workers)
 
 
+@app.command("export-onnx")
+def export_onnx_subcommand(
+    checkpoint: Path = typer.Option(..., exists=True, readable=True),
+    output_dir: Path = typer.Option(Path("onnx")),
+    prefix: Optional[str] = typer.Option(None),
+    opset: int = typer.Option(17),
+    batch_size: int = typer.Option(1, min=1),
+    device: str = typer.Option("cpu"),
+    simplify: bool = typer.Option(True),
+) -> None:
+    export_onnx_command(checkpoint, output_dir, prefix, opset, batch_size, device, simplify)
+
+
 @app.command("convert")
 def convert_subcommand(
     source: Path = typer.Option(..., exists=True, readable=True),
@@ -149,3 +184,7 @@ def main_eval() -> None:
 
 def main_convert() -> None:
     typer.run(convert_command)
+
+
+def main_export_onnx() -> None:
+    typer.run(export_onnx_command)

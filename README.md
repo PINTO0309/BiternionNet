@@ -122,9 +122,20 @@ Evaluate:
 
 ```bash
 uv run --locked biternion-eval \
---checkpoint runs/towncentre-biternion/best.pt \
---manifest data/towncentre/manifest.jsonl
+  --checkpoint runs/towncentre-biternion/best.pt \
+  --manifest data/towncentre/manifest.jsonl
 ```
+
+Export a checkpoint to ONNX with opset 17 and optimize it with `onnxsim-prebuilt`:
+
+```bash
+uv run --locked biternion-export-onnx \
+--checkpoint runs/towncentre-biternion/best.pt \
+--output-dir runs/towncentre-biternion/ \
+--opset 17
+```
+
+This writes static and dynamic-batch ONNX files, plus `_sim.onnx` optimized versions. The model uses flatten + Linear layers, so spatial dimensions are fixed by the checkpoint experiment; the dynamic ONNX export intentionally makes only the batch axis dynamic.
 
 ## Experiment Presets
 
