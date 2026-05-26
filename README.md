@@ -1,95 +1,164 @@
 # BiternionNet
-Code used to produce the results of the paper "BiternionNets: Continuous Head Pose Regression from Discrete Training Labels"
 
-Note that I am still in the process of cleaning up my code so that it can (hopefully) be used by anyone besides myself,
-thus not everything is in here yet. It's on its way.
+PyTorch + `uv` training pipeline for the experiments from "BiternionNets: Continuous Head Pose Regression from Discrete Training Labels".
 
-# Requirements
+The original notebooks are kept as historical reference, but the supported execution path is now Python package code under `src/biternionnet` plus CLI commands.
 
-For running the experiments, you'll need to install recent versions of at least the following:
+## Acknowledgements
 
-- Python3
-- NumPy
-- SciPy
-- Matplotlib
-- OpenCV with Python bindings
-- Theano
-- Jupyter notebook (aka IPython)
+This repository is a refactored PyTorch + `uv` fork of Lucas Beyer's original [BiternionNet](https://github.com/lucasb-eyer/BiternionNet) implementation. The core idea, experiment structure, original notebook workflows, dataset preparation scripts, and the Biternion / von Mises comparison setup come from that project.
 
-I've written a [tutorial on installing all of them](http://lb.eyer.be/a/sci-env.html).
-You'll also need to clone and install my own toolbox(es):
+Please cite and credit the original work when using this code:
 
-- DeepFried2: `pip install git+https://github.com/lucasb-eyer/DeepFried2.git`
-- lbtoolbox: `pip install git+https://github.com/lucasb-eyer/lbtoolbox.git`
-
-Since most of my experiments are written in Jupyter notebook, you can directly look at them on Github or start a local server:
-
-```
-cd THIS_REPO
-jupyter notebook
+```bibtex
+@inproceedings{Beyer2015BiternionNets,
+  author = {Lucas Beyer and Alexander Hermans and Bastian Leibe},
+  title = {Biternion Nets: Continuous Head Pose Regression from Discrete Training Labels},
+  booktitle = {Pattern Recognition},
+  publisher = {Springer},
+  series = {Lecture Notes in Computer Science},
+  volume = {9358},
+  pages = {157-168},
+  year = {2015},
+  isbn = {978-3-319-24946-9},
+  doi = {10.1007/978-3-319-24947-6_13},
+  ee = {http://lucasb.eyer.be/academic/biternions/biternions_gcpr15.pdf}
+}
 ```
 
-# What's what?
+The changes in this fork are engineering changes around packaging, dependency management, PyTorch model/training code, JSONL manifests, and command-line execution. They are not intended to obscure or replace the authorship of the original research code.
 
-## `download_data.py`
+## Setup
 
-Simply running this file will download and extract all benchmark datasets necessary for the comparisons done in the paper.
-You *need* to run this file before most of the notebooks will work.
+```bash
+uv python install 3.13.11
+uv sync --locked
+```
 
-## `Inspection - Tosato Classification.ipynb`
+Run tests:
 
-While browsing through Tosato's classification datasets, I noticed some curious filenames, and used this notebook to investigate dataset-weirdnesses.
-Note that I did not attempt to fix any of the weirdness, as it would render comparisons meaningless.
+```bash
+uv run --locked pytest
+```
 
-Results:
+For reproducible installs, keep `pyproject.toml` and `uv.lock` committed and use the Python version in `.python-version` with `--locked` in CI. Use `--frozen` when you want commands to fail instead of updating the lock file:
 
-- `QMUL` contains files suffixed with ` - Copy`, such as `001633.jpg` followed by `001633 - Copy.jpg`.
-  These are actual exact copies. Whether this is unintended, or a hacky way to give some data more weight, I don't know.
-- `QMUL` contains files suffixed with `_f`, but they are unique and not flips of other files, as one might guess.
-- `HOCoffee` has a lot of identical filenames but of different types, e.g. `head (1).png` vs. `head (1).jpg`.
-- `HOC` (aka `ETHZ`) contains files with matching names such as `norm_0002002.jpg` and `norm_0002002 (3).jpg`. These don't seem related, though.
+```bash
+uv run --frozen pytest
+```
 
-Given the above, I exhaustively searched for mirroring in the dataset but found none, meaning that mirroring is a valid data augmentation step.
+## Manifest Format
 
-Besides the above, this notebook also plots the label distributions, which is mildly interesting.
+Training uses JSONL manifests. Image paths are relative to the manifest file unless absolute.
 
-## `Inspection - Regression.ipynb`
+Classification:
 
-This notebook takes a look at Tosato's orientation regression dasets (IDIAP, CAVIAR) and Benfold's dataset (TownCentre).
-Its purpose is to look at statistics of the dataset in order to determine whether they're well suited or not.
-Protip: they're not.
+```json
+{"split":"train","image":"images/0001.jpg","task":"classification","label":"front"}
+{"split":"test","image":"images/0002.jpg","task":"classification","label":"left"}
+```
 
-- `IDIAP`: Appears to already have flip-augmentation, even though there's no mention of it in Tosato's paper.
-- `CAVIAR`: The data is so weird I don't really want to do much with it. So no augmentation.
+Single-angle regression / Biternion:
 
-## `prepare_data.py`
+```json
+{"split":"train","image":"images/0001.jpg","task":"angle_deg","angle_deg":90.0}
+{"split":"test","image":"images/0002.jpg","task":"angle_deg","angle_deg":270.0}
+```
 
-Simply run this script without any arguments.
-It will load all the raw data, apply horizontal flip augmentation and then save the data into gzipped pickles for easier use from notebooks.
-This can take some time, even on fast machines.
-It's not optimized and took ~50min on my high-end desktop, but it's a one-off thing so just read some paper while it's working.
+Three-axis radian pose regression:
 
-You can optionally specify the name of one or more datasets as arguments and only those will be processed, e.g. `./prepare_data.py QMUL HIIT`.
+```json
+{"split":"train","image":"images/0001.jpg","task":"pose_rad","pan":0.1,"tilt":-0.2,"roll":0.0}
+```
 
-## `Experiments - Tosato.ipynb`
+## CLI
 
-Reproduction of the experiments on Tosato's benchmark datasets.
-There's nothing really interesting here, just reproducibility.
+List experiment presets:
 
-## `Experiments - TownCentre.ipynb`
+```bash
+uv run --locked biternion list-experiments
+```
 
-Reproduction of the experiments on Benfold's TownCentre dataset.
+Train:
 
-This is much more interesting, as this analyses both the Biternion output
-as well as the von-Mises criterion.
+```bash
+uv run --locked biternion-train \
+  --experiment towncentre-biternion \
+  --manifest data/custom/manifest.jsonl \
+  --output runs/towncentre-biternion
+```
 
-One caveat is that because there's no official train/test split, the results
-will vary every run due to the random split. With only ~7k training data and
-less than 1k test data, the variance may be considerable.
-The relative improvement remains unchanged, though.
+Evaluate:
 
-## The final experiment
+```bash
+uv run --locked biternion-eval \
+  --checkpoint runs/towncentre-biternion/best.pt \
+  --manifest data/custom/manifest.jsonl
+```
 
-Unfortunately, I can't include the final experiment (training on labmates and
-testing on me) due to privacy reasons. I may upload a pre-trained model in the
-future though.
+Convert existing Tosato JSON metadata:
+
+```bash
+uv run --locked biternion-convert \
+  --source data/QMULPoseHeads.json \
+  --kind tosato-classification \
+  --output data/qmul/manifest.jsonl
+```
+
+## Experiment Presets
+
+Classification presets:
+
+- `hiit`
+- `hocoffee`
+- `hoc`
+- `qmul`
+- `qmul-no-background`
+
+Regression / Biternion presets:
+
+- `idiap`
+- `caviar`
+- `caviar-occluded`
+- `towncentre-linreg`
+- `towncentre-linreg-rad`
+- `towncentre-mod-mae`
+- `towncentre-vonmises`
+- `towncentre-biternion`
+- `towncentre-biternion-vonmises`
+
+TownCentre quantized-label presets follow:
+
+```text
+towncentre-q{3,4x,4p,6x,8x,8p,10x,12x}-{softmax,linreg,linreg-vonmises,biternion,biternion-vonmises}
+```
+
+## Reproduction Scripts
+
+Run Tosato-family manifests:
+
+```bash
+uv run --locked python scripts/run_tosato.py --output-root runs/tosato
+```
+
+Run TownCentre experiments:
+
+```bash
+uv run --locked python scripts/run_towncentre.py \
+  --manifest data/towncentre/manifest.jsonl \
+  --output-root runs/towncentre
+```
+
+Inspect a manifest:
+
+```bash
+uv run --locked python scripts/inspect_dataset.py data/custom/manifest.jsonl
+```
+
+## Notes
+
+- Images are loaded with OpenCV, converted from BGR to RGB, scaled to `float32` in `[0, 1]`, cropped, and returned as `C,H,W` tensors.
+- The `uv` interpreter is pinned to Python `3.13.11` in `.python-version`; package metadata allows Python `>=3.11`.
+- Direct runtime dependencies and the build backend are pinned exactly in `pyproject.toml`; resolved transitive dependencies and artifact hashes are recorded in `uv.lock`.
+- Checkpoints contain `model_state_dict`, `optimizer_state_dict`, the experiment config, `class_to_idx`, and metric history. Quantization borders/centres are included inside the experiment config for quantized presets.
+- Numerical results are not expected to match the original Theano implementation bit-for-bit. This is a PyTorch port of the original notebook architecture, losses, metrics, and experiment presets, with framework/runtime differences.

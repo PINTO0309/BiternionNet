@@ -1,7 +1,5 @@
 #!/usr/bin/env python
 
-from lbtoolbox.util import flipany
-
 import os
 import sys
 import re
@@ -16,6 +14,10 @@ import numpy as np
 from scipy.io import loadmat
 from sklearn.preprocessing import LabelEncoder
 import h5py
+
+
+def flipany(array, dim):
+    return np.flip(array, axis=dim)
 
 
 def here(f):
@@ -154,10 +156,12 @@ def flipped_classes(X, y, n, le, old, new):
     Horizontally flips all images in `X` which are labeled as `old` and label them as `new`.
     Returns the flipped X, y, n.
     """
-    indices = np.where(y == le.transform(old))[0]
+    old_idx = le.transform([old])[0]
+    new_idx = le.transform([new])[0]
+    indices = np.where(y == old_idx)[0]
     return (
         flipany(X[indices], dim=3),
-        np.full(len(indices), le.transform(new), dtype=y.dtype),
+        np.full(len(indices), new_idx, dtype=y.dtype),
         tuple(n[i] for i in indices)
     )
 

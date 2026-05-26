@@ -1,10 +1,9 @@
 #!/usr/bin/env python
 
-from lbtoolbox.download import download
-
-import os
 import inspect
+import os
 import tarfile
+import urllib.request
 
 
 def here(f):
@@ -14,7 +13,10 @@ def here(f):
 
 def download_extract(urlbase, name, into):
     print("Downloading " + name)
-    fname = download(os.path.join(urlbase, name), into)
+    os.makedirs(into, exist_ok=True)
+    fname = os.path.join(into, name)
+    if not os.path.exists(fname):
+        urllib.request.urlretrieve(os.path.join(urlbase, name), fname)
     print("Extracting...")
     with tarfile.open(fname) as f:
         f.extractall(path=into)
