@@ -62,7 +62,7 @@ def dopred(model, aug, X, ensembling, output2preds, batchsize=100):
     y_preds = []
     for Xb in batched(batchsize, X):
         if aug is None:
-            p_y = model.forward(X)
+            p_y = model.forward(Xb)
         else:
             p_y = ensembling([model.forward(X) for X in aug.augbatch_pred(Xb)])
         y_preds += list(output2preds(p_y))
