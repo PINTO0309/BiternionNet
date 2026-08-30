@@ -29,3 +29,17 @@ def test_biternion_losses_backward():
     assert pred.grad is not None
     assert torch.isfinite(pred.grad).all()
 
+
+
+def test_probs2deg_centre_and_quadint():
+    from biternionnet.losses import probs2deg_centre, probs2deg_quadint
+
+    centres = np.array([0, 90, 180, 270], dtype=np.float32)
+    probs = np.array([[0.1, 0.7, 0.2, 0.0], [0.6, 0.2, 0.0, 0.2]])
+    assert probs2deg_centre(probs, centres).tolist() == [90.0, 0.0]
+    quad = probs2deg_quadint(probs, centres)
+    # Vertex is pulled towards the heavier neighbour, and stays on the circle.
+    assert 90.0 < quad[0] < 180.0
+    assert quad[1] == 0.0 or quad[1] == 360.0 or (0.0 <= quad[1] < 360.0)
+    symmetric = probs2deg_quadint(np.array([[0.2, 0.6, 0.2, 0.0]]), centres)
+    assert np.isclose(symmetric[0], 90.0)

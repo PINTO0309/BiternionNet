@@ -95,3 +95,42 @@ class ModuloMAELoss(nn.Module):
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         return torch.remainder(torch.abs(pred - target), 360.0).mean()
 
+
+def parabola_vertex(x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
+    """Vertex (x, y) of the parabola through three points (notebook helper)."""
+    x1, x2, x3 = (float(v) for v in x)
+    y1, y2, y3 = (float(v) for v in y)
+    denom = (x1 - x2) * (x1 - x3) * (x2 - x3)
+    a = (x3 * (y2 - y1) + x2 * (y1 - y3) + x1 * (y3 - y2)) / denom
+    b = (x3 * x3 * (y1 - y2) + x2 * x2 * (y3 - y1) + x1 * x1 * (y2 - y3)) / denom
+    c = (x2 * x3 * (x2 - x3) * y1 + x3 * x1 * (x3 - x1) * y2 + x1 * x2 * (x1 - x2) * y3) / denom
+    if a == 0.0:
+        return x2, y2
+    return -b / (2.0 * a), c - b * b / (4.0 * a)
+
+
+def probs2deg_centre(probs: np.ndarray, centres: np.ndarray) -> np.ndarray:
+    """Class probabilities -> angle in degrees using the most likely class centre."""
+    return np.asarray(centres, dtype=np.float64)[np.argmax(probs, axis=-1)]
+
+
+def prob2deg_quadint(prob: np.ndarray, centres: np.ndarray) -> float:
+    """Quadratic interpolation between the best class and its two cyclic neighbours (paper Sec. 5)."""
+    centres = np.asarray(centres, dtype=np.float64)
+    prob = np.asarray(prob, dtype=np.float64)
+    i = int(np.argmax(prob))
+    n = len(centres)
+    if i == 0:
+        xs = [centres[-1] - 360.0, centres[0], centres[1]]
+        ys = prob[[-1, 0, 1]]
+    elif i == n - 1:
+        xs = [centres[-2], centres[-1], centres[0] + 360.0]
+        ys = prob[[-2, -1, 0]]
+    else:
+        xs = centres[[i - 1, i, i + 1]]
+        ys = prob[[i - 1, i, i + 1]]
+    return float(np.mod(parabola_vertex(np.asarray(xs), ys)[0], 360.0))
+
+
+def probs2deg_quadint(probs: np.ndarray, centres: np.ndarray) -> np.ndarray:
+    return np.array([prob2deg_quadint(p, centres) for p in np.asarray(probs)], dtype=np.float64)

@@ -118,19 +118,54 @@ uv run --locked biternion-train \
 
 Use `--backbone-activation swish` to replace backbone ReLU activations with Swish/SiLU for ablation runs.
 
+The paper trains with a constant AdaDelta step for a fixed 50 epochs. Two opt-in schedules exist for ablations.
+
+`--lr-schedule wsd` enables a Warmup-Stable-Decay schedule applied per optimizer step (linear warmup over `--warmup-fraction` of all steps, default 0.05; constant; linear decay over the last `--decay-fraction`, default 0.3, down to `lr * --final-lr-ratio`, default 0.1). The per-epoch log records the current `lr`:
+
+```bash
+uv run --locked biternion-train \
+--experiment towncentre-biternion-vonmises \
+--manifest data/towncentre/manifest.jsonl \
+--lr-schedule wsd \
+--output runs/towncentre-biternion-vonmises-wsd
+```
+
+`--lr-schedule plateau_cosine` keeps the lr constant until the training loss plateaus, then decays it with a cosine over `--cosine-epochs` epochs (default 15) to `lr * --final-lr-ratio`, and stops. The plateau detector compares the mean train loss of the first and second half of the last `--plateau-window` epochs (default 10); decay starts when that relative decrease falls below `--plateau-threshold` (default 0.02, i.e. 2%) and `epoch >= --plateau-min-epochs` (default 10). `--epochs` is the budget: if no plateau is detected, decay is forced to start at `epochs - cosine_epochs + 1`. Every epoch log carries `lr`, `phase`, `plateau_rate`, and a `schedule_event` line when the decay is scheduled.
+
+To pick the decay point by hand while watching the logs, train with a constant lr (or `--disable-plateau-trigger`) and a generous `--epochs`, inspect the run, then resume from `last.pt` with a manual start epoch:
+
+```bash
+# phase 1: constant lr, large budget, share the logs
+uv run --locked biternion-train --experiment towncentre-biternion-vonmises \
+  --manifest data/towncentre/manifest.jsonl --epochs 200 --output runs/tc-btvm-manual
+
+# inspect the loss-decrease rate
+uv run --locked python scripts/schedule_report.py runs/tc-btvm-manual/last.pt --window 10
+
+# phase 2: resume and start the cosine decay at the chosen epoch
+uv run --locked biternion-train --experiment towncentre-biternion-vonmises \
+  --manifest data/towncentre/manifest.jsonl --epochs 200 --output runs/tc-btvm-manual \
+  --resume-from runs/tc-btvm-manual/last.pt \
+  --lr-schedule plateau_cosine --decay-start-epoch 41 --cosine-epochs 15
+```
+
+`--resume-from` restores model/optimizer state, history, global step and schedule state; epoch numbering continues and schedule options on the command line override the checkpoint's.
+
 Evaluate:
 
 ```bash
 uv run --locked biternion-eval \
-  --checkpoint runs/towncentre-biternion/best.pt \
+  --checkpoint runs/towncentre-biternion/last.pt \
   --manifest data/towncentre/manifest.jsonl
 ```
+
+Training always writes `last.pt` (the original notebooks train a fixed 50 epochs and evaluate the final model). `best.pt` is written only when the manifest contains a `val` split, so checkpoint selection never looks at the test split. `biternion-convert --kind towncentre-raw --val-split 0.5` carves a person-level `val` split out of the non-train persons.
 
 Export a checkpoint to ONNX with opset 17 and optimize it with `onnxsim-prebuilt`:
 
 ```bash
 uv run --locked biternion-export-onnx \
---checkpoint runs/towncentre-biternion/best.pt \
+--checkpoint runs/towncentre-biternion/last.pt \
 --output-dir runs/towncentre-biternion/ \
 --opset 17
 ```
@@ -158,6 +193,7 @@ Regression / Biternion presets:
 - `towncentre-vonmises`
 - `towncentre-biternion`
 - `towncentre-biternion-vonmises`
+- `towncentre-biternion-long` / `towncentre-biternion-vonmises-long` — not a paper setting: 1000 epochs at the constant AdaDelta step followed by a 100-epoch cosine decay (`plateau_cosine` with a manual `decay_start_epoch`), chosen from a 1000-epoch constant-lr sweep in which test MAAD kept improving slowly without overfitting
 
 TownCentre quantized-label presets follow:
 
@@ -187,10 +223,19 @@ Inspect a manifest:
 uv run --locked python scripts/inspect_dataset.py data/custom/manifest.jsonl
 ```
 
+## Fidelity to the original notebooks
+
+- Max-pooling uses `ceil_mode=True` so the 46x46 network produces the notebook's `64@5x5` feature map (`Linear(1600, 512)`); Theano's pooling rounds partial windows up while PyTorch floors by default. Checkpoints written before this change (no `pool_ceil_mode` key) are loaded with floor pooling for compatibility.
+- TownCentre presets resize every head crop to 50x50 before the 46x46 random crop (`resize_size`), matching `prepare_data.scale_all`. Raw TownCentre crops are ~25x23, so without the resize there was no crop augmentation at all.
+- `idiap`, `caviar`, and `caviar-occluded` disable horizontal-flip augmentation (`flip_augmentation=False`) like the notebooks; there is no flip rule for pan/tilt/roll labels.
+- `towncentre-vonmises` uses `kappa=0.5` like the notebook; the quantized `linreg-vonmises` presets keep `kappa=1.0`.
+- Quantized-label presets (`towncentre-q*`) are trained on bin labels but evaluated against the continuous ground-truth angle, as in Section 5 of the paper. Softmax presets report `maad_deg` (class-centre prediction), `maad_quadint_deg` (quadratic interpolation between the best bin and its neighbours), and `bin_accuracy`.
+- Not ported: the shallow "pure linear regression" baseline, the `ModuloMADCriterion` run with `N(0, 20)` last-layer init, DeepFried2's post-training BatchNorm statistics pass, multi-crop test-time augmentation, and averaging over five independently trained networks.
+
 ## Notes
 
-- Images are loaded with OpenCV, converted from BGR to RGB, scaled to `float32` in `[0, 1]`, resized if needed to satisfy the requested crop, cropped, and returned as `C,H,W` tensors.
+- Images are loaded with OpenCV, converted from BGR to RGB, scaled to `float32` in `[0, 1]`, optionally resized to the preset's `resize_size`, resized if still smaller than the requested crop, cropped, and returned as `C,H,W` tensors.
 - The `uv` interpreter is pinned to Python `3.13.11` in `.python-version`; package metadata allows Python `>=3.11`.
 - Direct runtime dependencies and the build backend are pinned exactly in `pyproject.toml`; resolved transitive dependencies and artifact hashes are recorded in `uv.lock`.
-- Checkpoints contain `model_state_dict`, `optimizer_state_dict`, the experiment config, `class_to_idx`, and metric history. Quantization borders/centres are included inside the experiment config for quantized presets.
+- Checkpoints contain `model_state_dict`, `optimizer_state_dict`, the experiment config, `class_to_idx`, and metric history. Quantization borders/centres, `resize_size`, `flip_augmentation`, and `pool_ceil_mode` are included inside the experiment config.
 - Numerical results are not expected to match the original Theano implementation bit-for-bit. This is a PyTorch port of the original notebook architecture, losses, metrics, and experiment presets, with framework/runtime differences.

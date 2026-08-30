@@ -59,3 +59,26 @@ def test_manifest_dataset_resizes_small_images_before_crop(tmp_path):
     image, target = dataset[0]
     assert tuple(image.shape) == (3, 46, 46)
     assert target.item() == 90.0
+
+
+def test_crop_config_resize_then_random_crop(tmp_path):
+    from biternionnet.data import crop_image
+    import random
+
+    image = np.zeros((25, 23, 3), dtype=np.float32)
+    random.seed(0)
+    cropped = crop_image(image, CropConfig((46, 46), random_crop=True, resize=(50, 50)))
+    assert cropped.shape == (46, 46, 3)
+    # 50x50 -> 46x46 leaves a 4px margin so random crops actually vary.
+    offsets = set()
+    for _ in range(50):
+        big = np.arange(50 * 50, dtype=np.float32).reshape(50, 50, 1).repeat(3, axis=2)
+        offsets.add(float(crop_image(big, CropConfig((46, 46), random_crop=True, resize=(50, 50)))[0, 0, 0]))
+    assert len(offsets) > 1
+
+
+def test_flip_label_rejects_pose_rad():
+    import pytest
+
+    with pytest.raises(ValueError):
+        flip_label({"task": "pose_rad", "pan": 0.1, "tilt": 0.0, "roll": 0.0})

@@ -15,6 +15,8 @@ class ModelConfig:
     variant: str = "standard"
     input_size: tuple[int, int] = (46, 46)
     backbone_activation: str = "relu"
+    # DeepFried2/Theano pooling keeps the partial border window (17 -> 9); PyTorch floors (17 -> 8).
+    pool_ceil_mode: bool = True
 
 
 class BiternionHead(nn.Module):
@@ -38,27 +40,27 @@ def _conv_block(in_channels: int, out_channels: int, activation: str) -> list[nn
     ]
 
 
-def standard_backbone(extra_pool: bool = False, activation: str = "relu") -> nn.Sequential:
+def standard_backbone(extra_pool: bool = False, activation: str = "relu", ceil_mode: bool = True) -> nn.Sequential:
     layers: list[nn.Module] = []
     layers += _conv_block(3, 24, activation)
-    layers += [nn.Conv2d(24, 24, kernel_size=3), nn.BatchNorm2d(24), nn.MaxPool2d(2), _activation(activation)]
+    layers += [nn.Conv2d(24, 24, kernel_size=3), nn.BatchNorm2d(24), nn.MaxPool2d(2, ceil_mode=ceil_mode), _activation(activation)]
     layers += _conv_block(24, 48, activation)
-    layers += [nn.Conv2d(48, 48, kernel_size=3), nn.BatchNorm2d(48), nn.MaxPool2d(2), _activation(activation)]
+    layers += [nn.Conv2d(48, 48, kernel_size=3), nn.BatchNorm2d(48), nn.MaxPool2d(2, ceil_mode=ceil_mode), _activation(activation)]
     layers += _conv_block(48, 64, activation)
     layers += _conv_block(64, 64, activation)
     if extra_pool:
-        layers += [nn.MaxPool2d(2)]
+        layers += [nn.MaxPool2d(2, ceil_mode=ceil_mode)]
     return nn.Sequential(*layers)
 
 
-def hoc_backbone(activation: str = "relu") -> nn.Sequential:
+def hoc_backbone(activation: str = "relu", ceil_mode: bool = True) -> nn.Sequential:
     layers: list[nn.Module] = []
     layers += _conv_block(3, 24, activation)
     layers += _conv_block(24, 24, activation)
-    layers += [nn.Conv2d(24, 24, kernel_size=3), nn.BatchNorm2d(24), nn.MaxPool2d((3, 2)), _activation(activation)]
+    layers += [nn.Conv2d(24, 24, kernel_size=3), nn.BatchNorm2d(24), nn.MaxPool2d((3, 2), ceil_mode=ceil_mode), _activation(activation)]
     layers += _conv_block(24, 48, activation)
     layers += _conv_block(48, 48, activation)
-    layers += [nn.Conv2d(48, 48, kernel_size=3), nn.BatchNorm2d(48), nn.MaxPool2d(3), _activation(activation)]
+    layers += [nn.Conv2d(48, 48, kernel_size=3), nn.BatchNorm2d(48), nn.MaxPool2d(3, ceil_mode=ceil_mode), _activation(activation)]
     layers += _conv_block(48, 64, activation)
     layers += _conv_block(64, 64, activation)
     return nn.Sequential(*layers)
@@ -69,11 +71,11 @@ class HeadPoseNet(nn.Module):
         super().__init__()
         self.config = config
         if config.variant == "hoc":
-            self.backbone = hoc_backbone(config.backbone_activation)
+            self.backbone = hoc_backbone(config.backbone_activation, ceil_mode=config.pool_ceil_mode)
         elif config.variant == "idiap":
-            self.backbone = standard_backbone(extra_pool=True, activation=config.backbone_activation)
+            self.backbone = standard_backbone(extra_pool=True, activation=config.backbone_activation, ceil_mode=config.pool_ceil_mode)
         elif config.variant == "standard":
-            self.backbone = standard_backbone(extra_pool=False, activation=config.backbone_activation)
+            self.backbone = standard_backbone(extra_pool=False, activation=config.backbone_activation, ceil_mode=config.pool_ceil_mode)
         else:
             raise ValueError(f"Unsupported model variant: {config.variant}")
 

@@ -48,7 +48,13 @@ def convert_towncentre_pickle(source: str | Path, output: str | Path, image_root
     write_manifest(records, output)
 
 
-def convert_towncentre_raw(source: str | Path, output: str | Path, train_split: float = 0.9, seed: int = 0) -> None:
+def convert_towncentre_raw(source: str | Path, output: str | Path, train_split: float = 0.9, seed: int = 0, val_split: float = 0.0) -> None:
+    """Write a TownCentre manifest with a person-level split.
+
+    Each person id is assigned to ``train`` with probability ``train_split``; otherwise to
+    ``val`` with probability ``val_split`` (of the remainder) or ``test``. ``val`` is optional and
+    only used for checkpoint selection, so the default keeps the notebook's 90/10 train/test split.
+    """
     source = Path(source)
     output = Path(output)
     rng = random.Random(seed)
@@ -76,7 +82,12 @@ def convert_towncentre_raw(source: str | Path, output: str | Path, train_split: 
             raise ValueError(f"Could not extract TownCentre person id from {image_path.name}") from exc
 
         if person_id not in person_splits:
-            person_splits[person_id] = "train" if rng.random() < train_split else "test"
+            if rng.random() < train_split:
+                person_splits[person_id] = "train"
+            elif val_split > 0.0 and rng.random() < val_split:
+                person_splits[person_id] = "val"
+            else:
+                person_splits[person_id] = "test"
 
         records.append(
             {

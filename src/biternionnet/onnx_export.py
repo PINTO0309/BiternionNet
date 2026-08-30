@@ -8,7 +8,7 @@ import onnx
 import torch
 from onnxsim import simplify
 
-from .experiments import ExperimentConfig
+from .experiments import ExperimentConfig, config_from_checkpoint
 from .models import ModelConfig, build_model
 
 
@@ -22,7 +22,7 @@ def _output_dim(config: ExperimentConfig, class_to_idx: dict[str, int]) -> int:
 
 def load_checkpoint_model(checkpoint: str | Path, device: torch.device) -> tuple[torch.nn.Module, ExperimentConfig, dict[str, int], dict[str, Any]]:
     checkpoint_data = torch.load(checkpoint, map_location=device)
-    config = ExperimentConfig(**checkpoint_data["experiment"])
+    config = config_from_checkpoint(checkpoint_data["experiment"])
     class_to_idx = checkpoint_data.get("class_to_idx", {})
     model = build_model(
         ModelConfig(
@@ -31,6 +31,7 @@ def load_checkpoint_model(checkpoint: str | Path, device: torch.device) -> tuple
             variant=config.model_variant,
             input_size=config.input_size,
             backbone_activation=config.backbone_activation,
+            pool_ceil_mode=config.pool_ceil_mode,
         )
     ).to(device)
     model.load_state_dict(checkpoint_data["model_state_dict"])

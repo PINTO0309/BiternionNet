@@ -20,6 +20,8 @@ from .losses import deg2bit, quantize_labels
 class CropConfig:
     size: tuple[int, int] | None
     random_crop: bool = False
+    # Optional fixed (H, W) resize applied before cropping (``prepare_data.scale_all`` equivalent).
+    resize: tuple[int, int] | None = None
 
 
 def read_manifest(path: str | Path) -> list[dict[str, Any]]:
@@ -65,6 +67,8 @@ def crop_image(image: np.ndarray, crop: CropConfig | None) -> np.ndarray:
     if crop is None or crop.size is None:
         return image
     crop_h, crop_w = crop.size
+    if crop.resize is not None and tuple(image.shape[:2]) != tuple(crop.resize):
+        image = cv2.resize(image, (crop.resize[1], crop.resize[0]), interpolation=cv2.INTER_LANCZOS4)
     h, w = image.shape[:2]
     if h < crop_h or w < crop_w:
         resize_h = max(h, crop_h)
@@ -88,6 +92,8 @@ def flip_label(record: dict[str, Any], class_flip_map: dict[str, str] | None = N
             flipped["label"] = class_flip_map.get(str(flipped["label"]), str(flipped["label"]))
     elif task == "angle_deg":
         flipped["angle_deg"] = float((360.0 - float(flipped["angle_deg"])) % 360.0)
+    else:
+        raise ValueError(f"No horizontal-flip label rule for task {task!r}; disable flip augmentation for this experiment")
     return flipped
 
 
