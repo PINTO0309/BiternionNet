@@ -114,6 +114,27 @@ _EXPERIMENTS: dict[str, ExperimentConfig] = {
         decay_start_epoch=1001,
         cosine_epochs=100,
     ),
+    # Default configuration adopted on 2026-08-30 (history/004 §3.2): neighbour-frame manifest
+    # (manifest_nb3.jsonl, 269 steps/epoch) + photometric "cctv" + scale jitter, 300 constant epochs
+    # then a 50-epoch cosine decay (~94k steps). Chosen because the dataset is small and noisy; dataset
+    # reinforcement is worked on before re-tuning the augmentation strength.
+    "towncentre-biternion-vonmises-aug": ExperimentConfig(
+        "towncentre-biternion-vonmises-aug",
+        "angle_deg",
+        "biternion",
+        "biternion",
+        "vonmises_biternion",
+        output_dim=2,
+        kappa=1.0,
+        resize_size=TOWNCENTRE_RESIZE,
+        epochs=350,
+        lr_schedule="plateau_cosine",
+        plateau_threshold=None,
+        decay_start_epoch=301,
+        cosine_epochs=50,
+        photometric="cctv",
+        scale_jitter=(0.9, 1.1),
+    ),
     "smoke-classification": ExperimentConfig("smoke-classification", "classification", "classification", "classification", "cross_entropy", epochs=1, batch_size=2),
     "smoke-biternion": ExperimentConfig("smoke-biternion", "angle_deg", "biternion", "biternion", "cosine", output_dim=2, epochs=1, batch_size=2),
 }

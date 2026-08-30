@@ -20,4 +20,6 @@ work is done (or planned) so that later entries can refer back to earlier ones b
 | [001](001_fidelity_fixes.md) | Fidelity fixes to the original notebooks | done |
 | [002](002_towncentre_dataset.md) | TownCentre dataset analysis | done |
 | [003](003_lr_schedule_sweep.md) | Epoch budget and lr-schedule sweep (constant 1000 -> cosine 100) | done |
-| [004](004_augmentation_ablation.md) | Augmentation ablation (neighbour frames / photometric / scale jitter) | planned, runs pending |
+| [004](004_augmentation_ablation.md) | Augmentation ablation (neighbour frames / photometric / scale jitter) | R0-R4 done, follow-ups planned |
+| [005](005_synthetic_fill_study.md) | Can the HRFFA synthetic heads fill the sparse TownCentre bins? | done (study, negative) |
+| [006](006_synthetic_generation_plan.md) | Synthetic generation plan: images needed per pan band | plan |

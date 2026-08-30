@@ -44,17 +44,84 @@ Comparison: `uv run --locked python scripts/compare_runs.py runs/aug-r0-baseline
 **Decision rule**: adopt an augmentation if the mean over the last 2 000 steps improves by more than 2x the
 baseline std (~0.8 deg); confirm the winner with seeds 1 and 2. Reference from 003: 19.13 +- 0.42, final 18.50.
 
-## 3. Results
+## 3. Results (2026-08-30, seed 0)
 
-_(pending - paste the `compare_runs.py --markdown` table and per-run notes here)_
+`scripts/compare_runs.py ... --steps 2000 --markdown` (window = last 2 000 steps: 50 epochs for R0/R2/R3, 7 for R1/R4):
 
-| run | epochs | steps | win_ep | mean | std | min | final |
+| run | epochs | steps | win_ep | maad_deg mean | std | min | final |
 |---|---|---|---|---|---|---|---|
-| R0 aug-r0-baseline | | | | | | | |
-| R1 aug-r1-nb3 | | | | | | | |
-| R2 aug-r2-photo | | | | | | | |
-| R3 aug-r3-scale | | | | | | | |
-| R4 aug-r4-all | | | | | | | |
+| aug-r0-baseline | 1100 | 44000 | 50 | 18.93 | 0.39 | 18.46 | 18.60 |
+| aug-r1-nb3 | 164 | 44116 | 7 | 18.59 | 0.18 | 18.16 | 18.66 |
+| aug-r2-photo | 1100 | 44000 | 50 | 18.51 | 0.58 | 17.73 | 18.40 |
+| aug-r3-scale | 1100 | 44000 | 50 | 18.24 | 0.44 | 17.52 | 17.99 |
+| aug-r4-all | 164 | 44116 | 7 | 19.51 | 0.28 | 19.11 | 19.38 |
+
+Diagnostics from `history.jsonl` (window mean of test MAAD at 25 / 50 / 75 % of the step budget, just before
+the cosine phase, and the gain during the cosine phase; train loss converted to the equivalent angle with dropout on):
+
+| run | train loss at end (~angle) | MAAD @25 % | @50 % | @75 % | before decay | final | gain in decay |
+|---|---|---|---|---|---|---|---|
+| R0 baseline | 0.0080 (7.3 deg) | 24.47 | 21.90 | 20.52 | 20.95 | 18.60 | +2.02 |
+| R1 nb3 | 0.0106 (8.4 deg) | 20.04 | 18.89 | 18.51 | 18.71 | 18.66 | +0.12 |
+| R2 photo | 0.0146 (9.8 deg) | 23.45 | 21.75 | 20.30 | 20.57 | 18.40 | +2.06 |
+| R3 scale | 0.0117 (8.8 deg) | 21.99 | 20.53 | 20.03 | 19.60 | 17.99 | +1.37 |
+| R4 all | 0.0254 (13.0 deg) | 19.99 | 21.02 | 19.61 | 19.73 | 19.38 | +0.22 |
+
+Reading:
+
+- **R0** re-run after 001-G: 18.93 +- 0.39 (003 had 19.13 +- 0.42 before the clip fix) - a 0.2 deg shift of the
+  same configuration, which is the size of the nuisance variance to keep in mind below.
+- **R3 scale jitter** is the best single change: -0.69 deg on the window mean, -0.61 on the final epoch, lower
+  minimum (17.52). Just below the 0.8 deg decision threshold; needs seeds 1 / 2.
+- **R2 photometric**: -0.42 deg, train loss 1.8x the baseline (it regularises as intended), larger epoch noise.
+- **R1 neighbour frames**: same end point as the baseline (-0.34) but reaches it far earlier - 20.0 deg at
+  25 % of the budget vs 24.5 - and the constant phase plateaus at ~18.5-18.7 from 75 % on, so the cosine phase
+  adds only 0.12. At equal steps the 7x data buys convergence speed, not accuracy; the epoch noise is halved
+  (std 0.18).
+- **R4 all** is *worse* than the baseline (+0.58): train loss 0.025 (3x the baseline), the metric is flat at
+  ~19.6-21 from 25 % of the budget and the decay adds 0.22. With 7x correlated data plus photometric plus scale
+  jitter the 0.63 M-parameter net is under-fitted at 44 k steps; the combination needs either more steps or a
+  lighter photometric preset.
+
+Decision: no augmentation passes the > 0.8 deg rule on its own. Scale jitter (R3) is the candidate to
+confirm; the combination must be re-run with a larger budget before it is judged.
+
+## 3.1 Follow-up runs (planned)
+
+| Run | Purpose | Command |
+|---|---|---|
+| R0-s1, R0-s2 | baseline seed spread | R0 command with `--seed 1` / `--seed 2`, outputs `runs/aug-r0-baseline-s1`, `-s2` |
+| R3-s1, R3-s2 | confirm scale jitter | R3 command with `--seed 1` / `--seed 2`, outputs `runs/aug-r3-scale-s1`, `-s2` |
+| R5 photo+scale | combination without neighbour frames | `biternion-train --experiment towncentre-biternion-vonmises-long --manifest data/towncentre/manifest.jsonl --seed 0 --num-workers 4 --photometric cctv --scale-jitter 0.9 1.1 --output runs/aug-r5-photo-scale` |
+| R6 nb3+scale | neighbour frames with the lightest extra augmentation | R1 command + `--scale-jitter 0.9 1.1 --output runs/aug-r6-nb3-scale` |
+| R4-long | all three at ~2.1x budget (94 k steps: 300 constant + 50 cosine epochs x 269) | R4 command with `--epochs 350 --decay-start-epoch 301 --cosine-epochs 50 --num-workers 16 --output runs/aug-r4-all-long` (started 2026-08-30) |
+| R4-light | all three, `cctv-light` | R4 command with `--photometric cctv-light --output runs/aug-r4-all-light` |
+
+## 3.2 R4-long result (2026-08-30)
+
+| run | epochs | steps | win_ep | maad_deg mean | std | min | final |
+|---|---|---|---|---|---|---|---|
+| aug-r4-all-long | 350 | 94150 | 7 | 18.80 | 0.33 | 18.20 | 18.92 |
+
+Trajectory (7-epoch window): 19.80 (ep 50) / 19.68 (100) / 19.99 (150) / 20.20 (200) / 19.35 (250) / 19.38 (300)
+-> cosine 301-350 -> 18.80; train loss 0.061 -> 0.022 (ep 300) -> 0.017 (end).
+
+- The constant phase is **flat at ~19.4-20.2 deg from epoch 50 to 300** while the train loss keeps falling: the
+  extra 40 k steps did not move the test metric. The "under-fitted at 44 k steps" reading of §3 was only half
+  right - the combination is limited by the augmentation strength, not by the budget.
+- The cosine phase gains 0.58 deg (R4: 0.22, R1: 0.12, R0/R2/R3: 1.4-2.1).
+- End point 18.80 +- 0.33 at 2.1x the budget: equal to the baseline (18.93) and clearly behind R3 (18.24)
+  and R1 (18.59) at 1x. **A + B + C together is not adopted.**
+
+Working hypothesis: with 7x correlated neighbour frames the photometric preset `cctv` is too strong (train loss
+stays 2-3x the baseline's).
+
+**Decision (user, 2026-08-30): A + B + C in the R4-long configuration becomes the default anyway** - the dataset
+is too small and too noisy for the single-augmentation deltas (0.3-0.7 deg, comparable to the seed spread) to
+be a sound basis for dropping augmentations, and the next step is to reinforce the dataset itself (006) before
+re-tuning augmentation strength. Preset: `towncentre-biternion-vonmises-aug` (epochs 350, decay 301, cosine 50,
+`photometric=cctv`, `scale_jitter=(0.9, 1.1)`), to be used with `manifest_nb3.jsonl`. The §3.1 follow-ups are
+kept as optional checks.
 
 ## 4. Next candidates (not implemented)
 

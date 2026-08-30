@@ -221,6 +221,7 @@ Regression / Biternion presets:
 - `towncentre-vonmises`
 - `towncentre-biternion`
 - `towncentre-biternion-vonmises`
+- `towncentre-biternion-vonmises-aug` — the fork's current default (not a paper setting): photometric `cctv` + scale jitter, 300 constant epochs + 50 cosine epochs, meant for the neighbour-frame manifest (`--neighbor-frames 3`, 269 steps/epoch); see `history/004`
 - `towncentre-biternion-long` / `towncentre-biternion-vonmises-long` — not a paper setting: 1000 epochs at the constant AdaDelta step followed by a 100-epoch cosine decay (`plateau_cosine` with a manual `decay_start_epoch`), chosen from a 1000-epoch constant-lr sweep in which test MAAD kept improving slowly without overfitting
 
 TownCentre quantized-label presets follow:
