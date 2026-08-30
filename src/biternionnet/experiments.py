@@ -4,6 +4,8 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
+from .augment import get_photometric_preset
+
 
 @dataclass(frozen=True)
 class ExperimentConfig:
@@ -49,6 +51,11 @@ class ExperimentConfig:
     plateau_min_epochs: int = 10
     cosine_epochs: int = 15
     decay_start_epoch: int | None = None
+    # Data augmentation beyond the paper's random crop + flip (opt-in ablations):
+    # photometric preset name (see augment.PHOTOMETRIC_PRESETS) and multiplicative jitter of
+    # ``resize_size`` before the random crop.
+    photometric: str | None = None
+    scale_jitter: tuple[float, float] | None = None
 
 
 CLASS_FLIPS_4 = {"front": "front", "back": "back", "left": "right", "right": "left", "background": "background"}
@@ -180,6 +187,8 @@ def with_overrides(
     cosine_epochs: int | None = None,
     decay_start_epoch: int | None = None,
     disable_plateau_trigger: bool = False,
+    photometric: str | None = None,
+    scale_jitter: tuple[float, float] | None = None,
 ) -> ExperimentConfig:
     changes = {}
     if epochs is not None:
@@ -214,7 +223,18 @@ def with_overrides(
         changes["cosine_epochs"] = cosine_epochs
     if decay_start_epoch is not None:
         changes["decay_start_epoch"] = decay_start_epoch
+    if photometric is not None:
+        changes["photometric"] = None if photometric == "none" else photometric
+    if scale_jitter is not None:
+        changes["scale_jitter"] = tuple(float(x) for x in scale_jitter)
     result = replace(config, **changes)
+    get_photometric_preset(result.photometric)  # validates the preset name
+    if result.scale_jitter is not None:
+        lo, hi = result.scale_jitter
+        if not 0.0 < lo <= hi:
+            raise ValueError("scale_jitter must satisfy 0 < low <= high")
+        if result.resize_size is None:
+            raise ValueError("scale_jitter requires a preset with resize_size")
     if result.warmup_fraction < 0.0 or result.decay_fraction < 0.0:
         raise ValueError("warmup_fraction and decay_fraction must be non-negative")
     if result.warmup_fraction + result.decay_fraction > 1.0:
@@ -238,7 +258,7 @@ def config_from_checkpoint(data: dict) -> ExperimentConfig:
     """
     data = dict(data)
     data.setdefault("pool_ceil_mode", False)
-    for key in ("input_size", "resize_size", "quantization_borders", "quantization_centres"):
+    for key in ("input_size", "resize_size", "quantization_borders", "quantization_centres", "scale_jitter"):
         if data.get(key) is not None:
             data[key] = tuple(data[key])
     return ExperimentConfig(**data)

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import random
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +13,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from .augment import get_photometric_preset
 from .data import CropConfig, ManifestDataset, build_class_mapping, read_manifest
 from .experiments import (
     ExperimentConfig,
@@ -121,13 +124,14 @@ def build_datasets(
         manifest,
         "train",
         config.target_kind,
-        crop=CropConfig(config.input_size, random_crop=True, resize=config.resize_size),
+        crop=CropConfig(config.input_size, random_crop=True, resize=config.resize_size, scale_jitter=config.scale_jitter),
         class_to_idx=class_to_idx,
         class_flip_map=config.class_flip_map,
         exclude_label=config.exclude_label,
         flip_probability=flip_probability,
         quantization_borders=borders,
         quantization_centres=centres,
+        photometric=get_photometric_preset(config.photometric),
     )
     test_dataset = _eval_dataset(config, manifest, "test", class_to_idx)
     val_dataset = None
@@ -202,6 +206,21 @@ def evaluate_model(model: nn.Module, loader: DataLoader, config: ExperimentConfi
     return metrics
 
 
+def _timestamp() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def _write_history_jsonl(path: Path, history: list[dict[str, Any]]) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        for record in history:
+            f.write(json.dumps(record, sort_keys=True) + "\n")
+
+
 def _selection_score(metrics: dict[str, float]) -> float:
     return metrics.get("accuracy", -metrics.get("maad_deg", float("inf")))
 
@@ -225,6 +244,8 @@ def train_model(
     cosine_epochs: int | None = None,
     decay_start_epoch: int | None = None,
     disable_plateau_trigger: bool = False,
+    photometric: str | None = None,
+    scale_jitter: tuple[float, float] | None = None,
     resume_from: str | Path | None = None,
     seed: int = 0,
     device_name: str | None = None,
@@ -241,6 +262,11 @@ def train_model(
     metric history, global step and schedule state are restored and epoch numbering continues.
     Schedule options given here override the ones stored in the checkpoint, which is how a
     constant-lr run is switched to ``plateau_cosine`` with a hand-picked ``decay_start_epoch``.
+
+    Text logs written to ``output``: ``history.jsonl`` (one line per epoch, same dict as printed
+    to stdout plus ``time`` and ``epoch_seconds``; rewritten from the checkpoint history on
+    resume), ``events.jsonl`` (start / resume / schedule / finish events) and ``run.json`` (the
+    resolved experiment config and call arguments).
     """
     set_seed(seed)
     config = with_overrides(
@@ -259,6 +285,8 @@ def train_model(
         cosine_epochs=cosine_epochs,
         decay_start_epoch=decay_start_epoch,
         disable_plateau_trigger=disable_plateau_trigger,
+        photometric=photometric,
+        scale_jitter=scale_jitter,
     )
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
@@ -311,11 +339,36 @@ def train_model(
     best_path = output / "best.pt"
     last_path = output / "last.pt"
     start_epoch = len(history) + 1
+    history_path = output / "history.jsonl"
+    events_path = output / "events.jsonl"
+    run_info = {
+        "time": _timestamp(),
+        "experiment": config.__dict__,
+        "manifest": str(manifest),
+        "output": str(output),
+        "resume_from": None if resume_from is None else str(resume_from),
+        "seed": seed,
+        "device": str(device),
+        "num_workers": num_workers,
+        "train_flip_probability": train_flip_probability,
+        "train_size": len(train_dataset),
+        "test_size": len(test_dataset),
+        "val_size": None if val_dataset is None else len(val_dataset),
+        "steps_per_epoch": len(train_loader),
+        "class_to_idx": class_to_idx,
+    }
+    (output / "run.json").write_text(json.dumps(run_info, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _write_history_jsonl(history_path, history)
     if resume_data is not None:
-        print(json.dumps({"resumed_from": str(resume_from), "start_epoch": start_epoch, "global_step": global_step, "schedule_state": controller.state()}, sort_keys=True))
+        resume_event = {"event": "resume", "time": _timestamp(), "resumed_from": str(resume_from), "start_epoch": start_epoch, "global_step": global_step, "schedule_state": controller.state()}
+        print(json.dumps(resume_event, sort_keys=True))
+        _append_jsonl(events_path, resume_event)
+    else:
+        _append_jsonl(events_path, {"event": "start", "time": _timestamp(), "experiment": config.name, "epochs": config.epochs, "steps_per_epoch": len(train_loader)})
 
     stopped_early = False
     for epoch in range(start_epoch, config.epochs + 1):
+        epoch_started = time.perf_counter()
         model.train()
         losses = []
         iterator = tqdm(train_loader, desc=f"epoch {epoch}/{config.epochs}", leave=False)
@@ -345,6 +398,10 @@ def train_model(
             val_metrics = evaluate_model(model, val_loader, config, device)
             epoch_record.update({f"val_{k}": v for k, v in val_metrics.items()})
         epoch_record.update(controller.on_epoch_end(epoch, history + [epoch_record]))
+        epoch_record["time"] = _timestamp()
+        epoch_record["epoch_seconds"] = round(time.perf_counter() - epoch_started, 3)
+        if epoch_record.get("schedule_event"):
+            _append_jsonl(events_path, {"event": "schedule", "time": epoch_record["time"], "epoch": epoch, "message": epoch_record["schedule_event"], **controller.state()})
         if val_loader is not None:
             score = _selection_score(val_metrics)
             if best_score is None or score > best_score:
@@ -352,11 +409,15 @@ def train_model(
                 save_checkpoint(best_path, model, optimizer, config, class_to_idx, history + [epoch_record], global_step, controller.state())
         history.append(epoch_record)
         save_checkpoint(last_path, model, optimizer, config, class_to_idx, history, global_step, controller.state())
+        _append_jsonl(history_path, epoch_record)
         print(json.dumps(epoch_record, sort_keys=True))
         if controller.should_stop(epoch):
             stopped_early = True
-            print(json.dumps({"schedule_event": f"cosine decay complete after epoch {epoch}; stopping"}, sort_keys=True))
+            stop_event = {"event": "schedule", "time": _timestamp(), "epoch": epoch, "message": f"cosine decay complete after epoch {epoch}; stopping"}
+            print(json.dumps(stop_event, sort_keys=True))
+            _append_jsonl(events_path, stop_event)
             break
+    _append_jsonl(events_path, {"event": "finish", "time": _timestamp(), "epochs_completed": len(history), "global_step": global_step, "stopped_early": stopped_early})
 
     result: dict[str, Any] = {
         "history": history,
@@ -365,6 +426,8 @@ def train_model(
         "class_to_idx": class_to_idx,
         "schedule_state": controller.state(),
         "stopped_early": stopped_early,
+        "history_jsonl": str(history_path),
+        "events_jsonl": str(events_path),
     }
     return result
 

@@ -13,6 +13,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from .augment import PhotometricConfig, apply_photometric
 from .losses import deg2bit, quantize_labels
 
 
@@ -22,6 +23,10 @@ class CropConfig:
     random_crop: bool = False
     # Optional fixed (H, W) resize applied before cropping (``prepare_data.scale_all`` equivalent).
     resize: tuple[int, int] | None = None
+    # Optional multiplicative jitter of ``resize`` (only with random_crop). The resized image is
+    # never smaller than ``size`` so the crop always fits, i.e. the effective lower bound is
+    # ``size / resize`` (0.92 for 46/50).
+    scale_jitter: tuple[float, float] | None = None
 
 
 def read_manifest(path: str | Path) -> list[dict[str, Any]]:
@@ -63,18 +68,31 @@ def load_image(path: Path) -> np.ndarray:
     return image.astype(np.float32) / 255.0
 
 
-def crop_image(image: np.ndarray, crop: CropConfig | None) -> np.ndarray:
-    if crop is None or crop.size is None:
-        return image
+def resize_for_crop(image: np.ndarray, crop: CropConfig) -> np.ndarray:
+    """Resize ``image`` so that a ``crop.size`` window fits: fixed ``crop.resize`` (with optional
+    scale jitter for random crops), then enlarge any side still smaller than the crop."""
     crop_h, crop_w = crop.size
-    if crop.resize is not None and tuple(image.shape[:2]) != tuple(crop.resize):
-        image = cv2.resize(image, (crop.resize[1], crop.resize[0]), interpolation=cv2.INTER_LANCZOS4)
+    if crop.resize is not None:
+        target_h, target_w = crop.resize
+        if crop.random_crop and crop.scale_jitter is not None:
+            scale = random.uniform(*crop.scale_jitter)
+            target_h = max(crop_h, int(round(target_h * scale)))
+            target_w = max(crop_w, int(round(target_w * scale)))
+        if tuple(image.shape[:2]) != (target_h, target_w):
+            image = cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
     h, w = image.shape[:2]
     if h < crop_h or w < crop_w:
-        resize_h = max(h, crop_h)
-        resize_w = max(w, crop_w)
-        image = cv2.resize(image, (resize_w, resize_h), interpolation=cv2.INTER_LANCZOS4)
-        h, w = image.shape[:2]
+        image = cv2.resize(image, (max(w, crop_w), max(h, crop_h)), interpolation=cv2.INTER_LANCZOS4)
+    # Lanczos overshoots on float input; the original pipeline resized uint8 images, which
+    # OpenCV saturates, so clip to keep the [0, 1] range the notebooks fed to the network.
+    if np.issubdtype(image.dtype, np.floating):
+        image = np.clip(image, 0.0, 1.0)
+    return image
+
+
+def crop_region(image: np.ndarray, crop: CropConfig) -> np.ndarray:
+    crop_h, crop_w = crop.size
+    h, w = image.shape[:2]
     if crop.random_crop:
         top = random.randint(0, h - crop_h)
         left = random.randint(0, w - crop_w)
@@ -82,6 +100,28 @@ def crop_image(image: np.ndarray, crop: CropConfig | None) -> np.ndarray:
         top = (h - crop_h) // 2
         left = (w - crop_w) // 2
     return image[top : top + crop_h, left : left + crop_w]
+
+
+def prepare_image(
+    image: np.ndarray,
+    crop: CropConfig | None,
+    photometric: PhotometricConfig | None = None,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """resize -> (photometric) -> crop. Photometric augmentation runs on the resized image so
+    blur / noise / erasing are scaled to the network's working resolution."""
+    if crop is None or crop.size is None:
+        if photometric is not None:
+            image = apply_photometric(image, photometric, rng or np.random.default_rng(random.getrandbits(64)))
+        return image
+    image = resize_for_crop(image, crop)
+    if photometric is not None:
+        image = apply_photometric(image, photometric, rng or np.random.default_rng(random.getrandbits(64)))
+    return crop_region(image, crop)
+
+
+def crop_image(image: np.ndarray, crop: CropConfig | None) -> np.ndarray:
+    return prepare_image(image, crop)
 
 
 def flip_label(record: dict[str, Any], class_flip_map: dict[str, str] | None = None) -> dict[str, Any]:
@@ -110,11 +150,13 @@ class ManifestDataset(Dataset):
         flip_probability: float = 0.0,
         quantization_borders: np.ndarray | None = None,
         quantization_centres: np.ndarray | None = None,
+        photometric: PhotometricConfig | None = None,
     ) -> None:
         self.manifest = Path(manifest)
         self.root = self.manifest.parent
         self.target_kind = target_kind
         self.crop = crop
+        self.photometric = None if photometric is None or photometric.is_noop() else photometric
         self.class_to_idx = class_to_idx or {}
         self.class_flip_map = class_flip_map or {}
         self.flip_probability = flip_probability
@@ -142,8 +184,11 @@ class ManifestDataset(Dataset):
             image = np.ascontiguousarray(image[:, ::-1])
             record = flip_label(record, self.class_flip_map)
 
-        image = crop_image(image, self.crop)
-        image_tensor = torch.from_numpy(np.transpose(image, (2, 0, 1))).float()
+        # numpy RNG derived from Python's ``random`` so DataLoader workers (which re-seed
+        # ``random`` but not numpy) do not produce identical noise / occluders.
+        rng = np.random.default_rng(random.getrandbits(64)) if self.photometric is not None else None
+        image = prepare_image(image, self.crop, self.photometric, rng)
+        image_tensor = torch.from_numpy(np.ascontiguousarray(np.transpose(image, (2, 0, 1)))).float()
         return image_tensor, self._target(record)
 
     def _target(self, record: dict[str, Any]) -> torch.Tensor:

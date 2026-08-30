@@ -48,18 +48,50 @@ def convert_towncentre_pickle(source: str | Path, output: str | Path, image_root
     write_manifest(records, output)
 
 
-def convert_towncentre_raw(source: str | Path, output: str | Path, train_split: float = 0.9, seed: int = 0, val_split: float = 0.0) -> None:
+def _frame_index(directory: Path, person_id: int) -> dict[int, Path]:
+    """Map frame number -> image path for every non-label file of one TownCentre person directory."""
+    index: dict[int, Path] = {}
+    for path in directory.iterdir():
+        if not path.is_file() or path.suffix.lower() == ".txt":
+            continue
+        parts = path.name.split("_")
+        try:
+            frame, pid = int(parts[0]), int(parts[1])
+        except (IndexError, ValueError):
+            continue
+        if pid == person_id:
+            index[frame] = path
+    return index
+
+
+def convert_towncentre_raw(
+    source: str | Path,
+    output: str | Path,
+    train_split: float = 0.9,
+    seed: int = 0,
+    val_split: float = 0.0,
+    neighbor_frames: int = 0,
+) -> None:
     """Write a TownCentre manifest with a person-level split.
 
     Each person id is assigned to ``train`` with probability ``train_split``; otherwise to
     ``val`` with probability ``val_split`` (of the remainder) or ``test``. ``val`` is optional and
     only used for checkpoint selection, so the default keeps the notebook's 90/10 train/test split.
+
+    ``neighbor_frames=k`` additionally adds the unlabelled frames ``f-k .. f+k`` around every
+    labelled *training* frame ``f`` with the same angle (TownCentre labels every ~100th frame and
+    the head turns by a median 14 degrees per 100 frames, so a few neighbouring frames share the
+    label to well under a degree). Test/val records and the person split are unchanged, so the
+    manifest is comparable to the ``k=0`` one.
     """
+    if neighbor_frames < 0:
+        raise ValueError("neighbor_frames must be >= 0")
     source = Path(source)
     output = Path(output)
     rng = random.Random(seed)
     person_splits: dict[int, str] = {}
     records = []
+    frame_indices: dict[Path, dict[int, Path]] = {}
 
     for label_path in sorted(source.glob("*/*.txt")):
         lines = label_path.read_text(encoding="utf-8").splitlines()
@@ -89,14 +121,33 @@ def convert_towncentre_raw(source: str | Path, output: str | Path, train_split: 
             else:
                 person_splits[person_id] = "test"
 
-        records.append(
-            {
-                "split": person_splits[person_id],
-                "image": _relpath(image_path, output.parent),
-                "task": "angle_deg",
-                "angle_deg": float((float(pan_match.group(1)) + 720.0) % 360.0),
-            }
-        )
+        split = person_splits[person_id]
+        angle = float((float(pan_match.group(1)) + 720.0) % 360.0)
+        records.append({"split": split, "image": _relpath(image_path, output.parent), "task": "angle_deg", "angle_deg": angle})
+
+        if neighbor_frames > 0 and split == "train":
+            try:
+                frame = int(image_path.name.split("_")[0])
+            except ValueError as exc:
+                raise ValueError(f"Could not extract TownCentre frame number from {image_path.name}") from exc
+            index = frame_indices.get(label_path.parent)
+            if index is None:
+                index = frame_indices[label_path.parent] = _frame_index(label_path.parent, person_id)
+            for delta in range(-neighbor_frames, neighbor_frames + 1):
+                neighbor = index.get(frame + delta)
+                if delta == 0 or neighbor is None:
+                    continue
+                records.append(
+                    {
+                        "split": split,
+                        "image": _relpath(neighbor, output.parent),
+                        "task": "angle_deg",
+                        "angle_deg": angle,
+                        "source": "neighbor",
+                        "anchor_frame": frame,
+                        "frame_offset": delta,
+                    }
+                )
 
     if not records:
         raise ValueError(f"No valid TownCentre records found under {source}")

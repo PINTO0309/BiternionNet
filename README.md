@@ -151,6 +151,34 @@ uv run --locked biternion-train --experiment towncentre-biternion-vonmises \
 
 `--resume-from` restores model/optimizer state, history, global step and schedule state; epoch numbering continues and schedule options on the command line override the checkpoint's.
 
+### Text logs
+
+Every run directory also gets plain-text logs next to the checkpoints:
+
+- `history.jsonl` — one JSON object per epoch (the same record printed to stdout: `train_loss`, `lr`, test metrics, `phase` / `plateau_rate` for schedules, plus `time` and `epoch_seconds`). On resume it is rebuilt from the checkpoint's history and then appended to, so it always matches `last.pt`.
+- `events.jsonl` — `start` / `resume` / `schedule` (decay scheduled or finished) / `finish` events with timestamps.
+- `run.json` — the resolved experiment config, manifest, dataset sizes, `steps_per_epoch`, seed and device.
+
+`scripts/compare_runs.py` and `scripts/schedule_report.py` read `last.pt`; `compare_runs.py` falls back to `history.jsonl` + `run.json` when no checkpoint is present.
+
+### Data augmentation (opt-in)
+
+The paper only uses a random 46x46 crop and a horizontal flip. Three optional augmentations are available for ablations; none of them changes labels except through the existing flip rule.
+
+- **Neighbouring frames** (`biternion-convert --kind towncentre-raw --neighbor-frames 3`): TownCentre labels roughly every 100th frame, and the head turns by a median of 14 degrees per 100 frames, so the +-k unlabelled frames around every labelled *training* frame are added with the same angle (`"source": "neighbor"`, `"anchor_frame"`, `"frame_offset"` are recorded). The person split and the test records are identical to the `k=0` manifest. One epoch then has ~(2k+1)x more steps, so compare runs at equal optimizer steps (`scripts/compare_runs.py --steps 2000`).
+- **Photometric** (`--photometric cctv`): brightness/contrast/gamma, short motion blur, gaussian noise, small random erasing, mild gaussian blur and JPEG re-compression, applied to the 50x50 resized image before the crop (`cctv-light` halves the probabilities; presets live in `biternionnet.augment`).
+- **Scale jitter** (`--scale-jitter 0.9 1.1`): multiplies the pre-crop resize (50x50 -> 46..55) before the random 46x46 crop; the resized image is never smaller than the crop.
+
+```bash
+uv run --locked biternion-convert --source data/TownCentreHeadImages --kind towncentre-raw \
+  --output data/towncentre/manifest_nb3.jsonl --train-split 0.9 --seed 0 --neighbor-frames 3
+
+uv run --locked biternion-train --experiment towncentre-biternion-vonmises \
+  --manifest data/towncentre/manifest_nb3.jsonl --epochs 160 --lr-schedule plateau_cosine \
+  --disable-plateau-trigger --decay-start-epoch 146 --cosine-epochs 15 \
+  --photometric cctv --scale-jitter 0.9 1.1 --output runs/aug-all
+```
+
 Evaluate:
 
 ```bash
@@ -223,6 +251,13 @@ Inspect a manifest:
 uv run --locked python scripts/inspect_dataset.py data/custom/manifest.jsonl
 ```
 
+Plot the angle-label distribution as a JPEG bar chart (one panel per split plus "all"; bins are centred on 0°, so `--bin-width 45` gives the paper's 8 canonical directions):
+
+```bash
+uv run --locked python scripts/plot_angle_distribution.py data/towncentre/manifest.jsonl \
+  --output data/towncentre/angle_distribution.jpg --bin-width 10
+```
+
 ## Fidelity to the original notebooks
 
 - Max-pooling uses `ceil_mode=True` so the 46x46 network produces the notebook's `64@5x5` feature map (`Linear(1600, 512)`); Theano's pooling rounds partial windows up while PyTorch floors by default. Checkpoints written before this change (no `pool_ceil_mode` key) are loaded with floor pooling for compatibility.
@@ -231,6 +266,12 @@ uv run --locked python scripts/inspect_dataset.py data/custom/manifest.jsonl
 - `towncentre-vonmises` uses `kappa=0.5` like the notebook; the quantized `linreg-vonmises` presets keep `kappa=1.0`.
 - Quantized-label presets (`towncentre-q*`) are trained on bin labels but evaluated against the continuous ground-truth angle, as in Section 5 of the paper. Softmax presets report `maad_deg` (class-centre prediction), `maad_quadint_deg` (quadratic interpolation between the best bin and its neighbours), and `bin_accuracy`.
 - Not ported: the shallow "pure linear regression" baseline, the `ModuloMADCriterion` run with `N(0, 20)` last-layer init, DeepFried2's post-training BatchNorm statistics pass, multi-crop test-time augmentation, and averaging over five independently trained networks.
+
+## Experiment history
+
+`history/` holds one numbered Markdown entry per topic (fidelity fixes, dataset analysis, schedule sweep,
+augmentation ablation, ...), with the run names, commands, result tables (`scripts/compare_runs.py --markdown`)
+and figures under `history/assets/NNN/`. See `history/README.md` for the conventions and the index.
 
 ## Notes
 

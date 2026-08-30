@@ -179,3 +179,66 @@ def test_resume_continues_epochs_and_switches_to_cosine(tmp_path):
     assert resumed["history"][-1]["lr"] < resumed["history"][-2]["lr"] < 1.0
     assert abs(resumed["history"][-1]["lr"] - 0.1) < 1e-9
     assert resumed["schedule_state"]["trigger_reason"] == "manual"
+
+
+def test_training_with_photometric_and_scale_jitter(tmp_path):
+    manifest = _angle_manifest(tmp_path)
+    result = train_model(
+        "towncentre-biternion",  # has resize_size, required for scale_jitter
+        manifest,
+        tmp_path / "run",
+        epochs=1,
+        batch_size=2,
+        photometric="cctv",
+        scale_jitter=(0.9, 1.1),
+        device_name="cpu",
+    )
+    assert "maad_deg" in result["history"][0]
+    import torch
+
+    saved = torch.load(result["last_checkpoint"], map_location="cpu")["experiment"]
+    assert saved["photometric"] == "cctv" and tuple(saved["scale_jitter"]) == (0.9, 1.1)
+
+
+def test_with_overrides_validates_augmentation():
+    import pytest
+    from biternionnet.experiments import get_experiment, with_overrides
+
+    config = get_experiment("towncentre-biternion")
+    assert with_overrides(config, None, None, None, photometric="none").photometric is None
+    with pytest.raises(ValueError):
+        with_overrides(config, None, None, None, photometric="bogus")
+    with pytest.raises(ValueError):
+        with_overrides(config, None, None, None, scale_jitter=(1.1, 0.9))
+    with pytest.raises(ValueError):
+        with_overrides(get_experiment("qmul"), None, None, None, scale_jitter=(0.9, 1.1))  # no resize_size
+
+
+def test_text_logs_written_and_consistent_after_resume(tmp_path):
+    import json
+
+    manifest = _angle_manifest(tmp_path)
+    out = tmp_path / "run"
+    first = train_model("smoke-biternion", manifest, out, epochs=2, batch_size=1, device_name="cpu")
+    lines = [json.loads(l) for l in (out / "history.jsonl").read_text().splitlines()]
+    assert [r["epoch"] for r in lines] == [1, 2]
+    assert lines == first["history"]
+    assert all("time" in r and "epoch_seconds" in r for r in lines)
+    run_info = json.loads((out / "run.json").read_text())
+    assert run_info["experiment"]["name"] == "smoke-biternion" and run_info["steps_per_epoch"] == 2
+    events = [json.loads(l) for l in (out / "events.jsonl").read_text().splitlines()]
+    assert [e["event"] for e in events] == ["start", "finish"]
+
+    # resume into a fresh directory: history.jsonl is rebuilt from the checkpoint, then appended
+    out2 = tmp_path / "run2"
+    resumed = train_model(
+        "smoke-biternion", manifest, out2, epochs=5, batch_size=1, device_name="cpu",
+        resume_from=first["last_checkpoint"], lr_schedule="plateau_cosine", decay_start_epoch=4, cosine_epochs=1,
+    )
+    lines2 = [json.loads(l) for l in (out2 / "history.jsonl").read_text().splitlines()]
+    assert [r["epoch"] for r in lines2] == [1, 2, 3, 4]
+    assert lines2 == resumed["history"]
+    events2 = [json.loads(l) for l in (out2 / "events.jsonl").read_text().splitlines()]
+    assert events2[0]["event"] == "resume" and events2[0]["start_epoch"] == 3
+    assert any(e["event"] == "schedule" for e in events2) and events2[-1]["event"] == "finish"
+    assert events2[-1]["stopped_early"] is True

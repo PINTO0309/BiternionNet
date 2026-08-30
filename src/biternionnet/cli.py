@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, Optional, Tuple
 
 import typer
 
@@ -47,6 +47,8 @@ def train_command(
     cosine_epochs: Optional[int] = typer.Option(None, min=1, help="plateau_cosine: length of the cosine decay phase in epochs (default 15)."),
     decay_start_epoch: Optional[int] = typer.Option(None, min=1, help="plateau_cosine: start the cosine decay at this epoch (manual trigger)."),
     disable_plateau_trigger: bool = typer.Option(False, help="plateau_cosine: never auto-trigger; wait for --decay-start-epoch or the epoch budget."),
+    photometric: Optional[str] = typer.Option(None, help="Photometric augmentation preset for training images: cctv, cctv-light, or none."),
+    scale_jitter: Tuple[float, float] = typer.Option((0.0, 0.0), help="Multiplicative jitter range of the pre-crop resize, e.g. 0.9 1.1 (0 0 = off)."),
     resume_from: Optional[Path] = typer.Option(None, exists=True, readable=True, help="Resume from a checkpoint (last.pt); epoch numbering continues."),
     seed: int = typer.Option(0, help="Random seed."),
     device: Optional[str] = typer.Option(None, help="Torch device, e.g. cpu or cuda."),
@@ -71,6 +73,8 @@ def train_command(
         cosine_epochs=cosine_epochs,
         decay_start_epoch=decay_start_epoch,
         disable_plateau_trigger=disable_plateau_trigger,
+        photometric=photometric,
+        scale_jitter=None if scale_jitter == (0.0, 0.0) else scale_jitter,
         resume_from=resume_from,
         seed=seed,
         device_name=device,
@@ -122,13 +126,14 @@ def convert_command(
     train_split: float = typer.Option(0.9, min=0.0, max=1.0, help="Train split ratio for raw TownCentre conversion."),
     seed: int = typer.Option(0, help="Random seed for raw TownCentre person-level split."),
     val_split: float = typer.Option(0.0, min=0.0, max=1.0, help="Fraction of non-train persons assigned to a 'val' split (raw TownCentre only)."),
+    neighbor_frames: int = typer.Option(0, min=0, help="Also add the +-k unlabelled neighbouring frames of every labelled training frame with the same angle (raw TownCentre only)."),
 ) -> None:
     if kind == "tosato-classification":
         convert_tosato_classification(source, output)
     elif kind == "pickle-classification":
         convert_pickle_classification(source, output)
     elif kind == "towncentre-raw":
-        convert_towncentre_raw(source, output, train_split=train_split, seed=seed, val_split=val_split)
+        convert_towncentre_raw(source, output, train_split=train_split, seed=seed, val_split=val_split, neighbor_frames=neighbor_frames)
     elif kind == "towncentre-pickle":
         convert_towncentre_pickle(source, output, image_root=image_root)
     elif kind == "idiap-pickle":
@@ -161,6 +166,8 @@ def train_subcommand(
     cosine_epochs: Optional[int] = typer.Option(None, min=1),
     decay_start_epoch: Optional[int] = typer.Option(None, min=1),
     disable_plateau_trigger: bool = typer.Option(False),
+    photometric: Optional[str] = typer.Option(None),
+    scale_jitter: Tuple[float, float] = typer.Option((0.0, 0.0)),
     resume_from: Optional[Path] = typer.Option(None, exists=True, readable=True),
     seed: int = typer.Option(0),
     device: Optional[str] = typer.Option(None),
@@ -185,6 +192,8 @@ def train_subcommand(
         cosine_epochs,
         decay_start_epoch,
         disable_plateau_trigger,
+        photometric,
+        scale_jitter,
         resume_from,
         seed,
         device,
@@ -229,8 +238,9 @@ def convert_subcommand(
     train_split: float = typer.Option(0.9, min=0.0, max=1.0),
     seed: int = typer.Option(0),
     val_split: float = typer.Option(0.0, min=0.0, max=1.0),
+    neighbor_frames: int = typer.Option(0, min=0),
 ) -> None:
-    convert_command(source, kind, output, train_root, test_root, image_root, train_split, seed, val_split)
+    convert_command(source, kind, output, train_root, test_root, image_root, train_split, seed, val_split, neighbor_frames)
 
 
 def main_train() -> None:
