@@ -74,6 +74,22 @@ def test_pitch_calibration_classifies_but_does_not_reject_eye_level():
     assert classify_elevation(profile, calibration, config) == ("unresolved", False)
 
 
+def test_near_level_camera_regime_never_counts_as_high_angle():
+    config = load_config(CONFIG)
+    row = _quality_row(20, 0.0, -20.0, cam=20)
+    row["camera_regime"] = "near_level"
+    calibration = {
+        "valid": True,
+        "maximum_abs_pan_deg": 60,
+        "bias_deg": 0.0,
+        "threshold_deg": 25.0,
+    }
+    assert classify_elevation(row, calibration, config) == (
+        "eye_level_or_low_angle",
+        False,
+    )
+
+
 def test_back_view_is_allowed_and_direction_mapping_is_explicit():
     config = load_config(CONFIG)
     row = {

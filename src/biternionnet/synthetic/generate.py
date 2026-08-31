@@ -59,6 +59,7 @@ MASK_VARIANTS = (
 )
 STATE_NAME = "batch_state.json"
 PLAN_NAME = "generation_plan.jsonl"
+STANDALONE_PROVENANCE_DIR = "standalone_provenance"
 TERMINAL_STATUSES = {"completed", "failed", "expired", "cancelled"}
 ACTIVE_STATUSES = {"validating", "in_progress", "finalizing", "cancelling"}
 
@@ -259,6 +260,31 @@ def load_config(path: Path) -> dict[str, Any]:
             len(bin_counts) != 19 or sum(map(int, bin_counts)) != count
         ):
             raise PipelineError(f"invalid bin_counts for {stage}")
+        mask_bin_counts = stage_config.get("mask_bin_counts")
+        if mask_bin_counts is not None:
+            masks = list(map(int, mask_bin_counts))
+            counts = list(map(int, bin_counts or []))
+            if (
+                len(masks) != 19
+                or not counts
+                or any(mask < 0 or mask > total for mask, total in zip(masks, counts))
+            ):
+                raise PipelineError(f"invalid mask_bin_counts for {stage}")
+    elevation = (config.get("generation") or {}).get("camera_elevation") or {}
+    minimum = int(elevation.get("min", 0))
+    maximum = int(elevation.get("max", 0))
+    if minimum > maximum:
+        raise PipelineError("generation.camera_elevation min must not exceed max")
+    schedule = elevation.get("schedule", "random_integer")
+    if schedule not in {"random_integer", "balanced_integer"}:
+        raise PipelineError(
+            "generation.camera_elevation.schedule must be random_integer or balanced_integer"
+        )
+    if config.get("generation", {}).get("camera_regime", "high_angle") not in {
+        "high_angle",
+        "near_level",
+    }:
+        raise PipelineError("generation.camera_regime must be high_angle or near_level")
     return config
 
 
@@ -328,6 +354,58 @@ def _pan_detail(signed_pan: int) -> str:
     return "Show an exact full-back view centered on the rear of the skull; no face or side profile."
 
 
+def _camera_detail(camera_elevation: int) -> str:
+    """Describe signed camera elevation without introducing overhead bias."""
+    angle = int(camera_elevation)
+    if angle > 0:
+        return (
+            f"Place the camera exactly {angle} degrees above the subject's eye level, with its "
+            f"optical axis angled downward by {angle} degrees. Use only a subtle elevated-camera "
+            "cue; do not exaggerate this into a steep overhead or bird's-eye view."
+        )
+    if angle < 0:
+        amount = abs(angle)
+        return (
+            f"Place the camera exactly {amount} degrees below the subject's eye level, with its "
+            f"optical axis angled upward by {amount} degrees. Use only a subtle low-camera cue; "
+            "do not exaggerate this into a dramatic worm's-eye view."
+        )
+    return (
+        "Place the camera exactly at the subject's eye level with a horizontal optical axis. "
+        "Do not use top-down, overhead, low-angle, or upward-looking camera cues."
+    )
+
+
+def _balanced_integer_schedule(
+    minimum: int, maximum: int, total: int, rng: random.Random
+) -> list[int]:
+    """Allocate integer elevations almost uniformly, preserving sign symmetry when possible."""
+    values = list(range(minimum, maximum + 1))
+    if not values:
+        raise PipelineError("camera elevation schedule is empty")
+    quotient, remainder = divmod(total, len(values))
+    counts = {value: quotient for value in values}
+    if minimum == -maximum and 0 in counts:
+        pairs = list(range(1, maximum + 1))
+        rng.shuffle(pairs)
+        if remainder % 2:
+            counts[0] += 1
+            remainder -= 1
+        for magnitude in pairs[: remainder // 2]:
+            counts[-magnitude] += 1
+            counts[magnitude] += 1
+    else:
+        extras = values[:]
+        rng.shuffle(extras)
+        for value in extras[:remainder]:
+            counts[value] += 1
+    schedule = [value for value in values for _ in range(counts[value])]
+    if len(schedule) != total:
+        raise PipelineError("balanced camera schedule did not match the target count")
+    rng.shuffle(schedule)
+    return schedule
+
+
 def _exact_schedule(
     config_rows: list[dict[str, Any]], total: int, rng: random.Random
 ) -> list[str]:
@@ -352,12 +430,19 @@ def _make_prompt(config: dict[str, Any], record: dict[str, Any]) -> str:
         f"skin tone {record['skin_tone']}, {record['hair']}, wearing {record['clothing']}; "
         f"accessory: {record['accessory']}. Scene: {record['scene']}; {record['lighting']}."
     )
+    mask = (
+        f"Face covering: the subject is correctly wearing {record['mask_description']} "
+        "over the nose, mouth, and chin."
+        if record.get("mask_description")
+        else "Face covering: none; keep the nose and mouth naturally visible."
+    )
     return " ".join(
         [
             prompt["preamble"],
             prompt["camera"].format(**record),
             prompt["pan"].format(**record),
             appearance,
+            mask,
             prompt["framing"],
             prompt["realism"],
         ]
@@ -366,12 +451,33 @@ def _make_prompt(config: dict[str, Any], record: dict[str, Any]) -> str:
 
 def _make_compact_production_prompt(record: dict[str, Any]) -> str:
     """Keep the production controls while minimizing queued Batch text tokens."""
+    mask = (
+        f"Correctly wears {record['mask_description']} over nose, mouth, chin. "
+        if record.get("mask_description")
+        else "No face mask. "
+    )
+    near_level = record.get("camera_regime") == "near_level"
+    opening = (
+        "Photorealistic natural CCTV photo"
+        if near_level
+        else "Photorealistic overhead CCTV"
+    )
+    camera = (
+        record["camera_detail"]
+        if near_level
+        else (
+            f"Camera {record['camera_elevation']:+d}deg above, looking down; "
+            "crown visible."
+        )
+    )
+    neck = "upright natural neck" if near_level else "upright neck, never look up"
     return (
-        f"Photorealistic overhead CCTV: one fictional {record['age']} {record['gender']}; "
+        f"{opening}: one fictional {record['age']} {record['gender']}; "
         f"{record['skin_tone']}, {record['hair']}, {record['clothing']}, {record['accessory']}. "
-        f"Camera {record['camera_elevation']:+d}deg above, looking down; crown visible. "
+        f"{camera} "
         f"Head pan {record['signed_pan']:+d}deg ({record['expected_direction']}), "
-        f"pitch {record['head_pitch']:+d}, roll 0; upright neck, never look up. "
+        f"pitch {record['head_pitch']:+d}, roll 0; {neck}. "
+        f"{mask}"
         "One uncropped head, neck, shoulders, upper torso; head 30-40% height, clear margins. "
         f"{record['scene']}; {record['lighting']}. "
         "No extra people or faces, legs, text, watermark, CGI, or anatomy defects."
@@ -412,6 +518,8 @@ def _record(
     camera_elevation: int,
     head_pitch: int,
     size: str,
+    camera_regime: str,
+    mask_description: str | None = None,
 ) -> dict[str, Any]:
     prompt = config["prompt"]
     pan = signed_pan % 360
@@ -424,6 +532,8 @@ def _record(
         "signed_pan": signed_pan,
         "intent_pan_deg": float(pan),
         "camera_elevation": camera_elevation,
+        "camera_regime": camera_regime,
+        "camera_detail": _camera_detail(camera_elevation),
         "head_pitch": head_pitch,
         "roll": 0,
         "size": size,
@@ -441,6 +551,9 @@ def _record(
         "clothing": prompt["clothing"][index % len(prompt["clothing"])],
         "accessory": prompt["accessories"][index % len(prompt["accessories"])],
     }
+    if mask_description is not None:
+        record["augmentation_type"] = "face_mask"
+        record["mask_description"] = mask_description
     record["custom_id"] = _custom_id(signed_pan, camera_elevation, head_pitch, serial)
     record["filename"] = _image_filename(
         signed_pan,
@@ -464,23 +577,50 @@ def build_plan(
         raise PipelineError(f"unknown stage: {stage}")
     rng = random.Random(seed)
     generation = config["generation"]
+    stage_config = config["stages"][stage]
     if stage == "validation":
         if bin_counts is not None or serial_offset:
             raise PipelineError("validation does not support partial overrides")
         assignments = [dict(row) for row in config["validation"]]
     else:
-        counts = list(map(int, bin_counts or config["stages"][stage]["bin_counts"]))
+        counts = list(map(int, bin_counts or stage_config["bin_counts"]))
         if len(counts) != 19:
             raise PipelineError("bin_counts must contain 19 values")
-        assignments = [
-            {"abs_pan": abs_pan, "occurrence": occurrence}
-            for abs_pan, count in zip(config["targets"]["abs_pan_bins"], counts)
-            for occurrence in range(count)
-        ]
+        mask_counts = list(map(int, stage_config.get("mask_bin_counts") or [0] * 19))
+        assignments = []
+        odd_sign_index = 0
+        for abs_pan, count, mask_count in zip(
+            config["targets"]["abs_pan_bins"], counts, mask_counts
+        ):
+            positive_first = True
+            if stage_config.get("balance_pan_signs") and abs_pan not in {0, 180}:
+                if count % 2:
+                    positive_first = odd_sign_index % 2 == 0
+                    odd_sign_index += 1
+            for occurrence in range(count):
+                assignment = {
+                    "abs_pan": abs_pan,
+                    "occurrence": occurrence,
+                    "native_mask": occurrence < mask_count,
+                }
+                if stage_config.get("balance_pan_signs") and abs_pan not in {0, 180}:
+                    positive = (occurrence % 2 == 0) == positive_first
+                    assignment["signed_pan"] = abs_pan if positive else -abs_pan
+                assignments.append(assignment)
         rng.shuffle(assignments)
     sizes = _exact_schedule(generation["size_schedule"], len(assignments), rng)
+    elevation_config = generation["camera_elevation"]
+    elevation_schedule = None
+    if elevation_config.get("schedule", "random_integer") == "balanced_integer":
+        elevation_schedule = _balanced_integer_schedule(
+            int(elevation_config["min"]),
+            int(elevation_config["max"]),
+            len(assignments),
+            rng,
+        )
     records: list[dict[str, Any]] = []
     local_counts = {value: 0 for value in config["targets"]["abs_pan_bins"]}
+    mask_serial = 0
     for index, assignment in enumerate(assignments):
         abs_pan = int(assignment["abs_pan"])
         occurrence = local_counts[abs_pan]
@@ -491,15 +631,15 @@ def build_plan(
             signed_pan = abs_pan
         else:
             signed_pan = abs_pan if occurrence % 2 == 0 else -abs_pan
-        camera_elevation = int(
-            assignment.get(
-                "camera_elevation",
-                rng.randint(
-                    int(generation["camera_elevation"]["min"]),
-                    int(generation["camera_elevation"]["max"]),
-                ),
+        if elevation_schedule is not None and "camera_elevation" not in assignment:
+            camera_elevation = elevation_schedule[index]
+        else:
+            sampled_camera_elevation = rng.randint(
+                int(elevation_config["min"]), int(elevation_config["max"])
             )
-        )
+            camera_elevation = int(
+                assignment.get("camera_elevation", sampled_camera_elevation)
+            )
         head_pitch = int(
             assignment.get(
                 "head_pitch",
@@ -509,6 +649,10 @@ def build_plan(
                 ),
             )
         )
+        mask_description = None
+        if assignment.get("native_mask"):
+            mask_description = MASK_VARIANTS[mask_serial % len(MASK_VARIANTS)]
+            mask_serial += 1
         records.append(
             _record(
                 config,
@@ -519,6 +663,8 @@ def build_plan(
                 camera_elevation=camera_elevation,
                 head_pitch=head_pitch,
                 size=sizes[index],
+                camera_regime=str(generation.get("camera_regime", "high_angle")),
+                mask_description=mask_description,
             )
         )
     custom_ids = [row["custom_id"] for row in records]
@@ -725,6 +871,7 @@ def create_plan(
     bin_counts: list[int] | None = None,
     direct_production: bool = False,
     single_batch: bool = False,
+    sequential_batches: bool = False,
     compact_prompts: bool = False,
 ) -> Path:
     if not batch_id or any(character in batch_id for character in "/\\"):
@@ -736,12 +883,20 @@ def create_plan(
             f"Batch image generation requires api.model={BATCH_IMAGE_MODEL!r}; "
             "dated GPT-Image-2 snapshots are not accepted by the Batch API"
         )
-    if direct_production and stage != "uniform_200":
-        raise PipelineError("direct production is only allowed for uniform_200")
+    stage_config = config["stages"].get(stage) or {}
+    direct_stage_allowed = stage == "uniform_200" or bool(
+        stage_config.get("direct_production_allowed")
+    )
+    if direct_production and not direct_stage_allowed:
+        raise PipelineError(f"direct production is not allowed for {stage}")
     if direct_production and approved_batch_dir is not None:
         raise PipelineError("direct production cannot also use an approved parent")
-    if direct_production and not single_batch:
-        raise PipelineError("direct production requires --single-batch")
+    if single_batch and sequential_batches:
+        raise PipelineError("choose either --single-batch or --sequential-batches")
+    if direct_production and not (single_batch or sequential_batches):
+        raise PipelineError(
+            "direct production requires --single-batch or --sequential-batches"
+        )
     if compact_prompts and not direct_production:
         raise PipelineError("compact prompts require direct production")
     required_parent = (
@@ -869,6 +1024,7 @@ def create_plan(
         "planning_cost_basis": cost_basis,
         "direct_production": direct_production,
         "single_batch": single_batch,
+        "sequential_batches": sequential_batches,
         "prompt_profile": "compact_direct_v1" if compact_prompts else "full_v4",
         "approval_policy": (
             "operator_direct_no_human_review"
@@ -919,6 +1075,207 @@ def save_state(run_dir: Path, state: dict[str, Any]) -> None:
         state["status"] = "terminal_with_failures"
     state["updated_at"] = utc_now()
     _atomic_json(run_dir / STATE_NAME, state)
+
+
+def prepare_standalone_run(run_dir: Path) -> dict[str, Any]:
+    """Detach an edit run from its parent after preserving immutable evidence."""
+    run_dir = run_dir.resolve()
+    state = load_state(run_dir)
+    parent_dir = state.get("parent_batch_dir")
+    if not parent_dir or not state.get("edit_round"):
+        raise PipelineError("standalone preparation requires a parent-backed edit run")
+    if state.get("standalone_conversion"):
+        raise PipelineError("standalone conversion is already recorded")
+    if any(
+        attempt.get("status") in ACTIVE_STATUSES
+        for shard in state["shards"]
+        for attempt in shard["attempts"]
+    ):
+        raise PipelineError("cannot detach a run while a remote Batch is active")
+    if len(state.get("items") or {}) != int(state["target_count"]) or not all(
+        item.get("status") == "success" for item in state["items"].values()
+    ):
+        raise PipelineError("standalone preparation requires every image locally collected")
+
+    required = ["auto_qa.jsonl", "qa_report.json", "accepted_annotations.jsonl"]
+    for name in required:
+        if not (run_dir / name).is_file():
+            raise PipelineError(f"standalone preparation requires {name}")
+    report = json.loads((run_dir / "qa_report.json").read_text(encoding="utf-8"))
+    target_count = int(state["target_count"])
+    promotion = report.get("operator_label_promotion") or {}
+    if (
+        report.get("total") != target_count
+        or report.get("quality_pass") != target_count
+        or promotion.get("total_accepted") != target_count
+    ):
+        raise PipelineError("standalone preparation requires fully accepted automatic QA")
+
+    final_dir = run_dir / STANDALONE_PROVENANCE_DIR
+    staging_dir = run_dir / f".{STANDALONE_PROVENANCE_DIR}.tmp"
+    if final_dir.exists() or staging_dir.exists():
+        raise PipelineError("standalone provenance directory already exists")
+    staging_dir.mkdir()
+    backup_names = [
+        STATE_NAME,
+        "auto_qa.jsonl",
+        "qa_report.json",
+        "accepted_annotations.jsonl",
+    ]
+    for optional in ("completion_audit.json", "usage_report.json"):
+        if (run_dir / optional).is_file():
+            backup_names.append(optional)
+    backups: list[dict[str, Any]] = []
+    for name in backup_names:
+        source = run_dir / name
+        target_name = f"parent_reuse_{name}"
+        target = staging_dir / target_name
+        shutil.copy2(source, target)
+        backups.append(
+            {
+                "source": name,
+                "snapshot": target_name,
+                "sha256": sha256_file(target),
+                "size_bytes": target.stat().st_size,
+            }
+        )
+
+    token_evidence: list[dict[str, Any]] = []
+    for index, (endpoint, plan) in enumerate(
+        sorted((state.get("token_batch_plans") or {}).items())
+    ):
+        usage_value = plan.get("usage_path")
+        if not usage_value:
+            continue
+        usage_path = Path(str(usage_value)).resolve()
+        if not usage_path.is_file():
+            raise PipelineError(f"token evidence is unavailable: {usage_path}")
+        expected_sha256 = plan.get("usage_sha256")
+        actual_sha256 = sha256_file(usage_path)
+        if expected_sha256 and actual_sha256 != expected_sha256:
+            raise PipelineError("token evidence changed after edit planning")
+        target_name = f"token_evidence_{index:02d}_{usage_path.name}"
+        target = staging_dir / target_name
+        shutil.copy2(usage_path, target)
+        original_evidence_run = plan.get("evidence_run")
+        plan["evidence_run"] = str(final_dir)
+        plan["usage_path"] = str(final_dir / target_name)
+        token_evidence.append(
+            {
+                "endpoint": endpoint,
+                "original_evidence_run": original_evidence_run,
+                "original_usage_path": str(usage_path),
+                "snapshot": target_name,
+                "sha256": actual_sha256,
+                "size_bytes": target.stat().st_size,
+            }
+        )
+
+    parent_keys = (
+        "parent_batch_dir",
+        "parent_state_sha256",
+        "parent_plan_sha256",
+        "parent_qa_sha256",
+        "parent_approval_sha256",
+    )
+    original_parent = {key: state.get(key) for key in parent_keys}
+    provenance = {
+        "schema_version": 1,
+        "created_at": utc_now(),
+        "run_id": state["local_batch_id"],
+        "purpose": "preserve parent-reuse evidence before full standalone QA",
+        "original_parent": original_parent,
+        "backups": backups,
+        "token_evidence": token_evidence,
+    }
+    _atomic_json(staging_dir / "provenance_manifest.json", provenance)
+    staging_dir.replace(final_dir)
+    provenance_path = final_dir / "provenance_manifest.json"
+
+    for key in parent_keys:
+        state[key] = None
+    state["standalone_conversion"] = {
+        "schema_version": 1,
+        "status": "prepared_for_full_qa",
+        "prepared_at": utc_now(),
+        "provenance_manifest": str(provenance_path),
+        "provenance_manifest_sha256": sha256_file(provenance_path),
+        "previous_parent_batch_dir": str(parent_dir),
+    }
+    save_state(run_dir, state)
+    return {
+        "batch_dir": str(run_dir),
+        "status": "prepared_for_full_qa",
+        "target_count": target_count,
+        "parent_detached": True,
+        "provenance_manifest": str(provenance_path),
+        "backups": len(backups),
+        "token_evidence_snapshots": len(token_evidence),
+    }
+
+
+def finalize_standalone_run(run_dir: Path) -> dict[str, Any]:
+    """Verify full non-reused QA and seal a prepared standalone conversion."""
+    run_dir = run_dir.resolve()
+    state = load_state(run_dir)
+    conversion = state.get("standalone_conversion")
+    if not isinstance(conversion, dict) or conversion.get("status") != (
+        "prepared_for_full_qa"
+    ):
+        raise PipelineError("standalone run is not awaiting full QA verification")
+    if state.get("parent_batch_dir") is not None:
+        raise PipelineError("standalone run still has an operational parent")
+    provenance_path = Path(str(conversion.get("provenance_manifest", "")))
+    if not provenance_path.is_file() or sha256_file(provenance_path) != conversion.get(
+        "provenance_manifest_sha256"
+    ):
+        raise PipelineError("standalone provenance is unavailable or changed")
+    qa_path = run_dir / "auto_qa.jsonl"
+    report_path = run_dir / "qa_report.json"
+    if not qa_path.is_file() or not report_path.is_file():
+        raise PipelineError("full automatic QA is required before finalization")
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    target_count = int(state["target_count"])
+    reuse = report.get("qa_reuse") or {}
+    promotion = report.get("operator_label_promotion") or {}
+    if (
+        report.get("total") != target_count
+        or report.get("quality_pass") != target_count
+        or reuse.get("compatibility") != "not_applicable"
+        or reuse.get("reused_passed_records") != 0
+        or reuse.get("evaluated_current_run_records") != target_count
+        or promotion.get("total_accepted") != target_count
+    ):
+        raise PipelineError(
+            "standalone finalization requires fully accepted, non-reused automatic QA"
+        )
+    if (
+        sum(1 for line in qa_path.open(encoding="utf-8") if line.strip())
+        != target_count
+    ):
+        raise PipelineError("standalone automatic QA row count is incomplete")
+    conversion.update(
+        {
+            "status": "verified_standalone",
+            "verified_at": utc_now(),
+            "auto_qa_sha256": sha256_file(qa_path),
+            "qa_report_sha256": sha256_file(report_path),
+            "evaluated_current_run_records": target_count,
+            "reused_passed_records": 0,
+        }
+    )
+    save_state(run_dir, state)
+    return {
+        "batch_dir": str(run_dir),
+        "status": conversion["status"],
+        "target_count": target_count,
+        "quality_pass": int(report["quality_pass"]),
+        "evaluated_current_run_records": int(
+            reuse["evaluated_current_run_records"]
+        ),
+        "reused_passed_records": int(reuse["reused_passed_records"]),
+        "provenance_manifest": str(provenance_path),
+    }
 
 
 def read_plan(
@@ -989,13 +1346,21 @@ def submit_pending(
         raise PipelineError(
             f"explicit approved request count {approved_request_count} does not match pending {pending}"
         )
-    if state.get("stage") == "uniform_200" and not state.get("parent_batch_dir"):
+    if state.get("direct_production") and not state.get("parent_batch_dir"):
         if state.get("direct_production") is not True:
             raise PipelineError(
-                "uniform_200 without a parent requires an explicit direct-production plan"
+                "production without a parent requires an explicit direct-production plan"
             )
-        if state.get("single_batch") is not True or len(state["shards"]) != 1:
-            raise PipelineError("direct production must remain a single Batch")
+        single = state.get("single_batch") is True and len(state["shards"]) == 1
+        sequential = state.get("sequential_batches") is True
+        if not (single or sequential):
+            raise PipelineError(
+                "direct production must remain single-batch or strictly sequential"
+            )
+        if sequential and any(
+            len(shard.get("custom_ids") or []) > 500 for shard in state["shards"]
+        ):
+            raise PipelineError("sequential production Batch exceeds 500 requests")
     cost_per_request = state.get(
         "planning_cost_per_request_usd",
         state.get("reference_cost_per_request_usd", 0.0),
@@ -1018,7 +1383,9 @@ def submit_pending(
         _approved_parent(parent, required)
         if sha256_file(parent / "approval.json") != state.get("parent_approval_sha256"):
             raise PipelineError("parent approval changed after planning")
-    serialized_token_batches = bool(state.get("token_batch_plans"))
+    serialized_token_batches = bool(
+        state.get("token_batch_plans") or state.get("sequential_batches")
+    )
     if serialized_token_batches and any(
         attempt.get("batch_id") and attempt.get("status") in ACTIVE_STATUSES
         for shard in state["shards"]
@@ -1107,6 +1474,104 @@ def refresh_status(run_dir: Path, client: Any | None = None) -> dict[str, Any]:
         ),
         "pending_requests": pending_request_count(state),
         "total": len(state["items"]),
+    }
+
+
+def advance_sequential_batches(
+    run_dir: Path,
+    *,
+    spend_cap_usd: float,
+    client: Any | None = None,
+) -> dict[str, Any]:
+    """Collect a terminal Batch and submit at most one next sequential Batch."""
+    state = load_state(run_dir)
+    if state.get("sequential_batches") is not True:
+        raise PipelineError("advance-sequential requires a sequential-batches plan")
+
+    status = refresh_status(run_dir, client=client)
+    state = load_state(run_dir)
+    active = [
+        attempt
+        for shard in state["shards"]
+        for attempt in shard["attempts"]
+        if attempt.get("batch_id") and attempt.get("status") in ACTIVE_STATUSES
+    ]
+    if active:
+        return {
+            "stage": status["stage"],
+            "status": status["status"],
+            "action": "waiting_for_active_batch",
+            "active_batches": [
+                {
+                    "batch_id": str(attempt["batch_id"]),
+                    "status": str(attempt["status"]),
+                    "request_counts": attempt.get("request_counts"),
+                }
+                for attempt in active
+            ],
+            "local_success": status["local_success"],
+            "pending_requests": status["pending_requests"],
+            "total": status["total"],
+            "submitted_batch_ids": [],
+        }
+
+    remote_exists = any(
+        attempt.get("batch_id")
+        for shard in state["shards"]
+        for attempt in shard["attempts"]
+    )
+    collection = collect_results(run_dir, client=client) if remote_exists else None
+    attempts_before = {
+        str(attempt["input_path"])
+        for shard in state["shards"]
+        for attempt in shard["attempts"]
+    }
+    prepare_resume(run_dir)
+    state = load_state(run_dir)
+    retry_requests = sum(
+        len(attempt["custom_ids"])
+        for shard in state["shards"]
+        for attempt in shard["attempts"]
+        if str(attempt["input_path"]) not in attempts_before
+    )
+    local_success = sum(
+        item.get("status") == "success" for item in state["items"].values()
+    )
+    if local_success == len(state["items"]):
+        return {
+            "stage": state["stage"],
+            "status": state["status"],
+            "action": "all_images_collected",
+            "local_success": local_success,
+            "total": len(state["items"]),
+            "pending_requests": pending_request_count(state),
+            "retry_requests": retry_requests,
+            "collection": collection,
+            "submitted_batch_ids": [],
+        }
+
+    pending = pending_request_count(state)
+    if pending == 0:
+        raise PipelineError(
+            "sequential run is incomplete but has no active or planned requests"
+        )
+    submitted = submit_pending(
+        run_dir,
+        approved_request_count=pending,
+        spend_cap_usd=spend_cap_usd,
+        client=client,
+    )
+    return {
+        "stage": state["stage"],
+        "status": load_state(run_dir)["status"],
+        "action": "submitted_next_batch" if submitted else "no_submission",
+        "local_success": local_success,
+        "total": len(state["items"]),
+        "pending_requests_before_submission": pending,
+        "pending_requests": pending_request_count(load_state(run_dir)),
+        "retry_requests": retry_requests,
+        "collection": collection,
+        "submitted_batch_ids": submitted,
     }
 
 
@@ -1363,6 +1828,16 @@ def _edit_prompt(
         corrections.append(
             "Show exactly one complete, clearly detectable human head and no other person."
         )
+        if int(row.get("head_count") or 0) > 1:
+            corrections.append(
+                "The detector found more than one head/person because the background contains "
+                "person-shaped content. Keep only the main foreground subject. Remove every "
+                "background human, face, head, mannequin, shop-window dummy, statue, poster, "
+                "photograph, screen image, silhouette, and human reflection. Replace any such "
+                "storefront display or reflective window with a plain opaque wall, closed shutter, "
+                "or empty facade that has no human-like shapes. Do not duplicate, reflect, or "
+                "partially repeat the foreground subject anywhere in the image."
+            )
     if "body_not_detected" in reasons:
         corrections.append(
             "Keep the neck, both shoulders, and a coherent upper torso clearly visible."
@@ -2163,20 +2638,34 @@ def collect_results(run_dir: Path, client: Any | None = None) -> dict[str, Any]:
             prefix = f"shard_{shard['index']:03d}_attempt_{attempt['number']:02d}"
             if attempt.get("output_file_id"):
                 output = run_dir / f"{prefix}_output.jsonl"
+                output_already_processed = (
+                    attempt.get("local_output_path") == output.name
+                    and output.exists()
+                    and attempt.get("local_output_sha256") == sha256_file(output)
+                )
                 if not output.exists():
                     _download_file(client, attempt["output_file_id"], output)
-                new_ids, new_usage = process_output_jsonl(output, run_dir, state, plan)
-                changed.update(new_ids)
-                usage.update({row["custom_id"]: row for row in new_usage})
-                attempt["local_output_path"] = output.name
-                attempt["local_output_sha256"] = sha256_file(output)
+                if not output_already_processed:
+                    new_ids, new_usage = process_output_jsonl(
+                        output, run_dir, state, plan
+                    )
+                    changed.update(new_ids)
+                    usage.update({row["custom_id"]: row for row in new_usage})
+                    attempt["local_output_path"] = output.name
+                    attempt["local_output_sha256"] = sha256_file(output)
             if attempt.get("error_file_id"):
                 error = run_dir / f"{prefix}_error.jsonl"
+                error_already_processed = (
+                    attempt.get("local_error_path") == error.name
+                    and error.exists()
+                    and attempt.get("local_error_sha256") == sha256_file(error)
+                )
                 if not error.exists():
                     _download_file(client, attempt["error_file_id"], error)
-                _process_error_jsonl(error, state)
-                attempt["local_error_path"] = error.name
-                attempt["local_error_sha256"] = sha256_file(error)
+                if not error_already_processed:
+                    _process_error_jsonl(error, state)
+                    attempt["local_error_path"] = error.name
+                    attempt["local_error_sha256"] = sha256_file(error)
             save_state(run_dir, state)
     write_jsonl(usage_path, (usage[key] for key in sorted(usage)))
     _hash_manifest(run_dir, state)

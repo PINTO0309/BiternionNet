@@ -15,14 +15,17 @@ from biternionnet.synthetic.generate import (
     _pitch_calibration_tail_candidates,
     _qa_edit_reasons,
     _token_based_batch_plan,
+    advance_sequential_batches,
     build_plan,
     build_usage_report,
     create_edit_cycle,
     create_mask_augmentation,
     create_plan,
+    finalize_standalone_run,
     load_config,
     load_state,
     pending_request_count,
+    prepare_standalone_run,
     process_output_jsonl,
     read_plan,
     refresh_status,
@@ -38,6 +41,11 @@ CONFIG = (
 )
 SNAPSHOT_CONFIG = (
     Path(__file__).resolve().parents[1] / "configs" / "synthetic_towncentre.yaml"
+)
+NEAR_LEVEL_CONFIG = (
+    Path(__file__).resolve().parents[1]
+    / "configs"
+    / "synthetic_towncentre_near_level_batch.yaml"
 )
 
 
@@ -211,6 +219,24 @@ def test_crop_edit_prompt_translates_person_away_from_overflowing_edges():
     assert "uniformly reduce the entire person by approximately 3%" in prompt
 
 
+def test_multiple_head_edit_prompt_removes_person_shaped_background_content():
+    record = {
+        "size": "1024x1024",
+        "prompt": "Original target.",
+    }
+    row = {
+        "head_count": 3,
+        "actual_size": "1024x1024",
+    }
+
+    prompt = _edit_prompt(record, row, ["head_count_not_one"])
+
+    assert "Keep only the main foreground subject" in prompt
+    assert "mannequin" in prompt
+    assert "human reflection" in prompt
+    assert "plain opaque wall" in prompt
+
+
 def test_deim_direction_does_not_create_an_edit_reason():
     config = load_config(CONFIG)
     reasons = _qa_edit_reasons(
@@ -297,6 +323,96 @@ def test_direct_uniform_production_requires_explicit_single_batch(tmp_path):
     plan = read_plan(run, state)
     assert all("Photorealistic overhead CCTV" in row["prompt"] for row in plan.values())
     assert all("detected head" not in row["prompt"] for row in plan.values())
+
+
+def test_near_level_plan_preserves_pan_distribution_and_submits_serially(tmp_path):
+    run = create_plan(
+        NEAR_LEVEL_CONFIG,
+        "near_level_8400",
+        "production-nearlevel8400-v001",
+        tmp_path,
+        seed=20260831,
+        direct_production=True,
+        sequential_batches=True,
+        compact_prompts=True,
+    )
+    state = load_state(run)
+    rows = list(read_plan(run, state).values())
+
+    assert state["request_count"] == 8400
+    assert state["single_batch"] is False
+    assert state["sequential_batches"] is True
+    assert [len(shard["custom_ids"]) for shard in state["shards"]] == [500] * 16 + [
+        400
+    ]
+    assert Counter(row["abs_pan_bin"] for row in rows) == Counter(
+        {
+            0: 182,
+            10: 441,
+            20: 638,
+            30: 594,
+            40: 331,
+            50: 501,
+            60: 548,
+            70: 728,
+            80: 800,
+            90: 687,
+            100: 564,
+            110: 592,
+            120: 556,
+            130: 395,
+            140: 277,
+            150: 225,
+            160: 251,
+            170: 90,
+        }
+    )
+    sign_counts = Counter(
+        1 if row["signed_pan"] > 0 else -1 if row["signed_pan"] < 0 else 0
+        for row in rows
+    )
+    assert sign_counts == Counter({1: 4109, -1: 4109, 0: 182})
+
+    elevation_counts = Counter(row["camera_elevation"] for row in rows)
+    assert set(elevation_counts) == set(range(-20, 21))
+    assert set(elevation_counts.values()) == {204, 205}
+    assert sum(elevation_counts[value] for value in range(-20, 0)) == 4098
+    assert sum(elevation_counts[value] for value in range(1, 21)) == 4098
+    assert elevation_counts[0] == 204
+
+    masked = [row for row in rows if row.get("augmentation_type") == "face_mask"]
+    assert len(masked) == 1680
+    assert max(row["abs_pan_bin"] for row in masked) == 90
+    assert set(Counter(row["mask_description"] for row in masked).values()) == {210}
+    assert all(row["camera_regime"] == "near_level" for row in rows)
+    assert "above the subject's eye level" in next(
+        row["prompt"] for row in rows if row["camera_elevation"] == 20
+    )
+    assert "below the subject's eye level" in next(
+        row["prompt"] for row in rows if row["camera_elevation"] == -20
+    )
+    assert "exactly at the subject's eye level" in next(
+        row["prompt"] for row in rows if row["camera_elevation"] == 0
+    )
+    assert "Correctly wears" in masked[0]["prompt"]
+
+    client = SimpleNamespace(files=_FakeFiles(), batches=_FakeBatches())
+    advance = advance_sequential_batches(
+        run,
+        spend_cap_usd=100.0,
+        client=client,
+    )
+    assert advance["action"] == "submitted_next_batch"
+    assert advance["submitted_batch_ids"] == ["batch-1"]
+    assert advance["retry_requests"] == 0
+    assert pending_request_count(load_state(run)) == 7900
+    assert submit_pending(
+        run,
+        approved_request_count=7900,
+        spend_cap_usd=100.0,
+        client=client,
+    ) == []
+    assert client.batches.created == 1
 
 
 class _FakeFiles:
@@ -669,6 +785,92 @@ def test_usage_report_and_model_install_are_explicit_and_hash_checked(tmp_path):
         assets, source_repo=source_repo, repository_root=tmp_path / "repo"
     )
     assert installed_again[0]["status"] == "present"
+
+
+def test_standalone_conversion_archives_parent_evidence_and_requires_full_qa(
+    tmp_path,
+):
+    run = create_plan(CONFIG, "validation", "validation-standalone", tmp_path, seed=3)
+    state = load_state(run)
+    for item in state["items"].values():
+        item["status"] = "success"
+    for shard in state["shards"]:
+        for attempt in shard["attempts"]:
+            attempt["status"] = "completed"
+    state.update(
+        {
+            "direct_production": True,
+            "approval_policy": "operator_direct_no_human_review",
+            "edit_round": 1,
+            "parent_batch_dir": str(tmp_path / "parent"),
+            "parent_state_sha256": "state-hash",
+            "parent_plan_sha256": "plan-hash",
+            "parent_qa_sha256": "qa-hash",
+            "parent_approval_sha256": None,
+        }
+    )
+    evidence = tmp_path / "parent_usage.jsonl"
+    evidence.write_text('{"usage": {"input_tokens": 10}}\n', encoding="utf-8")
+    state["token_batch_plans"] = {
+        "/v1/images/edits": {
+            "evidence_run": str(tmp_path / "parent"),
+            "usage_path": str(evidence),
+            "usage_sha256": sha256_file(evidence),
+        }
+    }
+    save_state(run, state)
+    count = int(state["target_count"])
+    write_jsonl(run / "auto_qa.jsonl", ({"custom_id": str(i)} for i in range(count)))
+    write_jsonl(
+        run / "accepted_annotations.jsonl",
+        ({"custom_id": str(i)} for i in range(count)),
+    )
+    (run / "qa_report.json").write_text(
+        json.dumps(
+            {
+                "total": count,
+                "quality_pass": count,
+                "operator_label_promotion": {"total_accepted": count},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    prepared = prepare_standalone_run(run)
+    detached = load_state(run)
+    assert prepared["parent_detached"] is True
+    assert detached["parent_batch_dir"] is None
+    assert detached["standalone_conversion"]["status"] == "prepared_for_full_qa"
+    local_usage = Path(
+        detached["token_batch_plans"]["/v1/images/edits"]["usage_path"]
+    )
+    assert local_usage.is_file()
+    assert run.resolve() in local_usage.parents
+    provenance = json.loads(
+        Path(prepared["provenance_manifest"]).read_text(encoding="utf-8")
+    )
+    assert provenance["original_parent"]["parent_qa_sha256"] == "qa-hash"
+
+    with pytest.raises(PipelineError, match="non-reused"):
+        finalize_standalone_run(run)
+    (run / "qa_report.json").write_text(
+        json.dumps(
+            {
+                "total": count,
+                "quality_pass": count,
+                "qa_reuse": {
+                    "compatibility": "not_applicable",
+                    "reused_passed_records": 0,
+                    "evaluated_current_run_records": count,
+                },
+                "operator_label_promotion": {"total_accepted": count},
+            }
+        ),
+        encoding="utf-8",
+    )
+    finalized = finalize_standalone_run(run)
+    assert finalized["status"] == "verified_standalone"
+    assert finalized["evaluated_current_run_records"] == count
 
 
 def test_pilot_cost_projection_uses_hash_bound_validation_account_cost(tmp_path):

@@ -527,6 +527,8 @@ def rear_reliability_policy(
 def classify_elevation(
     row: dict[str, Any], calibration: dict[str, Any], config: dict[str, Any]
 ) -> tuple[str, bool]:
+    if row.get("camera_regime") == "near_level":
+        return "eye_level_or_low_angle", False
     if (
         int(row.get("abs_pan_bin", 999))
         > int(calibration.get("maximum_abs_pan_deg", 60))
@@ -740,6 +742,9 @@ def run_auto_qa(
                     "abs_pan_bin": record["abs_pan_bin"],
                     "intent_pan_deg": record["intent_pan_deg"],
                     "camera_elevation": record["camera_elevation"],
+                    "camera_regime": record.get("camera_regime", "high_angle"),
+                    "augmentation_type": record.get("augmentation_type"),
+                    "mask_description": record.get("mask_description"),
                     "expected_direction": record["expected_direction"],
                     "qa_reused_from_parent": True,
                     "qa_reused_parent_custom_id": parent_row["custom_id"],
@@ -753,6 +758,9 @@ def run_auto_qa(
             "abs_pan_bin": record["abs_pan_bin"],
             "intent_pan_deg": record["intent_pan_deg"],
             "camera_elevation": record["camera_elevation"],
+            "camera_regime": record.get("camera_regime", "high_angle"),
+            "augmentation_type": record.get("augmentation_type"),
+            "mask_description": record.get("mask_description"),
             "expected_direction": record["expected_direction"],
             "exists": path.exists(),
             "image_valid": False,
@@ -904,7 +912,7 @@ def run_auto_qa(
                 )
     rear_policy: dict[str, Any] | None = None
     rear_policy_mode = "not_applicable"
-    if state["stage"] in {"floor_120", "uniform_200"}:
+    if direct_production or state["stage"] in {"floor_120", "uniform_200"}:
         if direct_production:
             if rear_policy_path is not None:
                 raise PipelineError(

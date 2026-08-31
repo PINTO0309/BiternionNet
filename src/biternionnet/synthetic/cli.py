@@ -10,14 +10,17 @@ import typer
 
 from .generate import (
     PipelineError,
+    advance_sequential_batches,
     build_usage_report,
     collect_results,
     create_edit_cycle,
     create_mask_augmentation,
     create_plan,
+    finalize_standalone_run,
     load_config,
     load_state,
     pending_request_count,
+    prepare_standalone_run,
     prepare_resume,
     read_jsonl,
     refresh_status,
@@ -45,7 +48,7 @@ def _print(value: object) -> None:
 
 @app.command("plan")
 def plan_command(
-    stage: str = typer.Option(..., help="validation, pilot, floor_120, or uniform_200"),
+    stage: str = typer.Option(..., help="Configured generation stage name."),
     batch_id: str = typer.Option(...),
     config: Path = typer.Option(
         Path("configs/synthetic_towncentre_batch.yaml"), exists=True, readable=True
@@ -69,6 +72,14 @@ def plan_command(
         "--single-batch",
         help="Write all planned requests to one Batch input file.",
     ),
+    sequential_batches: bool = typer.Option(
+        False,
+        "--sequential-batches",
+        help=(
+            "Submit at most one planned Batch at a time; the next remains planned "
+            "until the active Batch reaches a terminal status."
+        ),
+    ),
     compact_prompts: bool = typer.Option(
         False,
         "--compact-prompts",
@@ -89,6 +100,7 @@ def plan_command(
         bin_counts=counts,
         direct_production=direct_production,
         single_batch=single_batch,
+        sequential_batches=sequential_batches,
         compact_prompts=compact_prompts,
     )
     state = load_state(run_dir)
@@ -107,6 +119,7 @@ def plan_command(
             "planning_cost_basis": state["planning_cost_basis"],
             "direct_production": state["direct_production"],
             "single_batch": state["single_batch"],
+            "sequential_batches": state["sequential_batches"],
             "prompt_profile": state["prompt_profile"],
             "paid_request_submitted": False,
         }
@@ -238,6 +251,36 @@ def submit_command(
 @app.command("status")
 def status_command(batch_dir: Path = typer.Option(..., exists=True)) -> None:
     _print(refresh_status(batch_dir))
+
+
+@app.command("standalone-prepare")
+def standalone_prepare_command(
+    batch_dir: Path = typer.Option(..., exists=True, file_okay=False),
+) -> None:
+    """Archive parent evidence and detach a completed edit run for full QA."""
+    _print(prepare_standalone_run(batch_dir))
+
+
+@app.command("standalone-finalize")
+def standalone_finalize_command(
+    batch_dir: Path = typer.Option(..., exists=True, file_okay=False),
+) -> None:
+    """Seal a detached run after full non-reused QA and label promotion."""
+    _print(finalize_standalone_run(batch_dir))
+
+
+@app.command("advance-sequential")
+def advance_sequential_command(
+    batch_dir: Path = typer.Option(..., exists=True, file_okay=False),
+    spend_cap_usd: float = typer.Option(..., min=0.001),
+) -> None:
+    """Collect a terminal Batch and submit no more than one next Batch."""
+    _print(
+        advance_sequential_batches(
+            batch_dir,
+            spend_cap_usd=spend_cap_usd,
+        )
+    )
 
 
 @app.command("collect")
