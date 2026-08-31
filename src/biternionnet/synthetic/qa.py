@@ -371,7 +371,10 @@ def run_auto_qa(
         if detector_sha256 != config["models"]["deimv2"]["sha256"]:
             raise PipelineError("DEIM model SHA-256 does not match the configured QA asset")
         detector_provider_plan = build_provider_plan(
-            detector_model, model_sha256=detector_sha256, force_cpu=cpu
+            detector_model,
+            model_sha256=detector_sha256,
+            force_cpu=cpu,
+            allow_tensorrt=False,
         )
         detector = Deimv2Detector(
             detector_model,

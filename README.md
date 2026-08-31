@@ -217,12 +217,14 @@ review row; genuine rear views may be unresolved. Approval writes a hash-bound `
 but it does not activate an HRFFA rejection gate. Validation approval also binds the profile-evaluation
 protocol and the account-verified model snapshot by SHA-256:
 
-All three ONNX QA models run at batch size 1. The default provider order is TensorRT, CUDA, then CPU; use
-`qa --cpu` only to force CPU. The DEIM graph has a symbolic public batch axis, but the pipeline still invokes
-it one image at a time and rejects any internal inference tensor whose leading dimension is not 1. Do not
-replace the HRFFA model with its `Nx3x320x320` sibling or add batched DEIM calls. TensorRT engine/timing caches
-are isolated under `data/models/trt_cache/` by ONNX Runtime version, model SHA-256, and `batch1`, so another
-model revision or batch profile cannot reuse the same cache.
+All three ONNX QA models run at batch size 1. SixD and HRFFA use TensorRT, CUDA, then CPU. **DEIMv2 never uses
+TensorRT** because its TensorRT result has shown an unexplained accuracy regression; DEIM uses CUDA, then CPU.
+Use `qa --cpu` only to force every model to CPU. The DEIM graph has a symbolic public batch axis, but the
+pipeline still invokes it one image at a time and rejects any internal inference tensor whose leading dimension
+is not 1. Do not replace the HRFFA model with its `Nx3x320x320` sibling or add batched DEIM calls. TensorRT
+engine/timing caches for SixD and HRFFA are isolated under `data/models/trt_cache/` by ONNX Runtime, TensorRT,
+CUDA runtime, GPU compute capability, precision, model SHA-256, and `batch1`. Any runtime change therefore
+selects a new empty cache and can never reuse an engine produced by the previous runtime.
 
 ```bash
 uv run --locked biternion-synthetic collect --batch-dir data/synthetic/batches/validation-v003

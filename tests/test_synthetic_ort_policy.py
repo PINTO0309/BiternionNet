@@ -5,6 +5,7 @@ import pytest
 
 from biternionnet.synthetic.detector import Deimv2Detector
 from biternionnet.synthetic.ort_policy import (
+    TensorRTRuntimeFingerprint,
     build_provider_plan,
     require_batch_one,
     validate_model_batch_axis,
@@ -24,6 +25,10 @@ def test_tensorrt_is_first_and_cache_is_isolated_to_model_hash_and_batch1(
             "TensorrtExecutionProvider",
         ],
     )
+    runtime = TensorRTRuntimeFingerprint("1.26.0", "10.14.1", "13.0", "86")
+    monkeypatch.setattr(
+        "biternionnet.synthetic.ort_policy._runtime_fingerprint", lambda: runtime
+    )
     digest = "a" * 64
     plan = build_provider_plan(model, model_sha256=digest)
     provider, options = plan.providers[0]
@@ -31,10 +36,12 @@ def test_tensorrt_is_first_and_cache_is_isolated_to_model_hash_and_batch1(
     assert plan.providers[1:] == ["CUDAExecutionProvider", "CPUExecutionProvider"]
     assert plan.tensorrt_cache_dir is not None
     assert plan.tensorrt_cache_dir.name == "model-aaaaaaaaaaaaaaaa-batch1"
+    assert plan.tensorrt_cache_dir.parent.name == "ort-1.26.0_trt-10.14.1_cuda-13.0_sm86_fp32"
     assert plan.tensorrt_cache_dir.is_dir()
     assert options["trt_engine_cache_enable"] is True
     assert options["trt_engine_cache_path"] == str(plan.tensorrt_cache_dir.resolve())
     assert plan.report()["multiple_batch_forbidden"] is True
+    assert plan.report()["tensorrt_runtime"] == runtime.report()
 
 
 def test_cpu_override_and_batch_guards_are_fail_closed(
@@ -50,12 +57,44 @@ def test_cpu_override_and_batch_guards_are_fail_closed(
     assert plan.providers == ["CPUExecutionProvider"]
     assert plan.tensorrt_cache_dir is None
 
+    cuda_plan = build_provider_plan(model, allow_tensorrt=False)
+    assert cuda_plan.providers == ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    assert cuda_plan.report()["provider_priority"] == [
+        "CUDAExecutionProvider",
+        "CPUExecutionProvider",
+    ]
+    assert cuda_plan.tensorrt_cache_dir is None
+    assert cuda_plan.tensorrt_runtime is None
+
     require_batch_one(np.zeros((1, 3, 8, 8), dtype=np.float32), model_name="fixture")
     with pytest.raises(ValueError, match="batch size 1"):
         require_batch_one(np.zeros((2, 3, 8, 8), dtype=np.float32), model_name="fixture")
     validate_model_batch_axis(["N", 3, 640, 640], model_name="DEIM", allow_dynamic=True)
     with pytest.raises(ValueError, match="fixed batch 1"):
         validate_model_batch_axis(["N", 3, 320, 320], model_name="HRFFA", allow_dynamic=False)
+
+
+def test_runtime_change_cannot_reuse_an_existing_tensorrt_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    model = tmp_path / "model.onnx"
+    model.write_bytes(b"fixture")
+    monkeypatch.setattr(
+        "biternionnet.synthetic.ort_policy.ort.get_available_providers",
+        lambda: ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
+    first_runtime = TensorRTRuntimeFingerprint("1.26.0", "10.14.1", "13.0", "86")
+    second_runtime = TensorRTRuntimeFingerprint("1.27.0", "10.15.0", "13.1", "86")
+    monkeypatch.setattr(
+        "biternionnet.synthetic.ort_policy._runtime_fingerprint", lambda: first_runtime
+    )
+    first = build_provider_plan(model, model_sha256="b" * 64)
+    monkeypatch.setattr(
+        "biternionnet.synthetic.ort_policy._runtime_fingerprint", lambda: second_runtime
+    )
+    second = build_provider_plan(model, model_sha256="b" * 64)
+    assert first.tensorrt_cache_dir != second.tensorrt_cache_dir
+    assert first.tensorrt_cache_dir.parent != second.tensorrt_cache_dir.parent
 
 
 def test_deim_list_api_never_combines_images_into_a_multiple_batch():

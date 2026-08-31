@@ -47,7 +47,7 @@ class Deimv2Detector:
         self._providers = (
             providers
             if providers is not None
-            else build_provider_plan(model_path).providers
+            else build_provider_plan(model_path, allow_tensorrt=False).providers
         )
         self.session = self._make_session(self._providers)
         model_input = self.session.get_inputs()[0]
