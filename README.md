@@ -376,7 +376,7 @@ uv run --locked biternion-export-onnx \
 --opset 17
 ```
 
-This writes static and dynamic-batch ONNX files, plus `_sim.onnx` optimized versions. The model uses flatten + Linear layers, so spatial dimensions are fixed by the checkpoint experiment; the dynamic ONNX export intentionally makes only the batch axis dynamic.
+This writes static and dynamic-batch ONNX files named by their input shape (`<prefix>_1x3x46x46.onnx`, `<prefix>_Nx3x46x46.onnx`; the static batch follows `--batch-size`), optimized in place with onnxsim (no separate `_sim.onnx` files; metadata records `opset` and `onnxsim: true/false`). The model uses flatten + Linear layers, so spatial dimensions are fixed by the checkpoint experiment; the dynamic ONNX export intentionally makes only the batch axis dynamic.
 
 ## Experiment Presets
 

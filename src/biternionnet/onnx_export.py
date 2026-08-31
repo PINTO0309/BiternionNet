@@ -56,15 +56,16 @@ def _check_onnx(path: Path) -> None:
     onnx.checker.check_model(model)
 
 
-def _simplify_onnx(source: Path, destination: Path, input_shape: tuple[int, int, int, int], dynamic_batch: bool) -> None:
+def _simplify_onnx_inplace(path: Path, input_shape: tuple[int, int, int, int]) -> None:
+    """Optimize with onnxsim and overwrite ``path`` (metadata is re-applied by the caller)."""
     model, ok = simplify(
-        str(source),
+        str(path),
         test_input_shapes={"input": list(input_shape)},
     )
     if not ok:
-        raise RuntimeError(f"onnxsim validation failed for {source}")
-    onnx.save(model, destination)
-    _check_onnx(destination)
+        raise RuntimeError(f"onnxsim validation failed for {path}")
+    onnx.save(model, path)
+    _check_onnx(path)
 
 
 def _export_one(
@@ -111,12 +112,12 @@ def export_checkpoint_to_onnx(
     dummy_input = torch.zeros(batch_size, 3, height, width, dtype=torch.float32, device=device)
     prefix = prefix or checkpoint.parent.name or checkpoint.stem
 
-    static_path = output_dir / f"{prefix}_static_opset{opset}.onnx"
-    dynamic_path = output_dir / f"{prefix}_dynamic_batch_opset{opset}.onnx"
-    static_simplified_path = output_dir / f"{prefix}_static_opset{opset}_sim.onnx"
-    dynamic_simplified_path = output_dir / f"{prefix}_dynamic_batch_opset{opset}_sim.onnx"
+    shape_tag = f"3x{height}x{width}"
+    static_path = output_dir / f"{prefix}_{batch_size}x{shape_tag}.onnx"
+    dynamic_path = output_dir / f"{prefix}_Nx{shape_tag}.onnx"
 
     metadata = {
+        "opset": str(opset),
         "checkpoint": str(checkpoint),
         "experiment": config.name,
         "input_size": json.dumps(config.input_size),
@@ -125,22 +126,19 @@ def export_checkpoint_to_onnx(
         "history_length": str(len(checkpoint_data.get("history", []))),
     }
 
+    input_shape = tuple(dummy_input.shape)
+    onnxsim_flag = "true" if simplify_models else "false"
     _export_one(model, dummy_input, static_path, opset, dynamic_batch=False)
-    _add_metadata(static_path, metadata | {"input_shape_mode": "static"})
+    if simplify_models:
+        _simplify_onnx_inplace(static_path, input_shape)
+    _add_metadata(static_path, metadata | {"input_shape_mode": "static", "onnxsim": onnxsim_flag})
 
     _export_one(model, dummy_input, dynamic_path, opset, dynamic_batch=True)
-    _add_metadata(dynamic_path, metadata | {"input_shape_mode": "dynamic_batch"})
+    if simplify_models:
+        _simplify_onnx_inplace(dynamic_path, input_shape)
+    _add_metadata(dynamic_path, metadata | {"input_shape_mode": "dynamic_batch", "onnxsim": onnxsim_flag})
 
-    outputs = {
+    return {
         "static": str(static_path),
         "dynamic_batch": str(dynamic_path),
     }
-    if simplify_models:
-        input_shape = tuple(dummy_input.shape)
-        _simplify_onnx(static_path, static_simplified_path, input_shape, dynamic_batch=False)
-        _add_metadata(static_simplified_path, metadata | {"input_shape_mode": "static", "onnxsim": "true"})
-        _simplify_onnx(dynamic_path, dynamic_simplified_path, input_shape, dynamic_batch=True)
-        _add_metadata(dynamic_simplified_path, metadata | {"input_shape_mode": "dynamic_batch", "onnxsim": "true"})
-        outputs["static_simplified"] = str(static_simplified_path)
-        outputs["dynamic_batch_simplified"] = str(dynamic_simplified_path)
-    return outputs

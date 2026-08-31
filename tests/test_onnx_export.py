@@ -31,10 +31,14 @@ def test_export_checkpoint_to_static_and_dynamic_batch_onnx(tmp_path):
 
     outputs = export_checkpoint_to_onnx(checkpoint, tmp_path / "onnx", prefix="smoke", opset=17)
 
+    assert set(outputs) == {"static", "dynamic_batch"}  # simplified in place, no separate _sim files
+    assert sorted(p.name for p in (tmp_path / "onnx").glob("*.onnx")) == ["smoke_1x3x46x46.onnx", "smoke_Nx3x46x46.onnx"]
     for path in outputs.values():
-        onnx.checker.check_model(onnx.load(path))
+        model = onnx.load(path)
+        onnx.checker.check_model(model)
+        assert {p.key: p.value for p in model.metadata_props}["onnxsim"] == "true"
 
-    static_dims = [dim.dim_param or dim.dim_value for dim in onnx.load(outputs["static_simplified"]).graph.input[0].type.tensor_type.shape.dim]
-    dynamic_dims = [dim.dim_param or dim.dim_value for dim in onnx.load(outputs["dynamic_batch_simplified"]).graph.input[0].type.tensor_type.shape.dim]
+    static_dims = [dim.dim_param or dim.dim_value for dim in onnx.load(outputs["static"]).graph.input[0].type.tensor_type.shape.dim]
+    dynamic_dims = [dim.dim_param or dim.dim_value for dim in onnx.load(outputs["dynamic_batch"]).graph.input[0].type.tensor_type.shape.dim]
     assert static_dims == [1, 3, 46, 46]
     assert dynamic_dims == ["batch", 3, 46, 46]
