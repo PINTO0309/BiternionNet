@@ -4,6 +4,10 @@ Created 2026-08-30 (user request: list, per angle band, how many images have to 
 the yaw/pan coverage of TownCentre; a synthetic generation run will be attempted). Counts come from
 `data/towncentre/manifest.jsonl` (train 3 904 / test 443); the generation-yield assumption comes from 005.
 
+> Status update (2026-08-31): the quota arithmetic and per-band table remain the planning basis, but sections
+> 3-5 are superseded by [007](007_synthetic_pipeline_design.md) after design review. In particular, do not use
+> the absolute `|pitch| <= 35 deg` gate or the old fixed-effect promotion criterion from this entry.
+
 ## 0. How the numbers are defined
 
 - Bins are 10 deg wide and centred on multiples of 10 deg (pan 0 = facing the camera, 90 = profile facing image-right,

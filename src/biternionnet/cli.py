@@ -54,6 +54,9 @@ def train_command(
     device: Optional[str] = typer.Option(None, help="Torch device, e.g. cpu or cuda."),
     num_workers: int = typer.Option(0, help="DataLoader worker count."),
     train_flip_probability: float = typer.Option(0.5, min=0.0, max=1.0, help="Training horizontal flip probability."),
+    synthetic_fraction: float = typer.Option(0.0, min=0.0, max=0.99, help="Exact fraction of epoch draws from records with source=synthetic."),
+    epoch_samples: Optional[int] = typer.Option(None, min=1, help="Epoch draw count when synthetic source sampling is enabled (default 26897)."),
+    synthetic_max_repeats: int = typer.Option(4, min=1, help="Maximum draws of one synthetic image per epoch."),
 ) -> None:
     result = train_model(
         experiment,
@@ -80,6 +83,9 @@ def train_command(
         device_name=device,
         num_workers=num_workers,
         train_flip_probability=train_flip_probability,
+        synthetic_fraction=synthetic_fraction,
+        epoch_samples=epoch_samples,
+        synthetic_max_repeats=synthetic_max_repeats,
     )
     typer.echo(json.dumps(result, sort_keys=True))
 
@@ -91,8 +97,17 @@ def eval_command(
     device: Optional[str] = typer.Option(None, help="Torch device, e.g. cpu or cuda."),
     batch_size: Optional[int] = typer.Option(None, help="Override batch size."),
     num_workers: int = typer.Option(0, help="DataLoader worker count."),
+    predictions_output: Optional[Path] = typer.Option(None, help="Optional per-item prediction JSONL for paired bootstrap."),
 ) -> None:
-    evaluate_checkpoint(checkpoint, manifest, split=split, device_name=device, batch_size=batch_size, num_workers=num_workers)
+    evaluate_checkpoint(
+        checkpoint,
+        manifest,
+        split=split,
+        device_name=device,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        predictions_output=predictions_output,
+    )
 
 
 def export_onnx_command(
@@ -173,6 +188,9 @@ def train_subcommand(
     device: Optional[str] = typer.Option(None),
     num_workers: int = typer.Option(0),
     train_flip_probability: float = typer.Option(0.5, min=0.0, max=1.0),
+    synthetic_fraction: float = typer.Option(0.0, min=0.0, max=0.99),
+    epoch_samples: Optional[int] = typer.Option(None, min=1),
+    synthetic_max_repeats: int = typer.Option(4, min=1),
 ) -> None:
     train_command(
         experiment,
@@ -199,6 +217,9 @@ def train_subcommand(
         device,
         num_workers,
         train_flip_probability,
+        synthetic_fraction,
+        epoch_samples,
+        synthetic_max_repeats,
     )
 
 
@@ -210,8 +231,9 @@ def eval_subcommand(
     device: Optional[str] = typer.Option(None),
     batch_size: Optional[int] = typer.Option(None),
     num_workers: int = typer.Option(0),
+    predictions_output: Optional[Path] = typer.Option(None),
 ) -> None:
-    eval_command(checkpoint, manifest, split, device, batch_size, num_workers)
+    eval_command(checkpoint, manifest, split, device, batch_size, num_workers, predictions_output)
 
 
 @app.command("export-onnx")

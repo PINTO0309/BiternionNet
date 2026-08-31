@@ -22,4 +22,8 @@ work is done (or planned) so that later entries can refer back to earlier ones b
 | [003](003_lr_schedule_sweep.md) | Epoch budget and lr-schedule sweep (constant 1000 -> cosine 100) | done |
 | [004](004_augmentation_ablation.md) | Augmentation ablation (neighbour frames / photometric / scale jitter) | R0-R4 done, follow-ups planned |
 | [005](005_synthetic_fill_study.md) | Can the HRFFA synthetic heads fill the sparse TownCentre bins? | done (study, negative) |
-| [006](006_synthetic_generation_plan.md) | Synthetic generation plan: images needed per pan band | plan |
+| [006](006_synthetic_generation_plan.md) | Synthetic generation plan: images needed per pan band | quota plan; pipeline details superseded by 007 |
+| [007](007_synthetic_pipeline_design.md) | TownCentre synthetic-data pipeline design and HRFFA port review | revised plan (Fable 5 review incorporated) |
+| [008](008_synthetic_pipeline_implementation.md) | Synthetic TownCentre reinforcement pipeline implementation | implemented; generation not yet submitted |
+| [009](009_hrffa_landmark_qa.md) | HRFFA ViT-L landmark diagnostics for synthetic QA | implemented; thresholds await Validation/Pilot calibration |
+| [010](010_single_batch_tensorrt_qa.md) | Single-batch TensorRT policy for synthetic ONNX QA | implemented |

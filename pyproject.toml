@@ -11,8 +11,11 @@ dependencies = [
     "onnx==1.20.0",
     "onnxruntime==1.23.2",
     "onnxsim-prebuilt==0.4.39.post2",
+    "openai==3.3.1",
     "opencv-python==4.13.0.92",
+    "pillow==12.2.0",
     "pytest==9.0.3",
+    "pyyaml==6.0.3",
     "scikit-learn==1.8.0",
     "scipy==1.17.1",
     "torch==2.12.0",
@@ -30,6 +33,8 @@ biternion-train = "biternionnet.cli:main_train"
 biternion-eval = "biternionnet.cli:main_eval"
 biternion-convert = "biternionnet.cli:main_convert"
 biternion-export-onnx = "biternionnet.cli:main_export_onnx"
+biternion-synthetic = "biternionnet.synthetic.cli:main"
+biternion-paired-bootstrap = "biternionnet.evaluation:main_paired_bootstrap"
 
 [build-system]
 requires = ["hatchling==1.29.0"]

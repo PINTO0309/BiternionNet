@@ -187,6 +187,83 @@ uv run --locked biternion-eval \
   --manifest data/towncentre/manifest.jsonl
 ```
 
+### Synthetic TownCentre reinforcement data
+
+The staged GPT-Image-2 pipeline is configured in `configs/synthetic_towncentre.yaml`. Image quality is
+hard-fixed to `low`; planning is local and does not submit a paid request:
+
+```bash
+uv run --locked biternion-synthetic install-models \
+  --source-repo /home/b920405/git/High-Angle_Robust_Fast_FaceAlignment
+uv run --locked biternion-synthetic plan \
+  --stage validation --batch-id validation-v003
+```
+
+Submission is deliberately separate and requires both the exact pending count and an explicit spend cap:
+
+```bash
+uv run --locked biternion-synthetic submit \
+  --batch-dir data/synthetic/batches/validation-v003 \
+  --approve-requests 19 --spend-cap-usd 0.20
+```
+
+After collection, run machine QA, prepare the human review/sign table, compare crop margins against real
+TownCentre crops, and record the actual account charge. Machine QA uses DEIMv2, SixDRepNet360, and the local
+HRFFA ViT-L iBUG68 model. HRFFA always receives a square 320x320 crop with 5% padding per side of the DEIM
+long side; its landmark/visibility signals remain diagnostic until calibrated against Pilot human review.
+`review-prepare` writes both an unobstructed `review_contact_sheet.jpg` and an overlaid
+`landmark_contact_sheet.jpg`. Fill `landmark_alignment` with `match`, `mismatch`, or `unresolved` for every
+review row; genuine rear views may be unresolved. Approval writes a hash-bound `landmark_calibration.json`,
+but it does not activate an HRFFA rejection gate. Validation approval also binds the profile-evaluation
+protocol and the account-verified model snapshot by SHA-256:
+
+All three ONNX QA models run at batch size 1. The default provider order is TensorRT, CUDA, then CPU; use
+`qa --cpu` only to force CPU. The DEIM graph has a symbolic public batch axis, but the pipeline still invokes
+it one image at a time and rejects any internal inference tensor whose leading dimension is not 1. Do not
+replace the HRFFA model with its `Nx3x320x320` sibling or add batched DEIM calls. TensorRT engine/timing caches
+are isolated under `data/models/trt_cache/` by ONNX Runtime version, model SHA-256, and `batch1`, so another
+model revision or batch profile cannot reuse the same cache.
+
+```bash
+uv run --locked biternion-synthetic collect --batch-dir data/synthetic/batches/validation-v003
+uv run --locked biternion-synthetic qa --batch-dir data/synthetic/batches/validation-v003
+uv run --locked biternion-synthetic review-prepare --batch-dir data/synthetic/batches/validation-v003
+uv run --locked biternion-synthetic margin-sheet \
+  --batch-dir data/synthetic/batches/validation-v003 \
+  --output data/synthetic/batches/validation-v003/margin_sheet.jpg
+uv run --locked biternion-synthetic usage-report \
+  --batch-dir data/synthetic/batches/validation-v003 --actual-cost-usd ACTUAL_ACCOUNT_CHARGE
+uv run --locked biternion-synthetic approve \
+  --batch-dir data/synthetic/batches/validation-v003 --reviewer REVIEWER \
+  --approve-sign-calibration --crop-margin 0.15 \
+  --evaluation-protocol data/towncentre/test_profiles_protocol.json \
+  --usage-report data/synthetic/batches/validation-v003/usage_report.json \
+  --account-verified-snapshot gpt-image-2-2026-04-21
+```
+
+Pilot planning refuses to proceed without this approved Validation evidence. Materialization writes a
+high-angle-only training manifest and an all-elevations ablation manifest. Correctly labelled eye-level or
+low-angle images are retained in the latter and never counted toward high-angle quotas:
+
+```bash
+uv run --locked biternion-synthetic materialize \
+  --batch-dir data/synthetic/batches/pilot-v001
+uv run --locked biternion-train --experiment towncentre-biternion-vonmises-aug \
+  --manifest data/towncentre/manifest_nb3_synthetic.jsonl \
+  --synthetic-fraction 0.10 --epoch-samples 26897 --synthetic-max-repeats 4 \
+  --output runs/synthetic-pilot-10pct
+```
+
+For `floor_120` and `uniform_200`, pass both the approved Validation
+`pitch_calibration.json` and approved Pilot `rear_label_policy.json` to `biternion-synthetic qa` via
+`--calibration` and `--rear-policy`. The latter freezes the per-rear-sector 70% SixD agreement / 10% DEIM
+conflict decision; sectors that do not qualify continue to use reviewed intent labels.
+
+Use `biternion-synthetic profiles-plan` / `profiles-finalize` to build the person-disjoint 200--300-image
+`test_profiles` set before the Pilot, and `biternion-eval --predictions-output ...` plus
+`biternion-paired-bootstrap` for matched-seed, paired person-cluster confidence intervals. Promotion requires
+a positive 95% CI; there is no fixed 0.5-degree target.
+
 Training always writes `last.pt` (the original notebooks train a fixed 50 epochs and evaluate the final model). `best.pt` is written only when the manifest contains a `val` split, so checkpoint selection never looks at the test split. `biternion-convert --kind towncentre-raw --val-split 0.5` carves a person-level `val` split out of the non-train persons.
 
 Export a checkpoint to ONNX with opset 17 and optimize it with `onnxsim-prebuilt`:

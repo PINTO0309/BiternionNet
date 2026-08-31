@@ -36,8 +36,17 @@ def test_smoke_biternion_training_creates_checkpoint(tmp_path):
     )
     checkpoint = Path(result["best_checkpoint"])
     assert checkpoint.exists()
-    metrics = evaluate_checkpoint(checkpoint, manifest, device_name="cpu", batch_size=2)
+    predictions = tmp_path / "predictions.jsonl"
+    metrics = evaluate_checkpoint(
+        checkpoint,
+        manifest,
+        device_name="cpu",
+        batch_size=2,
+        predictions_output=predictions,
+    )
     assert "maad_deg" in metrics
+    assert metrics["bin_180_count"] == 1 and metrics["bin_270_count"] == 1
+    assert len(predictions.read_text().splitlines()) == 2
 
 
 

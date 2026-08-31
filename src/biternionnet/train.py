@@ -15,6 +15,7 @@ from tqdm import tqdm
 
 from .augment import get_photometric_preset
 from .data import CropConfig, ManifestDataset, build_class_mapping, read_manifest
+from .evaluation import circular_absolute_error_deg, summarize_angle_errors
 from .experiments import (
     ExperimentConfig,
     config_from_checkpoint,
@@ -36,6 +37,7 @@ from .losses import (
 )
 from .models import ModelConfig, build_model
 from .schedules import build_controller, wsd_lr_factor  # noqa: F401  (wsd_lr_factor re-exported for tests)
+from .synthetic.sampling import SourceQuotaSampler
 
 
 def set_seed(seed: int) -> None:
@@ -151,11 +153,14 @@ def _target_deg(config: ExperimentConfig, target: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def evaluate_model(model: nn.Module, loader: DataLoader, config: ExperimentConfig, device: torch.device) -> dict[str, float]:
+def evaluate_model(
+    model: nn.Module, loader: DataLoader, config: ExperimentConfig, device: torch.device
+) -> dict[str, float | int]:
     model.eval()
     correct = 0
     total = 0
     angle_errors: list[torch.Tensor] = []
+    angle_targets: list[torch.Tensor] = []
     quadint_errors: list[torch.Tensor] = []
     pose_errors: list[torch.Tensor] = []
     borders, centres = quantization_arrays(config)
@@ -178,16 +183,21 @@ def evaluate_model(model: nn.Module, loader: DataLoader, config: ExperimentConfi
             pred_centre = torch.as_tensor(probs2deg_centre(probs, centres), dtype=torch.float32).reshape(-1, 1)
             pred_quadint = torch.as_tensor(probs2deg_quadint(probs, centres), dtype=torch.float32).reshape(-1, 1)
             angle_errors.append(angle_difference_deg(pred_centre, target_deg))
+            angle_targets.append(target_deg)
             quadint_errors.append(angle_difference_deg(pred_quadint, target_deg))
         elif config.model_head == "biternion":
             pred_deg = bit2deg(outputs).reshape(-1, 1)
-            angle_errors.append(angle_difference_deg(pred_deg, _target_deg(config, targets)).detach().cpu())
+            target_deg = _target_deg(config, targets)
+            angle_errors.append(angle_difference_deg(pred_deg, target_deg).detach().cpu())
+            angle_targets.append(target_deg.detach().cpu())
         elif config.target_kind == "pose_rad":
             err = torch.rad2deg(torch.abs(torch.atan2(torch.sin(targets - outputs), torch.cos(targets - outputs))))
             pose_errors.append(err.detach().cpu())
         else:
             pred_deg = outputs.reshape(-1, 1)
-            angle_errors.append(angle_difference_deg(pred_deg, _target_deg(config, targets)).detach().cpu())
+            target_deg = _target_deg(config, targets)
+            angle_errors.append(angle_difference_deg(pred_deg, target_deg).detach().cpu())
+            angle_targets.append(target_deg.detach().cpu())
 
     if config.target_kind == "classification":
         return {"accuracy": correct / total}
@@ -199,11 +209,61 @@ def evaluate_model(model: nn.Module, loader: DataLoader, config: ExperimentConfi
             "tilt_maad_deg": float(errors[:, 1].mean().item()),
             "roll_maad_deg": float(errors[:, 2].mean().item()),
         }
-    metrics = {"maad_deg": float(torch.cat(angle_errors, dim=0).mean().item())}
+    errors = torch.cat(angle_errors, dim=0).numpy().reshape(-1)
+    targets = torch.cat(angle_targets, dim=0).numpy().reshape(-1)
+    metrics = summarize_angle_errors(targets, errors)
     if quadint_errors:
         metrics["maad_quadint_deg"] = float(torch.cat(quadint_errors, dim=0).mean().item())
         metrics["bin_accuracy"] = correct / total
     return metrics
+
+
+@torch.no_grad()
+def prediction_rows(
+    model: nn.Module,
+    loader: DataLoader,
+    config: ExperimentConfig,
+    device: torch.device,
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return ordered per-item predictions for paired model comparisons."""
+    if config.target_kind == "classification" or config.target_kind == "pose_rad":
+        raise ValueError("per-item circular-angle predictions require a single-angle experiment")
+    model.eval()
+    _borders, centres = quantization_arrays(config)
+    predictions: list[float] = []
+    targets_deg: list[float] = []
+    for images, targets in loader:
+        outputs = model(images.to(device))
+        target_deg = _target_deg(config, targets.to(device)).detach().cpu().numpy().reshape(-1)
+        if config.target_kind == "quantized_classification":
+            probabilities = torch.softmax(outputs, dim=1).detach().cpu().numpy()
+            predicted = probs2deg_centre(probabilities, centres).reshape(-1)
+        elif config.model_head == "biternion":
+            predicted = bit2deg(outputs).detach().cpu().numpy().reshape(-1)
+        else:
+            predicted = outputs.detach().cpu().numpy().reshape(-1)
+        predictions.extend(float(value) % 360.0 for value in predicted)
+        targets_deg.extend(float(value) % 360.0 for value in target_deg)
+    if len(predictions) != len(records):
+        raise RuntimeError("prediction count does not match evaluation records")
+    result: list[dict[str, Any]] = []
+    for index, (record, prediction, target) in enumerate(
+        zip(records, predictions, targets_deg, strict=True)
+    ):
+        image = str(record.get("image", ""))
+        result.append(
+            {
+                "record_id": str(record.get("record_id") or record.get("custom_id") or image or index),
+                "person_id": str(record.get("person_id") or Path(image).parent.name or index),
+                "image": image,
+                "source": record.get("source"),
+                "target_deg": target,
+                "prediction_deg": prediction,
+                "error_deg": circular_absolute_error_deg(prediction, target),
+            }
+        )
+    return result
 
 
 def _timestamp() -> str:
@@ -221,8 +281,8 @@ def _write_history_jsonl(path: Path, history: list[dict[str, Any]]) -> None:
             f.write(json.dumps(record, sort_keys=True) + "\n")
 
 
-def _selection_score(metrics: dict[str, float]) -> float:
-    return metrics.get("accuracy", -metrics.get("maad_deg", float("inf")))
+def _selection_score(metrics: dict[str, float | int]) -> float:
+    return float(metrics.get("accuracy", -metrics.get("maad_deg", float("inf"))))
 
 
 def train_model(
@@ -251,6 +311,9 @@ def train_model(
     device_name: str | None = None,
     num_workers: int = 0,
     train_flip_probability: float = 0.5,
+    synthetic_fraction: float = 0.0,
+    epoch_samples: int | None = None,
+    synthetic_max_repeats: int = 4,
 ) -> dict[str, Any]:
     """Train an experiment preset.
 
@@ -309,7 +372,24 @@ def train_model(
         config = config.__class__(**{**config.__dict__, "pool_ceil_mode": resumed.pool_ceil_mode, "resize_size": resumed.resize_size})
 
     train_dataset, test_dataset, val_dataset, class_to_idx = build_datasets(config, manifest, train_flip_probability)
-    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=num_workers)
+    source_sampler = None
+    if synthetic_fraction > 0.0:
+        source_sampler = SourceQuotaSampler(
+            train_dataset.records,
+            synthetic_fraction=synthetic_fraction,
+            num_samples=epoch_samples or 26_897,
+            max_synthetic_repeats=synthetic_max_repeats,
+            seed=seed,
+        )
+    elif epoch_samples is not None:
+        raise ValueError("epoch_samples is only valid with synthetic_fraction > 0")
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.batch_size,
+        shuffle=source_sampler is None,
+        sampler=source_sampler,
+        num_workers=num_workers,
+    )
     test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False, num_workers=num_workers)
     val_loader = None
     if val_dataset is not None:
@@ -351,6 +431,9 @@ def train_model(
         "device": str(device),
         "num_workers": num_workers,
         "train_flip_probability": train_flip_probability,
+        "synthetic_fraction": synthetic_fraction,
+        "epoch_samples": len(train_dataset) if source_sampler is None else len(source_sampler),
+        "synthetic_max_repeats": synthetic_max_repeats if source_sampler is not None else None,
         "train_size": len(train_dataset),
         "test_size": len(test_dataset),
         "val_size": None if val_dataset is None else len(val_dataset),
@@ -368,6 +451,8 @@ def train_model(
 
     stopped_early = False
     for epoch in range(start_epoch, config.epochs + 1):
+        if source_sampler is not None:
+            source_sampler.set_epoch(epoch - 1)
         epoch_started = time.perf_counter()
         model.train()
         losses = []
@@ -394,6 +479,8 @@ def train_model(
             "lr": float(base_lr * controller.lr_factor(global_step)),
             **metrics,
         }
+        if source_sampler is not None and source_sampler.last_report is not None:
+            epoch_record["source_sampling"] = dict(source_sampler.last_report)
         if val_loader is not None:
             val_metrics = evaluate_model(model, val_loader, config, device)
             epoch_record.update({f"val_{k}": v for k, v in val_metrics.items()})
@@ -465,7 +552,8 @@ def evaluate_checkpoint(
     device_name: str | None = None,
     batch_size: int | None = None,
     num_workers: int = 0,
-) -> dict[str, float]:
+    predictions_output: str | Path | None = None,
+) -> dict[str, float | int]:
     checkpoint_data = torch.load(checkpoint, map_location="cpu")
     config = config_from_checkpoint(checkpoint_data["experiment"])
     if batch_size is not None:
@@ -477,5 +565,12 @@ def evaluate_checkpoint(
     model = build_model(model_config(config, class_to_idx)).to(device)
     model.load_state_dict(checkpoint_data["model_state_dict"])
     metrics = evaluate_model(model, loader, config, device)
+    if predictions_output is not None:
+        output = Path(predictions_output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        rows = prediction_rows(model, loader, config, device, dataset.records)
+        with output.open("w", encoding="utf-8") as stream:
+            for row in rows:
+                stream.write(json.dumps(row, sort_keys=True) + "\n")
     print(json.dumps(metrics, sort_keys=True))
     return metrics
