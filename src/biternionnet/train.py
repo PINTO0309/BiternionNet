@@ -306,6 +306,8 @@ def train_model(
     disable_plateau_trigger: bool = False,
     photometric: str | None = None,
     scale_jitter: tuple[float, float] | None = None,
+    resize_size: tuple[int, int] | None = None,
+    input_size: tuple[int, int] | None = None,
     resume_from: str | Path | None = None,
     seed: int = 0,
     device_name: str | None = None,
@@ -350,6 +352,8 @@ def train_model(
         disable_plateau_trigger=disable_plateau_trigger,
         photometric=photometric,
         scale_jitter=scale_jitter,
+        resize_size=resize_size,
+        input_size=input_size,
     )
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
@@ -369,7 +373,10 @@ def train_model(
             None,
             resumed.backbone_activation,
         )
-        config = config.__class__(**{**config.__dict__, "pool_ceil_mode": resumed.pool_ceil_mode, "resize_size": resumed.resize_size})
+        keep = {"pool_ceil_mode": resumed.pool_ceil_mode}
+        if resize_size is None:  # an explicit CLI override wins over the checkpoint's value
+            keep["resize_size"] = resumed.resize_size
+        config = config.__class__(**{**config.__dict__, **keep})
 
     train_dataset, test_dataset, val_dataset, class_to_idx = build_datasets(config, manifest, train_flip_probability)
     source_sampler = None

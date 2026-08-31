@@ -97,6 +97,26 @@ confirm; the combination must be re-run with a larger budget before it is judged
 | R4-long | all three at ~2.1x budget (94 k steps: 300 constant + 50 cosine epochs x 269) | R4 command with `--epochs 350 --decay-start-epoch 301 --cosine-epochs 50 --num-workers 16 --output runs/aug-r4-all-long` (started 2026-08-30) |
 | R4-light | all three, `cctv-light` | R4 command with `--photometric cctv-light --output runs/aug-r4-all-light` |
 
+## 3.1.1 Additional scenario (2026-08-31): direct 46x46 resize, no crop
+
+`--resize-size 46 46` overrides the preset's 50x50 pre-crop resize so every image is resized straight to
+the network input and the random 46-from-50 crop becomes the identity (no translation augmentation; the
+full head box stays in frame instead of losing a 4 px border). `--scale-jitter` on top of it re-introduces
+crops from 46..51 px versions, so the pure no-crop arm drops it. Commands (balanced manifest, 350/301/50):
+
+```text
+D1 pure resize:      ... --resize-size 46 46                       --output runs/abl-resize46
+D2 resize + jitter:  ... --resize-size 46 46 --scale-jitter 0.9 1.1 --output runs/abl-resize46-jitter
+D3 no-crop 64x64:    ... --resize-size 64 64 --input-size 64 64    --output runs/abl-resize64
+(reference = the same command with the preset 50x50 + crop, i.e. synth-biternion-vonmises-relu/swish)
+```
+
+D3 (`--input-size`, added the same day) resizes straight to a 64x64 network input: the backbone then
+yields a 64@9x9 map (`Linear(5184, 512)`, ~2.9 M params vs 1.6 M at 46). Note the TownCentre crops have a
+median height of 29 px, so 64 px is >2x upsampling - the scenario probes whether the extra resolution of
+the resize (not of the data) helps. ONNX export follows the checkpoint automatically
+(`<prefix>_1x3x64x64.onnx`), and the deployment contract becomes "resize directly to 64x64".
+
 ## 3.2 R4-long result (2026-08-30)
 
 | run | epochs | steps | win_ep | maad_deg mean | std | min | final |

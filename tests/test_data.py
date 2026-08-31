@@ -128,3 +128,19 @@ def test_resize_for_crop_clips_lanczos_overshoot():
     image[10:15, 10:14] = 1.0  # sharp edge -> ringing when upscaled
     out = resize_for_crop(image, CropConfig((46, 46), resize=(50, 50)))
     assert out.min() >= 0.0 and out.max() <= 1.0
+
+
+def test_resize_equal_to_crop_disables_translation():
+    import random
+
+    from biternionnet.data import prepare_image
+
+    rng = np.random.default_rng(0)
+    image = rng.uniform(0, 1, (30, 25, 3)).astype(np.float32)
+    crop = CropConfig((46, 46), random_crop=True, resize=(46, 46))
+    random.seed(0)
+    first = prepare_image(image, crop)
+    for seed in range(1, 20):
+        random.seed(seed)
+        assert np.array_equal(prepare_image(image, crop), first)  # no crop jitter left
+    assert first.shape == (46, 46, 3)

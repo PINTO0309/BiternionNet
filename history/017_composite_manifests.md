@@ -84,7 +84,7 @@ time; evaluations on test_synthetic made before it are void.
 
 ## 8. First balanced result (2026-08-31, swish arm)
 
-Run `runs/syn-balanced-swish`: `towncentre-biternion-vonmises` on `manifest_balanced.jsonl`, seed 0,
+Run `runs/synth-biternion-vonmises-swish` (earlier names: syn-balanced-swish, towncentre-biternion-vonmises-swish): `towncentre-biternion-vonmises` on `manifest_balanced.jsonl`, seed 0,
 `--epochs 350 --decay-start-epoch 301 --cosine-epochs 50` (= 165,550 steps, 1.76x the 94k reference
 budget), `--photometric cctv --scale-jitter 0.9 1.1 --backbone-activation swish`.
 
@@ -102,3 +102,60 @@ continuous prediction ring with no dead sectors. Caveats: three factors changed 
 (balanced manifest + larger budget + swish), and the bin_macro gain (~2 deg) is at the edge of the per-bin
 noise floor (007 review) - the relu arm on the same command (minus `--backbone-activation swish`) and/or
 extra seeds are needed before adopting balanced as the default.
+
+## 9. Both arms complete (2026-08-31): relu vs swish, and test_neighbor corrects the picture
+
+`runs/synth-biternion-vonmises-relu` = §8's command minus `--backbone-activation swish`; everything else
+identical (balanced manifest, seed 0, 350 ep / cosine 50 = 165,550 steps).
+
+test (443):
+
+| run | last7 MAAD | final | bin_macro | 90 | 225 |
+|---|---|---|---|---|---|
+| balanced relu | 19.01 +- 0.15 | 18.94 | 20.48 | 25.9 | 34.1 |
+| balanced swish | 18.32 +- 0.12 | 18.55 | 18.80 | 20.0 | 23.7 |
+
+test_neighbor (8,418; the reliable split for per-bin reads):
+
+| run | MAAD | bin_macro | 0 | 45 | 90 | 135 | 180 | 225 | 270 | 315 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| R4-long (nb3, relu, 94k) | 20.82 | 22.93 | 19.0 | 16.6 | 28.4 | 20.2 | 19.6 | 38.9 | 24.5 | 16.3 |
+| balanced relu (165k) | 21.44 | 23.26 | 20.7 | 18.7 | 24.3 | 19.3 | 22.2 | 40.2 | 22.2 | 18.6 |
+| balanced swish (165k) | 20.74 | 22.48 | 20.7 | 18.6 | 24.1 | 18.8 | 21.6 | 37.0 | 22.4 | 16.5 |
+
+Findings (seed 0 only):
+
+1. **Swish > relu, consistently**: -0.69 deg on test, -0.70 on test_neighbor, macro -0.8; the only factor that
+   moves both splits the same way.
+2. **The dramatic §8 rare-bin gains were small-n noise**, as the 007 review predicted: on test the 225-deg bin
+   (n=17) improved 38 -> 24, but on test_neighbor (n=320) it is 38.9 -> 37.0. The real effect of
+   balanced + synthetic is ~-4 deg at 90 deg, ~-2 deg at 225 (swish), paid for with +1-2 deg at 0/180.
+3. **Balanced + synthetic does not beat the nb3 reference overall** on test_neighbor (20.74 vs 20.82 at 1.76x
+   the budget); it redistributes error from profiles to the dominant sectors, macro -0.45.
+
+Next: seeds 1-2 for the swish pair, and a swish run on the nb3 manifest to separate "swish alone" from
+"swish + balanced"; per-item paired bootstrap (`--predictions-output`) for the 90/225 sectors.
+
+## 10. Current-pattern swish arm (2026-08-31): the flattening effect isolated
+
+`runs/synth-current-biternion-vonmises-swish`: same command as the balanced swish arm but on
+`manifest_current.jsonl` (345 steps/epoch -> 120,750 steps vs 165,550; the budget difference is
+minor given the flat constant phase, but noted).
+
+| swish arms | test last7 | test macro | test_nb MAAD | test_nb macro | test_nb 90 | test_nb 270 | test_nb 225 |
+|---|---|---|---|---|---|---|---|
+| current (121k) | **18.11 +- 0.10** | 19.31 | 21.24 | 23.29 | 26.4 | 25.2 | 37.4 |
+| balanced (165k) | 18.32 +- 0.12 | **18.80** | **20.74** | **22.48** | **24.1** | **22.4** | 37.0 |
+
+Balanced vs current with everything else equal: the flattening buys **-2.3 deg at 90, -2.8 at 270,
+-0.8 macro on test_neighbor**, and costs 0.2 deg on the bimodal 443-head test. The 225-deg sector
+(back-left profile, where the synthetic set has no measured labels) stays hard for every model (~37-40).
+
+Cross-run picture on test_neighbor: R4-long (nb3, relu, 94k) 20.82 / macro 22.93; current-swish 21.24 /
+23.29; balanced-swish 20.74 / 22.48. I.e. adding the synthetic set without flattening did not help the
+enlarged test; flattening + swish is the only combination that improves both macro and the profile bins
+over the nb3 reference.
+
+**Working default going forward: balanced manifest + swish** (best macro and profile bins, negligible
+cost on test). Open items: seeds 1-2, the 225-deg sector (needs measured rear labels or real data), and
+the resize-46 ablation (004 §3.1.1).

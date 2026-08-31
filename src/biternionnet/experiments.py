@@ -210,6 +210,8 @@ def with_overrides(
     disable_plateau_trigger: bool = False,
     photometric: str | None = None,
     scale_jitter: tuple[float, float] | None = None,
+    resize_size: tuple[int, int] | None = None,
+    input_size: tuple[int, int] | None = None,
 ) -> ExperimentConfig:
     changes = {}
     if epochs is not None:
@@ -248,6 +250,10 @@ def with_overrides(
         changes["photometric"] = None if photometric == "none" else photometric
     if scale_jitter is not None:
         changes["scale_jitter"] = tuple(float(x) for x in scale_jitter)
+    if resize_size is not None:
+        changes["resize_size"] = tuple(int(x) for x in resize_size)
+    if input_size is not None:
+        changes["input_size"] = tuple(int(x) for x in input_size)
     result = replace(config, **changes)
     get_photometric_preset(result.photometric)  # validates the preset name
     if result.scale_jitter is not None:
@@ -256,6 +262,8 @@ def with_overrides(
             raise ValueError("scale_jitter must satisfy 0 < low <= high")
         if result.resize_size is None:
             raise ValueError("scale_jitter requires a preset with resize_size")
+    if result.resize_size is not None and (result.resize_size[0] < result.input_size[0] or result.resize_size[1] < result.input_size[1]):
+        raise ValueError("resize_size must be >= input_size in both dimensions")
     if result.warmup_fraction < 0.0 or result.decay_fraction < 0.0:
         raise ValueError("warmup_fraction and decay_fraction must be non-negative")
     if result.warmup_fraction + result.decay_fraction > 1.0:

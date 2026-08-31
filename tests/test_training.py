@@ -260,3 +260,48 @@ def test_evaluate_checkpoint_reports_per_bin_metrics(tmp_path):
     assert "bin_macro_maad_deg" in metrics
     counts = [metrics.get(f"bin_{c:03d}_count", 0) for c in range(0, 360, 45)]
     assert sum(counts) == 4  # the fixture's 4 test records
+
+
+def test_resize_size_override_direct_46(tmp_path):
+    import pytest
+    import torch
+    from biternionnet.experiments import get_experiment, with_overrides
+
+    config = with_overrides(get_experiment("towncentre-biternion"), None, None, None, resize_size=(46, 46))
+    assert config.resize_size == (46, 46)
+    with pytest.raises(ValueError):
+        with_overrides(get_experiment("towncentre-biternion"), None, None, None, resize_size=(40, 46))
+
+    manifest = _angle_manifest(tmp_path)
+    result = train_model(
+        "towncentre-biternion", manifest, tmp_path / "run",
+        epochs=1, batch_size=2, resize_size=(46, 46), device_name="cpu",
+    )
+    saved = torch.load(result["last_checkpoint"], map_location="cpu")["experiment"]
+    assert tuple(saved["resize_size"]) == (46, 46)
+
+
+def test_input_size_override_no_crop_64(tmp_path):
+    import pytest
+    import torch
+    from biternionnet.experiments import get_experiment, with_overrides
+    from biternionnet.models import build_model
+    from biternionnet.train import model_config
+
+    config = with_overrides(get_experiment("towncentre-biternion"), None, None, None, resize_size=(64, 64), input_size=(64, 64))
+    assert config.input_size == (64, 64) and config.resize_size == (64, 64)
+    model = build_model(model_config(config, {}))
+    assert tuple(model.backbone(torch.zeros(1, 3, 64, 64)).shape) == (1, 64, 9, 9)
+    assert model.head[2].in_features == 64 * 9 * 9
+    with pytest.raises(ValueError):  # resize smaller than input
+        with_overrides(get_experiment("towncentre-biternion"), None, None, None, input_size=(64, 64))
+
+    manifest = _angle_manifest(tmp_path)
+    result = train_model(
+        "towncentre-biternion", manifest, tmp_path / "run",
+        epochs=1, batch_size=2, resize_size=(64, 64), input_size=(64, 64), device_name="cpu",
+    )
+    saved = torch.load(result["last_checkpoint"], map_location="cpu")["experiment"]
+    assert tuple(saved["input_size"]) == (64, 64) and tuple(saved["resize_size"]) == (64, 64)
+    metrics = evaluate_checkpoint(result["last_checkpoint"], manifest, device_name="cpu", batch_size=2)
+    assert "maad_deg" in metrics
