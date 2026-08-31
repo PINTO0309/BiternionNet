@@ -81,3 +81,24 @@ later batches are added (the previous scheme reshuffled it - the uniform200 hold
 the mask20 batch arrived, which would leak train images of older models into a re-generated test_synthetic).
 Stratification per bin is now statistical rather than exact. This regeneration reshuffles membership one last
 time; evaluations on test_synthetic made before it are void.
+
+## 8. First balanced result (2026-08-31, swish arm)
+
+Run `runs/syn-balanced-swish`: `towncentre-biternion-vonmises` on `manifest_balanced.jsonl`, seed 0,
+`--epochs 350 --decay-start-epoch 301 --cosine-epochs 50` (= 165,550 steps, 1.76x the 94k reference
+budget), `--photometric cctv --scale-jitter 0.9 1.1 --backbone-activation swish`.
+
+| metric (test, 443) | R4-long reference (nb3, relu, 94k) | syn-balanced-swish |
+|---|---|---|
+| MAAD last-7-epoch | 18.80 +- 0.33 | **18.32 +- 0.12** |
+| final epoch | 18.92 | 18.55 |
+| bin_macro | ~20.9 | **18.80** |
+| bin 225 / 90 | 38.2 / 26.6 | **23.7 / 20.0** |
+| bin 0 / 180 | 16.5 / 18.4 | 17.6 / 21.8 |
+
+The flattening works as intended: the rare bins improve by 6-14 deg, the dominant bins give back 1-3 deg,
+and the overall MAAD still improves. Donut heatmaps (`scripts/plot_donut.py`, split test_neighbor) show a
+continuous prediction ring with no dead sectors. Caveats: three factors changed at once vs the reference
+(balanced manifest + larger budget + swish), and the bin_macro gain (~2 deg) is at the edge of the per-bin
+noise floor (007 review) - the relu arm on the same command (minus `--backbone-activation swish`) and/or
+extra seeds are needed before adopting balanced as the default.
