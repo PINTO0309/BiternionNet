@@ -462,6 +462,21 @@ per-bin synthetic holdout). Both share a byte-identical test side: `test` (the o
 `biternion-eval --split ...`; every angle evaluation already reports per-45-degree-bin MAAD. See
 `history/017_composite_manifests.md`.
 
+### Donut heatmaps (paper Fig. 1)
+
+```bash
+uv run --locked python scripts/plot_donut.py \
+  --checkpoint runs/syn-balanced/last.pt \
+  --manifest data/towncentre/manifest_balanced.jsonl \
+  --split test --output runs/syn-balanced/donut_test.jpg
+```
+
+renders the cyclic prediction distribution as the donut heatmaps of the original notebook (cells 10-18;
+0 degrees at the top). Repeat `--checkpoint` to compare models side by side; the ground-truth donut is always
+the leftmost panel. `--split test_neighbor` gives a smoother ring (8,418 samples). Ported in
+`biternionnet/donut.py` with the notebook defaults (3600 bins, cyclic gaussian window 41, Spectral_r,
+counts scaled by n/400).
+
 ## Experiment history
 
 `history/` holds one numbered Markdown entry per topic (fidelity fixes, dataset analysis, schedule sweep,
