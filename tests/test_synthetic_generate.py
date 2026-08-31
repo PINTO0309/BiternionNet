@@ -18,9 +18,11 @@ from biternionnet.synthetic.generate import (
     build_plan,
     build_usage_report,
     create_edit_cycle,
+    create_mask_augmentation,
     create_plan,
     load_config,
     load_state,
+    pending_request_count,
     process_output_jsonl,
     read_plan,
     refresh_status,
@@ -200,6 +202,9 @@ def test_crop_edit_prompt_translates_person_away_from_overflowing_edges():
     assert "3% of the image height downward" in prompt
     assert "not a crop, zoom, head rotation" in prompt
     assert "times 1.10 must stay fully inside" in prompt
+    assert (
+        "explicitly overrides any generic target instruction not to translate" in prompt
+    )
 
     row["head_square_crop_box_xyxy"] = [-1.0, 100.0, 1031.0, 1132.0]
     prompt = _edit_prompt(record, row, ["head_crop_outside_image"])
@@ -340,6 +345,31 @@ def test_submit_requires_exact_count_and_spend_cap(tmp_path):
     assert submit_pending(
         run, approved_request_count=19, spend_cap_usd=0.95, client=client
     ) == ["batch-1"]
+
+
+def test_token_planned_batches_are_submitted_serially(tmp_path):
+    run = create_plan(CONFIG, "validation", "validation-serialized", tmp_path, seed=3)
+    state = load_state(run)
+    second_shard = json.loads(json.dumps(state["shards"][0]))
+    second_shard["index"] = 1
+    state["shards"].append(second_shard)
+    state["token_batch_plans"] = {
+        "/v1/images/edits": {"queued_token_limit_exclusive": 1_000_000}
+    }
+    save_state(run, state)
+    client = SimpleNamespace(files=_FakeFiles(), batches=_FakeBatches())
+
+    remote = submit_pending(
+        run,
+        approved_request_count=38,
+        spend_cap_usd=1.0,
+        client=client,
+    )
+
+    assert remote == ["batch-1"]
+    assert client.files.created == 1
+    assert client.batches.created == 1
+    assert pending_request_count(load_state(run)) == 19
 
 
 def test_process_output_reconciles_custom_id_and_usage(tmp_path):
@@ -497,6 +527,93 @@ def test_qa_failures_create_hash_bound_high_fidelity_edit_cycle(tmp_path):
     )
     assert assisted["pitch_reference_object"]["downward_correction_deg"] == 25
     assert assisted["pitch_reference_object"]["position"] == "lower-nose-aligned"
+
+
+def test_mask_augmentation_plans_twenty_percent_as_separate_edits(tmp_path):
+    root = tmp_path / "runs"
+    parent = create_plan(CONFIG, "validation", "mask-parent", root, seed=3)
+    state = load_state(parent)
+    plan = read_plan(parent, state)
+    qa_rows = []
+    usage_rows = []
+    for record in plan.values():
+        width, height = map(int, record["size"].split("x"))
+        Image.new("RGB", (width, height), (60, 80, 100)).save(
+            parent / "images" / record["filename"], "JPEG", quality=92
+        )
+        qa_rows.append(
+            {
+                "custom_id": record["custom_id"],
+                "quality_gate_pass": True,
+                "pan_quality_pass_auto": True,
+            }
+        )
+        usage_rows.append(
+            {"custom_id": record["custom_id"], "usage": {"input_tokens": 1500}}
+        )
+    write_jsonl(parent / "auto_qa.jsonl", qa_rows)
+    (parent / "qa_report.json").write_text(
+        json.dumps(
+            {
+                "total": len(plan),
+                "quality_pass": len(plan),
+                "pan_quality_pass_auto": len(plan),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    write_jsonl(parent / "usage.jsonl", usage_rows)
+    attempt = state["shards"][0]["attempts"][0]
+    attempt["endpoint"] = "/v1/images/edits"
+    attempt["custom_ids"] = list(plan)
+    state["shards"][0]["custom_ids"] = list(plan)
+    save_state(parent, state)
+
+    child = create_mask_augmentation(
+        parent,
+        "production-mask20-v001",
+        root,
+        target_fraction=0.20,
+        planning_cost_per_request_usd=0.009,
+        seed=7,
+    )
+    child_state = load_state(child)
+    child_plan = read_plan(child, child_state)
+
+    assert child_state["base_dataset_count"] == 19
+    assert child_state["request_count"] == 5
+    assert child_state["projected_combined_count"] == 24
+    assert child_state["projected_mask_fraction"] == pytest.approx(5 / 24)
+    assert child_state["augmentation_type"] == "face_mask"
+    assert len(child_state["shards"]) == 1
+    assert (
+        child_state["token_batch_plans"]["/v1/images/edits"][
+            "observed_mean_input_tokens"
+        ]
+        == 1500
+    )
+    assert all(record["abs_pan_bin"] <= 90 for record in child_plan.values())
+    assert all(
+        record["augmentation_type"] == "face_mask" for record in child_plan.values()
+    )
+    assert all(
+        "over the nose, mouth, and chin" in record["prompt"]
+        for record in child_plan.values()
+    )
+    assert all(
+        child_state["items"][custom_id]["operation"] == "mask_augmentation_edit"
+        for custom_id in child_plan
+    )
+    assert len(list((child / "edit_inputs").glob("*.jpg"))) == 5
+    request = json.loads(
+        (child / child_state["shards"][0]["attempts"][0]["input_path"])
+        .read_text()
+        .splitlines()[0]
+    )
+    assert request["url"] == "/v1/images/edits"
+    assert request["body"]["quality"] == "low"
+    assert "input_fidelity" not in request["body"]
 
 
 def test_usage_report_and_model_install_are_explicit_and_hash_checked(tmp_path):

@@ -47,6 +47,16 @@ PITCH_REFERENCE_OBJECTS = (
     "a small matte blue beanbag",
     "a small flat orange pavement marker disc",
 )
+MASK_VARIANTS = (
+    "a plain light-blue disposable surgical face mask",
+    "a plain white disposable surgical face mask",
+    "a plain pale-green disposable surgical face mask",
+    "a plain black cloth face mask",
+    "a plain navy cloth face mask",
+    "a plain grey cloth face mask",
+    "a plain white cup-shaped respirator mask without a valve",
+    "a plain light-grey cup-shaped respirator mask without a valve",
+)
 STATE_NAME = "batch_state.json"
 PLAN_NAME = "generation_plan.jsonl"
 TERMINAL_STATUSES = {"completed", "failed", "expired", "cancelled"}
@@ -1008,48 +1018,60 @@ def submit_pending(
         _approved_parent(parent, required)
         if sha256_file(parent / "approval.json") != state.get("parent_approval_sha256"):
             raise PipelineError("parent approval changed after planning")
+    serialized_token_batches = bool(state.get("token_batch_plans"))
+    if serialized_token_batches and any(
+        attempt.get("batch_id") and attempt.get("status") in ACTIVE_STATUSES
+        for shard in state["shards"]
+        for attempt in shard["attempts"]
+    ):
+        return []
     client = client or _client()
     remote_ids: list[str] = []
-    for shard in state["shards"]:
-        for attempt in shard["attempts"]:
-            if attempt.get("status") != "planned":
-                continue
-            input_path = run_dir / attempt["input_path"]
-            if sha256_file(input_path) != attempt["input_sha256"]:
-                raise PipelineError(f"Batch input changed: {input_path}")
-            endpoint = str(attempt.get("endpoint", ENDPOINT))
-            custom_ids = validate_batch_jsonl(
-                input_path, state["api_request"], expected_endpoint=endpoint
-            )
-            if custom_ids != attempt["custom_ids"]:
-                raise PipelineError(f"Batch input IDs changed: {input_path}")
-            metadata = {
-                "local_batch_id": state["local_batch_id"][:64],
-                "stage": state["stage"][:64],
-                "shard": str(shard["index"]),
-                "attempt": str(attempt["number"]),
-                "input_sha256": attempt["input_sha256"],
-            }
-            duplicate = _find_remote_duplicate(client, metadata)
-            if duplicate is not None:
-                _sync_attempt(attempt, duplicate)
-                save_state(run_dir, state)
-                remote_ids.append(str(attempt["batch_id"]))
-                continue
-            with input_path.open("rb") as stream:
-                uploaded = client.files.create(file=stream, purpose="batch")
-            attempt["input_file_id"] = _get(uploaded, "id")
-            attempt["history"].append({"at": utc_now(), "status": "input_uploaded"})
-            save_state(run_dir, state)
-            batch = client.batches.create(
-                input_file_id=attempt["input_file_id"],
-                endpoint=endpoint,
-                completion_window=COMPLETION_WINDOW,
-                metadata=metadata,
-            )
-            _sync_attempt(attempt, batch)
+    planned_attempts = [
+        (shard, attempt)
+        for shard in state["shards"]
+        for attempt in shard["attempts"]
+        if attempt.get("status") == "planned" and not attempt.get("batch_id")
+    ]
+    if serialized_token_batches:
+        planned_attempts = planned_attempts[:1]
+    for shard, attempt in planned_attempts:
+        input_path = run_dir / attempt["input_path"]
+        if sha256_file(input_path) != attempt["input_sha256"]:
+            raise PipelineError(f"Batch input changed: {input_path}")
+        endpoint = str(attempt.get("endpoint", ENDPOINT))
+        custom_ids = validate_batch_jsonl(
+            input_path, state["api_request"], expected_endpoint=endpoint
+        )
+        if custom_ids != attempt["custom_ids"]:
+            raise PipelineError(f"Batch input IDs changed: {input_path}")
+        metadata = {
+            "local_batch_id": state["local_batch_id"][:64],
+            "stage": state["stage"][:64],
+            "shard": str(shard["index"]),
+            "attempt": str(attempt["number"]),
+            "input_sha256": attempt["input_sha256"],
+        }
+        duplicate = _find_remote_duplicate(client, metadata)
+        if duplicate is not None:
+            _sync_attempt(attempt, duplicate)
             save_state(run_dir, state)
             remote_ids.append(str(attempt["batch_id"]))
+            continue
+        with input_path.open("rb") as stream:
+            uploaded = client.files.create(file=stream, purpose="batch")
+        attempt["input_file_id"] = _get(uploaded, "id")
+        attempt["history"].append({"at": utc_now(), "status": "input_uploaded"})
+        save_state(run_dir, state)
+        batch = client.batches.create(
+            input_file_id=attempt["input_file_id"],
+            endpoint=endpoint,
+            completion_window=COMPLETION_WINDOW,
+            metadata=metadata,
+        )
+        _sync_attempt(attempt, batch)
+        save_state(run_dir, state)
+        remote_ids.append(str(attempt["batch_id"]))
     return remote_ids
 
 
@@ -1300,7 +1322,9 @@ def _edit_prompt(
             f"{scale_instruction} Naturally reconstruct the small "
             "background area exposed by the move. After the shift, a square crop centred on the "
             "detected head with side max(head width, head height) times 1.10 must stay fully inside "
-            "the image, with a small safety clearance from every edge."
+            "the image, with a small safety clearance from every edge. This small whole-person "
+            "translation explicitly overrides any generic target instruction not to translate; "
+            "it does not override the target head pose, mask, identity, or scene requirements."
         )
     if any(reason in reasons for reason in ("pan_out_of_tolerance", "pose_unusable")):
         if row.get("pose_status") == "ok" and row.get("estimated_pan_deg") is not None:
@@ -1455,6 +1479,275 @@ def _observed_input_token_profile(
         "observed_min_input_tokens": min(values),
         "observed_max_input_tokens": max(values),
     }
+
+
+def _mask_augmentation_prompt(record: dict[str, Any], mask_description: str) -> str:
+    """Build a mask-only edit prompt while binding the pose and scene invariants."""
+    return " ".join(
+        [
+            "Edit the supplied source image; do not create an unrelated person or scene.",
+            f"Add exactly {mask_description}, correctly worn over the nose, mouth, and chin.",
+            "Make the mask visibly distinct from skin and hair, correctly foreshortened for the current "
+            "head orientation, naturally fitted to the cheeks and nose bridge, with plausible ear loops "
+            "or straps following the visible ear and side of the head.",
+            "Change only the face mask and the tiny immediately occluded facial area. Preserve the same "
+            "fictional identity, skull shape, head size, hair, hat or hood, eyeglasses, clothing, neck, "
+            "shoulders, upper torso, background, lighting, shadows, camera position, framing, and image size.",
+            f"Keep head pan {int(record['signed_pan']):+d} degrees, head pitch "
+            f"{int(record['head_pitch']):+d} degrees, roll 0 degrees, and camera elevation "
+            f"{int(record['camera_elevation']):+d} degrees unchanged. Do not mirror, rotate, translate, "
+            "zoom, crop, or re-pose the person.",
+            "The mask must be photorealistic and anatomically wearable. Do not add logos, text, valves, "
+            "hands, people, faces, reflections, borders, watermarks, or other objects. Do not turn the "
+            "mask into a beard, scarf, balaclava, costume mask, gas mask, or oxygen mask.",
+            "All unedited pixels and scene content should remain as close to the source image as possible.",
+        ]
+    )
+
+
+def _stratified_mask_selection(
+    records: list[dict[str, Any]], target_count: int, seed: int
+) -> list[dict[str, Any]]:
+    """Select face-visible records proportionally across pan bin and direction sign."""
+    eligible = [record for record in records if int(record["abs_pan_bin"]) <= 90]
+    if target_count <= 0 or target_count > len(eligible):
+        raise PipelineError(
+            f"mask target {target_count} exceeds {len(eligible)} face-visible records"
+        )
+    groups: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    for record in eligible:
+        signed_pan = int(record["signed_pan"])
+        sign = 0 if signed_pan == 0 else (1 if signed_pan > 0 else -1)
+        groups.setdefault((int(record["abs_pan_bin"]), sign), []).append(record)
+    allocations: dict[tuple[int, int], int] = {}
+    remainders: list[tuple[float, tuple[int, int]]] = []
+    for key, group in groups.items():
+        exact = target_count * len(group) / len(eligible)
+        allocations[key] = math.floor(exact)
+        remainders.append((exact - allocations[key], key))
+    remaining = target_count - sum(allocations.values())
+    for _, key in sorted(remainders, key=lambda value: (-value[0], value[1]))[
+        :remaining
+    ]:
+        allocations[key] += 1
+    selected: list[dict[str, Any]] = []
+    for key in sorted(groups):
+        group = sorted(groups[key], key=lambda row: str(row["custom_id"]))
+        random.Random(f"{seed}:{key[0]}:{key[1]}").shuffle(group)
+        selected.extend(group[: allocations[key]])
+    return sorted(selected, key=lambda row: str(row["custom_id"]))
+
+
+def create_mask_augmentation(
+    parent_run_dir: Path,
+    batch_id: str,
+    output_root: Path,
+    *,
+    target_fraction: float,
+    planning_cost_per_request_usd: float,
+    edit_token_evidence_run_dir: Path | None = None,
+    seed: int = 20260831,
+) -> Path:
+    """Plan mask-only image edits so masks reach a fraction of the combined set."""
+    if not batch_id or any(character in batch_id for character in "/\\"):
+        raise PipelineError("batch-id must be one safe path component")
+    if not 0.0 < target_fraction < 1.0:
+        raise PipelineError("mask target fraction must be between zero and one")
+    if planning_cost_per_request_usd <= 0:
+        raise PipelineError("planning cost per edit request must be positive")
+    parent_run_dir = parent_run_dir.resolve()
+    parent_state = load_state(parent_run_dir)
+    parent_plan = read_plan(parent_run_dir, parent_state)
+    qa_path = parent_run_dir / "auto_qa.jsonl"
+    report_path = parent_run_dir / "qa_report.json"
+    if not qa_path.exists() or not report_path.exists():
+        raise PipelineError("accepted automatic QA is required before mask planning")
+    qa_rows = {row["custom_id"]: row for row in read_jsonl(qa_path)}
+    if set(qa_rows) != set(parent_plan):
+        raise PipelineError("parent QA rows do not exactly match its generation plan")
+    if any(
+        row.get("quality_gate_pass") is not True
+        or row.get("pan_quality_pass_auto") is not True
+        for row in qa_rows.values()
+    ):
+        raise PipelineError(
+            "mask augmentation requires every parent image to be accepted"
+        )
+    qa_report = json.loads(report_path.read_text(encoding="utf-8"))
+    if (
+        qa_report.get("total") != len(parent_plan)
+        or qa_report.get("quality_pass") != len(parent_plan)
+        or qa_report.get("pan_quality_pass_auto") != len(parent_plan)
+    ):
+        raise PipelineError("parent QA report does not accept the complete dataset")
+
+    config_path = Path(parent_state["config_path"])
+    config = load_config(config_path)
+    if config["api"]["model"] != BATCH_IMAGE_MODEL:
+        raise PipelineError(
+            f"Batch image editing requires api.model={BATCH_IMAGE_MODEL!r}"
+        )
+    base_count = len(parent_plan)
+    target_count = math.ceil(base_count * target_fraction / (1.0 - target_fraction))
+    selected = _stratified_mask_selection(
+        [parent_plan[custom_id] for custom_id in sorted(parent_plan)],
+        target_count,
+        seed,
+    )
+    run_dir = output_root / "batches" / batch_id
+    if run_dir.exists():
+        raise PipelineError(f"refusing to overwrite existing run: {run_dir}")
+    run_dir.mkdir(parents=True)
+    (run_dir / "images").mkdir()
+    (run_dir / "edit_inputs").mkdir()
+
+    records: list[dict[str, Any]] = []
+    items: dict[str, dict[str, Any]] = {}
+    lineage: list[dict[str, Any]] = []
+    requests: list[dict[str, Any]] = []
+    for serial, parent_record in enumerate(selected, 1):
+        parent_id = str(parent_record["custom_id"])
+        source = parent_run_dir / "images" / parent_record["filename"]
+        if not _valid_image(source, parent_record["size"]):
+            raise PipelineError(f"mask edit source is unavailable: {source}")
+        source_sha256 = sha256_file(source)
+        record = dict(parent_record)
+        record.update(
+            {
+                "serial": serial,
+                "source_serial": int(parent_record["serial"]),
+                "custom_id": f"{batch_id}--{_custom_id(int(parent_record['signed_pan']), int(parent_record['camera_elevation']), int(parent_record['head_pitch']), serial)}",
+                "filename": _image_filename(
+                    int(parent_record["signed_pan"]),
+                    int(parent_record["camera_elevation"]),
+                    int(parent_record["head_pitch"]),
+                    serial,
+                    batch_id=batch_id,
+                ),
+                "parent_custom_id": parent_id,
+                "parent_filename": parent_record["filename"],
+                "augmentation_type": "face_mask",
+            }
+        )
+        mask_description = MASK_VARIANTS[(serial - 1) % len(MASK_VARIANTS)]
+        edit_prompt = _mask_augmentation_prompt(record, mask_description)
+        record["base_prompt"] = parent_record["prompt"]
+        record["prompt"] = edit_prompt
+        record["mask_description"] = mask_description
+        edit_source = run_dir / "edit_inputs" / parent_record["filename"]
+        shutil.copy2(source, edit_source)
+        if sha256_file(edit_source) != source_sha256:
+            raise PipelineError("mask edit source changed while copying")
+        request = edit_batch_request(record, config["api"], edit_source, edit_prompt)
+        requests.append(request)
+        item = {
+            "status": "planned",
+            "operation": "mask_augmentation_edit",
+            "filename": record["filename"],
+            "parent_custom_id": parent_id,
+            "parent_filename": parent_record["filename"],
+            "parent_sha256": source_sha256,
+            "edit_round": 1,
+            "edit_reasons": ["add_face_mask"],
+            "edit_prompt": edit_prompt,
+            "mask_description": mask_description,
+        }
+        items[record["custom_id"]] = item
+        lineage.append({"custom_id": record["custom_id"], **item})
+        records.append(record)
+    write_jsonl(run_dir / PLAN_NAME, records)
+    write_jsonl(run_dir / "edit_lineage.jsonl", lineage)
+
+    evidence_run = (edit_token_evidence_run_dir or parent_run_dir).resolve()
+    token_profile = _observed_input_token_profile(evidence_run, EDIT_ENDPOINT)
+    token_plan = _token_based_batch_plan(
+        len(requests), token_profile["observed_mean_input_tokens"]
+    )
+    chunks = _chunk_batch_requests(
+        requests, max_records=int(token_plan["max_records_per_batch"])
+    )
+    shards: list[dict[str, Any]] = []
+    for shard_index, chunk in enumerate(chunks):
+        input_name = f"batch_input_{shard_index:03d}_attempt_00.jsonl"
+        input_path = run_dir / input_name
+        write_jsonl(input_path, chunk)
+        custom_ids = validate_batch_jsonl(
+            input_path, config["api"], expected_endpoint=EDIT_ENDPOINT
+        )
+        if input_path.stat().st_size > 200 * 1024 * 1024:
+            raise PipelineError("Batch input exceeds the 200 MB API limit")
+        shards.append(
+            {
+                "index": shard_index,
+                "custom_ids": custom_ids,
+                "attempts": [
+                    {
+                        "number": 0,
+                        "endpoint": EDIT_ENDPOINT,
+                        "input_path": input_name,
+                        "input_sha256": sha256_file(input_path),
+                        "custom_ids": custom_ids,
+                        "input_file_id": None,
+                        "batch_id": None,
+                        "status": "planned",
+                        "output_file_id": None,
+                        "error_file_id": None,
+                        "request_counts": None,
+                        "history": [
+                            {"at": utc_now(), "status": "planned_mask_augmentation"}
+                        ],
+                    }
+                ],
+            }
+        )
+    final_count = base_count + len(records)
+    reference_cost = float(
+        config["api"].get("documented_reference_cost_per_image_usd", 0.0)
+    )
+    state = {
+        "schema_version": 1,
+        "local_batch_id": batch_id,
+        "stage": parent_state["stage"],
+        "status": "planned",
+        "seed": seed,
+        "config_path": str(config_path.resolve()),
+        "config_sha256": sha256_file(config_path),
+        "api_request": config["api"],
+        "plan_path": PLAN_NAME,
+        "plan_sha256": sha256_file(run_dir / PLAN_NAME),
+        "created_at": utc_now(),
+        "updated_at": utc_now(),
+        "parent_batch_dir": str(parent_run_dir),
+        "parent_state_sha256": sha256_file(parent_run_dir / STATE_NAME),
+        "parent_plan_sha256": parent_state["plan_sha256"],
+        "parent_qa_sha256": sha256_file(qa_path),
+        "parent_approval_sha256": None,
+        "direct_production": True,
+        "approval_policy": "operator_direct_no_human_review",
+        "intermediate_stages_waived": True,
+        "edit_round": 1,
+        "max_edit_rounds": 2,
+        "augmentation_type": "face_mask",
+        "base_dataset_count": base_count,
+        "target_fraction": target_fraction,
+        "target_count": len(records),
+        "projected_combined_count": final_count,
+        "projected_mask_fraction": len(records) / final_count,
+        "eligible_abs_pan_max": 90,
+        "request_count": len(records),
+        "reference_cost_per_request_usd": reference_cost,
+        "reference_projected_cost_usd": round(reference_cost * len(records), 6),
+        "planning_cost_per_request_usd": float(planning_cost_per_request_usd),
+        "planning_projected_cost_usd": round(
+            planning_cost_per_request_usd * len(records), 6
+        ),
+        "planning_cost_basis": "operator_supplied_observed_edit_cost",
+        "token_batch_plans": {EDIT_ENDPOINT: {**token_profile, **token_plan}},
+        "items": items,
+        "shards": shards,
+    }
+    _atomic_json(run_dir / STATE_NAME, state)
+    return run_dir
 
 
 def create_edit_cycle(

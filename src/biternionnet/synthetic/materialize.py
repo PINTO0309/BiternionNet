@@ -20,6 +20,7 @@ from .generate import (
     PipelineError,
     load_config,
     load_state,
+    read_plan,
     sector_centre,
     sha256_file,
     write_jsonl,
@@ -351,6 +352,7 @@ def materialize_run(
     rows, margin, annotation_source, annotations_path = _materialization_annotations(
         run_dir, state, config
     )
+    plan = read_plan(run_dir, state)
     sizes = _real_sizes(anchor_manifest)
     crops_dir = output_root / "crops"
     crops_dir.mkdir(parents=True, exist_ok=True)
@@ -390,29 +392,35 @@ def materialize_run(
             [cv2.IMWRITE_JPEG_QUALITY, int(config["storage"]["quality"])],
         ):
             raise PipelineError(f"failed to write crop: {output_path}")
-        run_manifest_rows.append(
-            {
-                "split": "train",
-                "task": "angle_deg",
-                "angle_deg": float(row["angle_deg"]),
-                "image": f"crops/{output_name}",
-                "source": "synthetic",
-                "custom_id": row["custom_id"],
-                "abs_pan_bin": int(row["abs_pan_bin"]),
-                "label_source": row["label_source"],
-                "label_confidence": float(row["label_confidence"]),
-                "camera_elevation_class": row["camera_elevation_class"],
-                "counts_toward_high_angle_quota": bool(
-                    row["counts_toward_high_angle_quota"]
-                ),
-                "generation_run": state["local_batch_id"],
-                "sha256": sha256_file(output_path),
-                "native_height": target_height,
-                "native_width": target_width,
-                "source_crop_rule": "deim_long_side_square_5pct_per_side",
-                "annotation_acceptance_source": annotation_source,
-            }
-        )
+        manifest_row = {
+            "split": "train",
+            "task": "angle_deg",
+            "angle_deg": float(row["angle_deg"]),
+            "image": f"crops/{output_name}",
+            "source": "synthetic",
+            "custom_id": row["custom_id"],
+            "abs_pan_bin": int(row["abs_pan_bin"]),
+            "label_source": row["label_source"],
+            "label_confidence": float(row["label_confidence"]),
+            "camera_elevation_class": row["camera_elevation_class"],
+            "counts_toward_high_angle_quota": bool(
+                row["counts_toward_high_angle_quota"]
+            ),
+            "generation_run": state["local_batch_id"],
+            "sha256": sha256_file(output_path),
+            "native_height": target_height,
+            "native_width": target_width,
+            "source_crop_rule": "deim_long_side_square_5pct_per_side",
+            "annotation_acceptance_source": annotation_source,
+        }
+        plan_row = plan.get(str(row["custom_id"]), {})
+        if plan_row.get("augmentation_type"):
+            manifest_row["augmentation_type"] = plan_row["augmentation_type"]
+        if plan_row.get("mask_description"):
+            manifest_row["mask_description"] = plan_row["mask_description"]
+        if plan_row.get("parent_custom_id"):
+            manifest_row["parent_custom_id"] = plan_row["parent_custom_id"]
+        run_manifest_rows.append(manifest_row)
     output_root.mkdir(parents=True, exist_ok=True)
     annotations_store = output_root / "annotations.jsonl"
     existing: dict[str, dict[str, Any]] = {}
@@ -481,6 +489,9 @@ def materialize_run(
         "high_angle_total": len(high_rows),
         "elevation_counts": dict(
             Counter(row["camera_elevation_class"] for row in all_rows)
+        ),
+        "augmentation_counts": dict(
+            Counter(row.get("augmentation_type", "none") for row in all_rows)
         ),
         "rejected": rejected,
         "crop_margin": margin,

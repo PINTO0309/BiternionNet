@@ -156,6 +156,14 @@ def test_materialize_accepts_all_promoted_direct_production_rows(tmp_path):
         json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     record = next(iter(read_plan(run, state).values()))
+    record["augmentation_type"] = "face_mask"
+    record["mask_description"] = "white surgical mask"
+    record["parent_custom_id"] = "fixture-parent"
+    write_jsonl(run / state["plan_path"], [record])
+    state["plan_sha256"] = sha256_file(run / state["plan_path"])
+    (run / "batch_state.json").write_text(
+        json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     image_path = run / "images" / record["filename"]
     _image(image_path, 200, 200)
     qa_row = {
@@ -246,6 +254,10 @@ def test_materialize_accepts_all_promoted_direct_production_rows(tmp_path):
     assert all_rows[0]["annotation_acceptance_source"] == (
         "direct_operator_promoted_auto_qa"
     )
+    assert all_rows[0]["augmentation_type"] == "face_mask"
+    assert all_rows[0]["mask_description"] == "white surgical mask"
+    assert all_rows[0]["parent_custom_id"] == "fixture-parent"
+    assert report["augmentation_counts"] == {"face_mask": 1}
     combined_all = (
         tmp_path / "towncentre" / "manifest_nb3_synthetic_all_elevations.jsonl"
     )

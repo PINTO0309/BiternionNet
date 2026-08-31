@@ -13,6 +13,7 @@ from .generate import (
     build_usage_report,
     collect_results,
     create_edit_cycle,
+    create_mask_augmentation,
     create_plan,
     load_config,
     load_state,
@@ -167,6 +168,52 @@ def edit_plan_command(
             "planning_cost_basis": state["planning_cost_basis"],
             "forced_edit_policy": state.get("forced_edit_policy"),
             "edit_reason_filter": state.get("edit_reason_filter"),
+            "paid_request_submitted": False,
+        }
+    )
+
+
+@app.command("mask-plan")
+def mask_plan_command(
+    parent_batch_dir: Path = typer.Option(..., exists=True, file_okay=False),
+    batch_id: str = typer.Option(...),
+    target_fraction: float = typer.Option(0.20, min=0.01, max=0.50),
+    planning_cost_per_request_usd: float = typer.Option(
+        ...,
+        min=0.001,
+        help="Observed per-edit account cost used by the paid submission guard.",
+    ),
+    edit_token_evidence_run: Optional[Path] = typer.Option(
+        None,
+        "--edit-token-evidence-run",
+        exists=True,
+        file_okay=False,
+        help="Completed image-edit run supplying observed input-token usage.",
+    ),
+    output_root: Path = typer.Option(Path("data/synthetic")),
+    seed: int = typer.Option(20260831),
+) -> None:
+    """Plan mask-only edits reaching the requested combined-dataset fraction."""
+    run_dir = create_mask_augmentation(
+        parent_batch_dir,
+        batch_id,
+        output_root,
+        target_fraction=target_fraction,
+        planning_cost_per_request_usd=planning_cost_per_request_usd,
+        edit_token_evidence_run_dir=edit_token_evidence_run,
+        seed=seed,
+    )
+    state = load_state(run_dir)
+    _print(
+        {
+            "batch_dir": str(run_dir),
+            "base_dataset_count": state["base_dataset_count"],
+            "mask_edit_requests": state["request_count"],
+            "projected_combined_count": state["projected_combined_count"],
+            "projected_mask_fraction": state["projected_mask_fraction"],
+            "batches": len(state["shards"]),
+            "token_batch_plan": state["token_batch_plans"]["/v1/images/edits"],
+            "planning_projected_cost_usd": state["planning_projected_cost_usd"],
             "paid_request_submitted": False,
         }
     )
