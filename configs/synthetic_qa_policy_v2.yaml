@@ -1,0 +1,5 @@
+schema_version: 1
+pan_tolerance_deg: 30.0
+enforce_head_height_ratio: false
+deim_direction_max_bin_distance: 1
+deim_crop_margin: 0.05

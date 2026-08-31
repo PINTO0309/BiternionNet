@@ -27,3 +27,9 @@ work is done (or planned) so that later entries can refer back to earlier ones b
 | [008](008_synthetic_pipeline_implementation.md) | Synthetic TownCentre reinforcement pipeline implementation | implemented; generation not yet submitted |
 | [009](009_hrffa_landmark_qa.md) | HRFFA ViT-L landmark diagnostics for synthetic QA | implemented; thresholds await Validation/Pilot calibration |
 | [010](010_single_batch_tensorrt_qa.md) | Single-batch TensorRT policy for synthetic ONNX QA | implemented |
+| [011](011_synthetic_validation_and_edit_cycles.md) | Synthetic Validation and QA-guided Batch edit cycles | two edit rounds complete; pitch calibration blocks Pilot |
+| [012](012_object_assisted_pitch_recovery.md) | Object-assisted pitch recovery | v010 executed; pitch improved but calibration still blocked |
+| [013](013_qa_policy_pan30_head_ratio_diagnostic.md) | QA policy: pan 30 deg and diagnostic-only head-height ratio | implemented; v010 re-evaluated |
+| [014](014_deim_direction_bin_tolerance.md) | DEIM direction tolerance by cyclic bin distance | implemented; v010 re-evaluated |
+| [015](015_fixed_deim_crop_margin.md) | Fixed DEIMv2-box crop margin | implemented at 5%; v010 sheet regenerated |
+| [016](016_validation_failure_repair.md) | Validation failure repair | v013 reaches 19/19 automatic QA and valid pitch calibration |

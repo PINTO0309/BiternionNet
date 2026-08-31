@@ -6,21 +6,23 @@ import csv
 import json
 import math
 from collections import Counter
+from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import cv2
 import numpy as np
+import yaml
 from PIL import Image, ImageDraw, ImageFont, UnidentifiedImageError
 
 from .detector import CLASS_BODY, CLASS_HEAD, DIR8_CLASSES, Deimv2Detector
 from .generate import (
+    DEIM_CROP_MARGIN,
     DIR8_BY_CENTRE,
     ORIENTATION_BY_CENTRE,
     PipelineError,
     circular_error_deg,
-    expected_direction,
     load_config,
     load_state,
     read_plan,
@@ -33,7 +35,6 @@ from .landmarks import HRFFAViTL, landmark_annotation
 from .ort_policy import OnnxProviderPlan, build_provider_plan
 from .pose import SixDRepNet360
 
-DIRECTION_CENTRE = {name: centre for centre, name in DIR8_BY_CENTRE.items()}
 REVIEW_COLUMNS = [
     "custom_id",
     "filename",
@@ -48,16 +49,124 @@ REVIEW_COLUMNS = [
     "photorealism",
     "intent_match",
     "framing",
-    "body_integrity",
+    "head_neck_shoulders_integrity",
     "camera_elevation_class",
     "crop_margin",
     "notes",
     "reviewed_sha256",
 ]
+REVIEW_INSTRUCTIONS_NAME = "human_review_instructions.md"
 PASS_FAIL = {"pass", "fail"}
 INTENT_VALUES = {"match", "off-by-one-bin", "wrong"}
 ELEVATION_VALUES = {"high_angle_match", "eye_level_or_low_angle", "unresolved"}
 LANDMARK_ALIGNMENT_VALUES = {"match", "mismatch", "unresolved"}
+QA_POLICY_SCHEMA_VERSION = 1
+QA_POLICY_KEYS = {
+    "schema_version",
+    "pan_tolerance_deg",
+    "enforce_head_height_ratio",
+    "deim_direction_max_bin_distance",
+    "deim_crop_margin",
+}
+DIRECTION_INDEX = {
+    name: index for index, (_, name) in enumerate(sorted(DIR8_BY_CENTRE.items()))
+}
+
+
+def load_qa_policy(path: Path) -> dict[str, Any]:
+    with path.open(encoding="utf-8") as stream:
+        policy = yaml.safe_load(stream)
+    if not isinstance(policy, dict) or set(policy) != QA_POLICY_KEYS:
+        raise PipelineError(f"QA policy must define exactly {sorted(QA_POLICY_KEYS)}")
+    if int(policy["schema_version"]) != QA_POLICY_SCHEMA_VERSION:
+        raise PipelineError("unsupported QA policy schema version")
+    tolerance = float(policy["pan_tolerance_deg"])
+    if not 0.0 < tolerance <= 90.0:
+        raise PipelineError("QA pan tolerance must be in (0, 90]")
+    if not isinstance(policy["enforce_head_height_ratio"], bool):
+        raise PipelineError("QA enforce_head_height_ratio must be boolean")
+    direction_distance = policy["deim_direction_max_bin_distance"]
+    if not isinstance(direction_distance, int) or not 0 <= direction_distance < 4:
+        raise PipelineError(
+            "QA DEIM direction bin distance must be an integer in [0, 3]"
+        )
+    crop_margin = float(policy["deim_crop_margin"])
+    if not math.isclose(crop_margin, DEIM_CROP_MARGIN, abs_tol=1e-12):
+        raise PipelineError(
+            f"QA DEIM crop margin must be fixed to {DEIM_CROP_MARGIN:.2f}"
+        )
+    return {
+        "schema_version": QA_POLICY_SCHEMA_VERSION,
+        "pan_tolerance_deg": tolerance,
+        "enforce_head_height_ratio": policy["enforce_head_height_ratio"],
+        "deim_direction_max_bin_distance": direction_distance,
+        "deim_crop_margin": DEIM_CROP_MARGIN,
+    }
+
+
+def effective_qa_config(
+    config: dict[str, Any], policy_path: Path | None
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    effective = deepcopy(config)
+    if policy_path is None:
+        policy = {
+            "schema_version": QA_POLICY_SCHEMA_VERSION,
+            "pan_tolerance_deg": float(config["qa"]["pan_tolerance_deg"]),
+            "enforce_head_height_ratio": bool(
+                config["qa"].get("enforce_head_height_ratio", True)
+            ),
+            "deim_direction_max_bin_distance": int(
+                config["qa"].get("deim_direction_max_bin_distance", 1)
+            ),
+            "deim_crop_margin": float(
+                config["qa"].get("deim_crop_margin", DEIM_CROP_MARGIN)
+            ),
+        }
+        source = {
+            **policy,
+            "source": "generation_config",
+            "path": None,
+            "sha256": None,
+        }
+    else:
+        policy_path = policy_path.resolve()
+        if not policy_path.exists():
+            raise PipelineError(f"QA policy not found: {policy_path}")
+        policy = load_qa_policy(policy_path)
+        source = {
+            **policy,
+            "source": "qa_policy_override",
+            "path": str(policy_path),
+            "sha256": sha256_file(policy_path),
+        }
+    effective["qa"]["pan_tolerance_deg"] = policy["pan_tolerance_deg"]
+    effective["qa"]["enforce_head_height_ratio"] = policy["enforce_head_height_ratio"]
+    effective["qa"]["deim_direction_max_bin_distance"] = policy[
+        "deim_direction_max_bin_distance"
+    ]
+    effective["qa"]["deim_crop_margin"] = policy["deim_crop_margin"]
+    return effective, source
+
+
+def config_from_recorded_qa_policy(
+    config: dict[str, Any], qa_report: dict[str, Any]
+) -> dict[str, Any]:
+    recorded = qa_report.get("qa_policy")
+    if not isinstance(recorded, dict):
+        raise PipelineError("QA report does not bind an effective QA policy")
+    source = recorded.get("source")
+    if source == "generation_config":
+        effective, verified = effective_qa_config(config, None)
+    elif source == "qa_policy_override":
+        path_value = recorded.get("path")
+        if not isinstance(path_value, str) or not path_value:
+            raise PipelineError("QA policy override path is missing")
+        effective, verified = effective_qa_config(config, Path(path_value))
+    else:
+        raise PipelineError("QA report has an unsupported QA policy source")
+    if verified != recorded:
+        raise PipelineError("QA policy changed after automatic QA")
+    return effective
 
 
 def _iou(left: list[float], right: list[float]) -> float:
@@ -70,13 +179,28 @@ def _iou(left: list[float], right: list[float]) -> float:
     return intersection / union if union else 0.0
 
 
-def direction_consistent(direction: str | None, intent_pan_deg: float) -> bool:
-    if direction not in DIRECTION_CENTRE:
-        return False
-    return circular_error_deg(DIRECTION_CENTRE[direction], intent_pan_deg) <= 45.0
+def direction_bin_distance(
+    direction: str | None, expected_direction: str | None
+) -> int | None:
+    if direction not in DIRECTION_INDEX or expected_direction not in DIRECTION_INDEX:
+        return None
+    difference = abs(DIRECTION_INDEX[direction] - DIRECTION_INDEX[expected_direction])
+    return min(difference, len(DIRECTION_INDEX) - difference)
 
 
-def _detection_annotation(image: np.ndarray, detections: list[list[float]]) -> dict[str, Any]:
+def direction_consistent(
+    direction: str | None,
+    expected_direction: str | None,
+    *,
+    max_bin_distance: int = 1,
+) -> bool:
+    distance = direction_bin_distance(direction, expected_direction)
+    return distance is not None and distance <= max_bin_distance
+
+
+def _detection_annotation(
+    image: np.ndarray, detections: list[list[float]]
+) -> dict[str, Any]:
     height, width = image.shape[:2]
     heads = [row for row in detections if int(row[0]) == CLASS_HEAD]
     bodies = [row for row in detections if int(row[0]) == CLASS_BODY]
@@ -91,7 +215,9 @@ def _detection_annotation(image: np.ndarray, detections: list[list[float]]) -> d
     box = [float(value) for value in head[1:5]]
     head_width, head_height = box[2] - box[0], box[3] - box[1]
     directions = [row for row in detections if int(row[0]) in DIR8_CLASSES]
-    direction = max(directions, key=lambda row: _iou(box, row[1:5])) if directions else None
+    direction = (
+        max(directions, key=lambda row: _iou(box, row[1:5])) if directions else None
+    )
     body = max(bodies, key=lambda row: row[5]) if bodies else None
     return {
         "detector_status": "ok",
@@ -99,19 +225,27 @@ def _detection_annotation(image: np.ndarray, detections: list[list[float]]) -> d
         "body_count": len(bodies),
         "head_box_xyxy": [round(value, 2) for value in box],
         "head_score": float(head[5]),
-        "body_box_xyxy": [round(float(value), 2) for value in body[1:5]] if body else None,
+        "body_box_xyxy": [round(float(value), 2) for value in body[1:5]]
+        if body
+        else None,
         "body_score": float(body[5]) if body else None,
         "head_height_ratio": round(head_height / height, 5),
         "margin_left_head_ratio": round(box[0] / head_width, 5) if head_width else 0.0,
-        "margin_right_head_ratio": round((width - box[2]) / head_width, 5) if head_width else 0.0,
+        "margin_right_head_ratio": round((width - box[2]) / head_width, 5)
+        if head_width
+        else 0.0,
         "margin_top_head_ratio": round(box[1] / head_height, 5) if head_height else 0.0,
-        "margin_bottom_head_ratio": round((height - box[3]) / head_height, 5) if head_height else 0.0,
+        "margin_bottom_head_ratio": round((height - box[3]) / head_height, 5)
+        if head_height
+        else 0.0,
         "direction": DIR8_CLASSES[int(direction[0])] if direction else None,
         "direction_score": float(direction[5]) if direction else None,
     }
 
 
-def quality_reasons(row: dict[str, Any], config: dict[str, Any]) -> tuple[list[str], bool]:
+def quality_reasons(
+    row: dict[str, Any], config: dict[str, Any]
+) -> tuple[list[str], bool]:
     qa = config["qa"]
     reasons: list[str] = []
     if not row.get("exists"):
@@ -129,12 +263,13 @@ def quality_reasons(row: dict[str, Any], config: dict[str, Any]) -> tuple[list[s
     elif detector_status == "ok":
         if qa["require_single_head"] and row.get("head_count") != 1:
             reasons.append("head_count_not_one")
-        limits = qa["head_height_ratio"]
-        ratio = row.get("head_height_ratio")
-        if ratio is None or float(ratio) < float(limits["min"]):
-            reasons.append("head_too_small")
-        elif float(ratio) > float(limits["max"]):
-            reasons.append("head_too_large")
+        if qa.get("enforce_head_height_ratio", True):
+            limits = qa["head_height_ratio"]
+            ratio = row.get("head_height_ratio")
+            if ratio is None or float(ratio) < float(limits["min"]):
+                reasons.append("head_too_small")
+            elif float(ratio) > float(limits["max"]):
+                reasons.append("head_too_large")
         margin_limit = float(qa["margin_min_head_ratio"])
         margins = [
             row.get("margin_left_head_ratio"),
@@ -144,6 +279,8 @@ def quality_reasons(row: dict[str, Any], config: dict[str, Any]) -> tuple[list[s
         ]
         if any(value is None or float(value) < margin_limit for value in margins):
             reasons.append("insufficient_margin")
+        # Body detection is used only to require neck/shoulder/upper-torso context.
+        # Lower-body anatomy is outside this head-crop QA contract.
         if qa["require_body_detection"] and not row.get("body_count"):
             reasons.append("body_not_detected")
         if not row.get("direction_consistent"):
@@ -157,7 +294,10 @@ def calibrate_pitch(
     eligible = [
         row
         for row in rows
-        if int(row["abs_pan_bin"]) <= 90
+        # SixDRepNet360's Euler pitch folds near a side profile (observed around
+        # 147..171 degrees at abs pan 90), so only the stable front/three-quarter
+        # range may calibrate camera-relative elevation.
+        if int(row["abs_pan_bin"]) <= 60
         and row.get("pose_status") == "ok"
         and row.get("quality_gate_pass")
     ]
@@ -166,10 +306,13 @@ def calibrate_pitch(
     if len(eligible) < minimum:
         return {
             "valid": False,
-            "reason": f"need at least {minimum} front/profile records, got {len(eligible)}",
+            "reason": f"need at least {minimum} stable front/three-quarter records, got {len(eligible)}",
             "sample_count": len(eligible),
+            "maximum_abs_pan_deg": 60,
         }
-    residuals = np.asarray([float(row["pitch_residual_deg"]) for row in eligible], dtype=np.float64)
+    residuals = np.asarray(
+        [float(row["pitch_residual_deg"]) for row in eligible], dtype=np.float64
+    )
     bias = float(np.median(residuals))
     centred = np.abs(residuals - bias)
     q = float(np.quantile(centred, float(elevation["quantile"]), method="linear"))
@@ -178,11 +321,17 @@ def calibrate_pitch(
     threshold = max(float(elevation["minimum_threshold_deg"]), data_threshold)
     pitch_by_elevation: dict[str, float] = {}
     for requested in sorted({float(row["camera_elevation"]) for row in eligible}):
-        group = [float(row["sixd_pitch_deg"]) for row in eligible if float(row["camera_elevation"]) == requested]
+        group = [
+            float(row["sixd_pitch_deg"])
+            for row in eligible
+            if float(row["camera_elevation"]) == requested
+        ]
         pitch_by_elevation[f"{requested:g}"] = float(np.median(group))
     trend_valid: bool | None = None
     if len(pitch_by_elevation) >= 2:
-        ordered = sorted((float(key), value) for key, value in pitch_by_elevation.items())
+        ordered = sorted(
+            (float(key), value) for key, value in pitch_by_elevation.items()
+        )
         trend_valid = ordered[-1][1] < ordered[0][1]
     valid = data_threshold <= maximum and trend_valid is not False
     return {
@@ -197,6 +346,7 @@ def calibrate_pitch(
             )
         ),
         "sample_count": len(eligible),
+        "maximum_abs_pan_deg": 60,
         "bias_deg": bias,
         "centred_q_deg": q,
         "data_threshold_deg": data_threshold,
@@ -227,16 +377,24 @@ def rear_reliability_policy(
     sectors: dict[str, dict[str, Any]] = {}
     for sector, rows in sorted(grouped.items()):
         count = len(rows)
-        agreement = sum(
-            row.get("pose_status") == "ok" and float(row.get("pan_error_deg", 999.0)) <= tolerance
-            for row in rows
-        ) / count
-        conflicts = sum(not bool(row.get("direction_consistent")) for row in rows) / count
+        agreement = (
+            sum(
+                row.get("pose_status") == "ok"
+                and float(row.get("pan_error_deg", 999.0)) <= tolerance
+                for row in rows
+            )
+            / count
+        )
+        conflicts = (
+            sum(not bool(row.get("direction_consistent")) for row in rows) / count
+        )
         sectors[sector] = {
             "reviewed": count,
             "sixd_within_tolerance_ratio": agreement,
             "deim_conflict_ratio": conflicts,
-            "sixd_allowed": stage == "pilot" and agreement >= agreement_min and conflicts <= conflict_max,
+            "sixd_allowed": stage == "pilot"
+            and agreement >= agreement_min
+            and conflicts <= conflict_max,
         }
     return {
         "schema_version": 1,
@@ -252,13 +410,23 @@ def rear_reliability_policy(
 def classify_elevation(
     row: dict[str, Any], calibration: dict[str, Any], config: dict[str, Any]
 ) -> tuple[str, bool]:
-    if row.get("pose_status") != "ok" or not calibration.get("valid"):
+    if (
+        int(row.get("abs_pan_bin", 999))
+        > int(calibration.get("maximum_abs_pan_deg", 60))
+        or row.get("pose_status") != "ok"
+        or not calibration.get("valid")
+    ):
         return "unresolved", False
-    residual_error = abs(float(row["pitch_residual_deg"]) - float(calibration["bias_deg"]))
+    residual_error = abs(
+        float(row["pitch_residual_deg"]) - float(calibration["bias_deg"])
+    )
     requested_camera = float(row["camera_elevation"])
     pitch = float(row["sixd_pitch_deg"])
     ratio = float(config["qa"]["elevation"]["minimum_negative_camera_ratio"])
-    high = residual_error <= float(calibration["threshold_deg"]) and pitch <= -ratio * requested_camera
+    high = (
+        residual_error <= float(calibration["threshold_deg"])
+        and pitch <= -ratio * requested_camera
+    )
     return ("high_angle_match", True) if high else ("eye_level_or_low_angle", False)
 
 
@@ -276,7 +444,9 @@ def summarize_landmarks(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 np.median([row["hrffa_high_confidence_visible_count"] for row in group])
             ),
             "median_core_face_high_conf_visible_count": float(
-                np.median([row["hrffa_core_face_high_conf_visible_count"] for row in group])
+                np.median(
+                    [row["hrffa_core_face_high_conf_visible_count"] for row in group]
+                )
             ),
             "median_mean_visible_probability": float(
                 np.median([row["hrffa_mean_visible_probability"] for row in group])
@@ -286,7 +456,10 @@ def summarize_landmarks(rows: list[dict[str, Any]]) -> dict[str, Any]:
             ),
             "median_left_minus_right_eye_visibility": float(
                 np.median(
-                    [row["hrffa_subject_left_minus_right_eye_visibility"] for row in group]
+                    [
+                        row["hrffa_subject_left_minus_right_eye_visibility"]
+                        for row in group
+                    ]
                 )
             ),
             "median_nose_tip_x_offset": float(
@@ -295,7 +468,9 @@ def summarize_landmarks(rows: list[dict[str, Any]]) -> dict[str, Any]:
         }
 
     sectors = {
-        direction: metrics([row for row in usable if row["expected_direction"] == direction])
+        direction: metrics(
+            [row for row in usable if row["expected_direction"] == direction]
+        )
         for direction in sorted({str(row["expected_direction"]) for row in rows})
     }
     return {
@@ -336,10 +511,12 @@ def landmark_human_calibration(
             "unresolved is expected for genuine rear views"
         ),
         "metrics_by_human_alignment": {
-            label: summarize_landmarks(group)["overall"] for label, group in by_label.items()
+            label: summarize_landmarks(group)["overall"]
+            for label, group in by_label.items()
         },
         "review_counts_by_expected_direction": {
-            direction: dict(counts) for direction, counts in sorted(by_direction.items())
+            direction: dict(counts)
+            for direction, counts in sorted(by_direction.items())
         },
         "promotion_requirement": (
             "define and preregister sector-specific thresholds from human-reviewed Pilot, then "
@@ -356,10 +533,12 @@ def run_auto_qa(
     landmark_model: Path | None = None,
     calibration_path: Path | None = None,
     rear_policy_path: Path | None = None,
+    qa_policy_path: Path | None = None,
     cpu: bool = False,
 ) -> dict[str, Any]:
     state = load_state(run_dir)
-    config = load_config(Path(state["config_path"]))
+    generation_config = load_config(Path(state["config_path"]))
+    config, qa_policy = effective_qa_config(generation_config, qa_policy_path)
     plan = list(read_plan(run_dir, state).values())
     detector = None
     detector_provider_plan: OnnxProviderPlan | None = None
@@ -369,7 +548,9 @@ def run_auto_qa(
             raise PipelineError(f"DEIM model not found: {detector_model}")
         detector_sha256 = sha256_file(detector_model)
         if detector_sha256 != config["models"]["deimv2"]["sha256"]:
-            raise PipelineError("DEIM model SHA-256 does not match the configured QA asset")
+            raise PipelineError(
+                "DEIM model SHA-256 does not match the configured QA asset"
+            )
         detector_provider_plan = build_provider_plan(
             detector_model,
             model_sha256=detector_sha256,
@@ -389,7 +570,9 @@ def run_auto_qa(
             raise PipelineError(f"SixD model not found: {pose_model}")
         pose_sha256 = sha256_file(pose_model)
         if pose_sha256 != config["models"]["sixdrepnet360"]["sha256"]:
-            raise PipelineError("SixD model SHA-256 does not match the configured QA asset")
+            raise PipelineError(
+                "SixD model SHA-256 does not match the configured QA asset"
+            )
         pose_provider_plan = build_provider_plan(
             pose_model, model_sha256=pose_sha256, force_cpu=cpu
         )
@@ -402,7 +585,9 @@ def run_auto_qa(
             raise PipelineError(f"HRFFA model not found: {landmark_model}")
         landmark_sha256 = sha256_file(landmark_model)
         if landmark_sha256 != config["models"]["hrffa_vitl_ibug68"]["sha256"]:
-            raise PipelineError("HRFFA model SHA-256 does not match the configured QA asset")
+            raise PipelineError(
+                "HRFFA model SHA-256 does not match the configured QA asset"
+            )
         landmark_provider_plan = build_provider_plan(
             landmark_model, model_sha256=landmark_sha256, force_cpu=cpu
         )
@@ -458,8 +643,20 @@ def run_auto_qa(
         row["duplicate_of"] = hashes.get(digest) if digest else None
         if digest:
             hashes.setdefault(digest, row["custom_id"])
+        row["direction_bin_distance"] = direction_bin_distance(
+            row.get("direction"), row.get("expected_direction")
+        )
+        row["deim_direction_max_bin_distance"] = int(
+            config["qa"]["deim_direction_max_bin_distance"]
+        )
         row["direction_consistent"] = direction_consistent(
-            row.get("direction"), float(row["intent_pan_deg"])
+            row.get("direction"),
+            row.get("expected_direction"),
+            max_bin_distance=row["deim_direction_max_bin_distance"],
+        )
+        row["qa_pan_tolerance_deg"] = float(config["qa"]["pan_tolerance_deg"])
+        row["head_height_ratio_gate_active"] = bool(
+            config["qa"].get("enforce_head_height_ratio", True)
         )
         reasons, detector_complete = quality_reasons(row, config)
         row["quality_gate_reasons"] = reasons
@@ -468,7 +665,9 @@ def run_auto_qa(
         row["pose_status"] = "skipped"
         row["landmark_status"] = "skipped"
         if pose is not None and row.get("head_box_xyxy") and row["custom_id"] in images:
-            yaw, pitch, roll = pose.infer(images[row["custom_id"]], row["head_box_xyxy"])
+            yaw, pitch, roll = pose.infer(
+                images[row["custom_id"]], row["head_box_xyxy"]
+            )
             if all(math.isfinite(value) for value in (yaw, pitch, roll)):
                 estimated = (-yaw) % 360.0
                 row.update(
@@ -478,14 +677,22 @@ def run_auto_qa(
                         "sixd_pitch_deg": round(pitch, 4),
                         "sixd_roll_deg": round(roll, 4),
                         "estimated_pan_deg": round(estimated, 4),
-                        "pan_error_deg": round(circular_error_deg(estimated, row["intent_pan_deg"]), 4),
+                        "pan_error_deg": round(
+                            circular_error_deg(estimated, row["intent_pan_deg"]), 4
+                        ),
                         "pitch_expected_deg": -float(row["camera_elevation"]),
-                        "pitch_residual_deg": round(wrap180(pitch + float(row["camera_elevation"])), 4),
+                        "pitch_residual_deg": round(
+                            wrap180(pitch + float(row["camera_elevation"])), 4
+                        ),
                     }
                 )
             else:
                 row["pose_status"] = "invalid"
-        if landmarks is not None and row.get("head_box_xyxy") and row["custom_id"] in images:
+        if (
+            landmarks is not None
+            and row.get("head_box_xyxy")
+            and row["custom_id"] in images
+        ):
             try:
                 result = landmarks.infer(images[row["custom_id"]], row["head_box_xyxy"])
                 row.update(landmark_annotation(result, images[row["custom_id"]].shape))
@@ -510,6 +717,7 @@ def run_auto_qa(
                 "stage": "validation",
                 "run_id": state["local_batch_id"],
                 "created_at": datetime.now(UTC).isoformat(),
+                "qa_policy": qa_policy,
             }
         )
         calibration_file = run_dir / "pitch_calibration.json"
@@ -518,27 +726,41 @@ def run_auto_qa(
         )
     else:
         if calibration_path is None or not calibration_path.exists():
-            raise PipelineError("non-validation QA requires --calibration from approved Validation")
+            raise PipelineError(
+                "non-validation QA requires --calibration from approved Validation"
+            )
         calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
         if not calibration.get("valid"):
             raise PipelineError("pitch calibration is not valid")
         if state.get("parent_batch_dir"):
             parent_approval = json.loads(
-                (Path(state["parent_batch_dir"]) / "approval.json").read_text(encoding="utf-8")
+                (Path(state["parent_batch_dir"]) / "approval.json").read_text(
+                    encoding="utf-8"
+                )
             )
-            if parent_approval.get("pitch_calibration_sha256") != sha256_file(calibration_path):
-                raise PipelineError("QA calibration does not match the approved parent calibration")
+            if parent_approval.get("pitch_calibration_sha256") != sha256_file(
+                calibration_path
+            ):
+                raise PipelineError(
+                    "QA calibration does not match the approved parent calibration"
+                )
     rear_policy: dict[str, Any] | None = None
     if state["stage"] in {"floor_120", "uniform_200"}:
         if rear_policy_path is None or not rear_policy_path.exists():
-            raise PipelineError("quota-fill QA requires --rear-policy from approved Pilot")
+            raise PipelineError(
+                "quota-fill QA requires --rear-policy from approved Pilot"
+            )
         rear_policy = json.loads(rear_policy_path.read_text(encoding="utf-8"))
         if rear_policy.get("source_stage") != "pilot":
             raise PipelineError("rear policy must come from Pilot")
         parent_approval = json.loads(
-            (Path(state["parent_batch_dir"]) / "approval.json").read_text(encoding="utf-8")
+            (Path(state["parent_batch_dir"]) / "approval.json").read_text(
+                encoding="utf-8"
+            )
         )
-        if parent_approval.get("rear_label_policy_sha256") != sha256_file(rear_policy_path):
+        if parent_approval.get("rear_label_policy_sha256") != sha256_file(
+            rear_policy_path
+        ):
             raise PipelineError("rear policy does not match approved Pilot")
     tolerance = float(config["qa"]["pan_tolerance_deg"])
     for row in rows:
@@ -546,21 +768,34 @@ def run_auto_qa(
         row["camera_elevation_class_auto"] = elevation_class
         row["counts_toward_high_angle_quota_auto"] = counts
         if int(row["abs_pan_bin"]) <= 90:
-            pose_pan_pass = row.get("pose_status") == "ok" and float(row["pan_error_deg"]) <= tolerance
+            pose_pan_pass = (
+                row.get("pose_status") == "ok"
+                and float(row["pan_error_deg"]) <= tolerance
+            )
             row["label_source_auto"] = "sixdrepnet360" if pose_pan_pass else None
-            row["angle_deg_auto"] = row.get("estimated_pan_deg") if pose_pan_pass else None
-            row["pan_quality_pass_auto"] = bool(row["quality_gate_pass"] and pose_pan_pass)
+            row["angle_deg_auto"] = (
+                row.get("estimated_pan_deg") if pose_pan_pass else None
+            )
+            row["pan_quality_pass_auto"] = bool(
+                row["quality_gate_pass"] and pose_pan_pass
+            )
         else:
-            sector_policy = (rear_policy or {}).get("sectors", {}).get(
-                str(row["expected_direction"]), {}
+            sector_policy = (
+                (rear_policy or {})
+                .get("sectors", {})
+                .get(str(row["expected_direction"]), {})
             )
             use_sixd = bool(
                 sector_policy.get("sixd_allowed")
                 and row.get("pose_status") == "ok"
                 and float(row.get("pan_error_deg", 999.0)) <= tolerance
             )
-            row["label_source_auto"] = "sixdrepnet360_rear_pilot_validated" if use_sixd else "intent_rear"
-            row["angle_deg_auto"] = row.get("estimated_pan_deg") if use_sixd else row["intent_pan_deg"]
+            row["label_source_auto"] = (
+                "sixdrepnet360_rear_pilot_validated" if use_sixd else "intent_rear"
+            )
+            row["angle_deg_auto"] = (
+                row.get("estimated_pan_deg") if use_sixd else row["intent_pan_deg"]
+            )
             row["pan_quality_pass_auto"] = bool(
                 row["quality_gate_pass"] and row["direction_consistent"]
             )
@@ -569,8 +804,13 @@ def run_auto_qa(
         "stage": state["stage"],
         "total": len(rows),
         "quality_pass": sum(bool(row["quality_gate_pass"]) for row in rows),
-        "pan_quality_pass_auto": sum(bool(row["pan_quality_pass_auto"]) for row in rows),
-        "elevation_counts_auto": dict(Counter(row["camera_elevation_class_auto"] for row in rows)),
+        "pan_quality_pass_auto": sum(
+            bool(row["pan_quality_pass_auto"]) for row in rows
+        ),
+        "elevation_counts_auto": dict(
+            Counter(row["camera_elevation_class_auto"] for row in rows)
+        ),
+        "qa_policy": qa_policy,
         "calibration": calibration,
         "calibration_path": (
             str((run_dir / "pitch_calibration.json").resolve())
@@ -617,7 +857,9 @@ def run_auto_qa(
             ),
         },
         "rear_policy": str(rear_policy_path.resolve()) if rear_policy_path else None,
-        "rear_policy_sha256": sha256_file(rear_policy_path) if rear_policy_path else None,
+        "rear_policy_sha256": sha256_file(rear_policy_path)
+        if rear_policy_path
+        else None,
     }
     (run_dir / "qa_report.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -629,7 +871,9 @@ def _contact_sheet(run_dir: Path, rows: list[dict[str, Any]], output: Path) -> N
     thumb_width, thumb_height = 180, 180
     columns = 5
     rows_count = math.ceil(len(rows) / columns)
-    canvas = Image.new("RGB", (columns * thumb_width, rows_count * (thumb_height + 45)), "white")
+    canvas = Image.new(
+        "RGB", (columns * thumb_width, rows_count * (thumb_height + 45)), "white"
+    )
     draw = ImageDraw.Draw(canvas)
     font = ImageFont.load_default()
     for index, row in enumerate(rows):
@@ -646,12 +890,19 @@ def _contact_sheet(run_dir: Path, rows: list[dict[str, Any]], output: Path) -> N
             f"{row['abs_pan_bin']:03d} {row.get('direction') or '-'}\n"
             f"pan={row.get('estimated_pan_deg')} p={row.get('sixd_pitch_deg')}"
         )
-        draw.multiline_text(((index % columns) * thumb_width + 2, y + thumb_height + 2), label, fill="black", font=font)
+        draw.multiline_text(
+            ((index % columns) * thumb_width + 2, y + thumb_height + 2),
+            label,
+            fill="black",
+            font=font,
+        )
     output.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(output, "JPEG", quality=92)
 
 
-def _landmark_contact_sheet(run_dir: Path, rows: list[dict[str, Any]], output: Path) -> None:
+def _landmark_contact_sheet(
+    run_dir: Path, rows: list[dict[str, Any]], output: Path
+) -> None:
     """Render HRFFA landmarks separately so the photorealism sheet stays unobstructed."""
     thumb_width, thumb_height = 240, 240
     columns = 4
@@ -677,7 +928,14 @@ def _landmark_contact_sheet(run_dir: Path, rows: list[dict[str, Any]], output: P
         points = row.get("hrffa_points_xy", [])
         visibility = row.get("hrffa_visibility", [])
         radius = (
-            max(2, int(round(max(head_box[2] - head_box[0], head_box[3] - head_box[1]) / 100)))
+            max(
+                2,
+                int(
+                    round(
+                        max(head_box[2] - head_box[0], head_box[3] - head_box[1]) / 100
+                    )
+                ),
+            )
             if head_box
             else 2
         )
@@ -715,7 +973,9 @@ def prepare_human_review(run_dir: Path) -> dict[str, Any]:
     qa_path = run_dir / "auto_qa.jsonl"
     if not qa_path.exists():
         raise PipelineError("run auto QA before preparing human review")
-    rows = [json.loads(line) for line in qa_path.read_text(encoding="utf-8").splitlines()]
+    rows = [
+        json.loads(line) for line in qa_path.read_text(encoding="utf-8").splitlines()
+    ]
     review_path = run_dir / "human_review.csv"
     if review_path.exists():
         raise PipelineError(f"refusing to overwrite existing review: {review_path}")
@@ -742,6 +1002,20 @@ def prepare_human_review(run_dir: Path) -> dict[str, Any]:
                     "reviewed_sha256": row.get("sha256", ""),
                 }
             )
+    instructions_path = run_dir / REVIEW_INSTRUCTIONS_NAME
+    instructions_path.write_text(
+        """# Human review instructions
+
+- Review the head, neck, both shoulders, and visible upper torso as the target region.
+- Set `head_neck_shoulders_integrity` to `fail` for anatomical breakage in that target region.
+- Lower-body breakage alone is acceptable. Do not fail `photorealism`, `framing`, or
+  `head_neck_shoulders_integrity` solely because legs, feet, or other lower-body regions are malformed.
+- `framing` still requires a complete head and TownCentre-like head margins; a distant full-body composition
+  can fail because the head is too small, independently of lower-body quality.
+- Record all review fields before approval. Do not change `reviewed_sha256`.
+""",
+        encoding="utf-8",
+    )
     contact_path = run_dir / "review_contact_sheet.jpg"
     _contact_sheet(run_dir, rows, contact_path)
     landmark_contact_path = run_dir / "landmark_contact_sheet.jpg"
@@ -769,6 +1043,7 @@ def prepare_human_review(run_dir: Path) -> dict[str, Any]:
     )
     return {
         "review": str(review_path),
+        "instructions": str(instructions_path),
         "contact_sheet": str(contact_path),
         "landmark_contact_sheet": str(landmark_contact_path),
         "sign_calibration": str(sign_path),
@@ -781,7 +1056,6 @@ def approve_human_review(
     *,
     reviewer: str,
     sign_calibration_approved: bool,
-    crop_margin: float,
     evaluation_protocol: Path,
     usage_report: Path,
     account_verified_snapshot: str | None,
@@ -796,6 +1070,7 @@ def approve_human_review(
     if not qa_report_path.exists():
         raise PipelineError("run auto QA before approval")
     qa_report = json.loads(qa_report_path.read_text(encoding="utf-8"))
+    config = config_from_recorded_qa_policy(config, qa_report)
     expected_model_hashes = {
         "detector_sha256": config["models"]["deimv2"]["sha256"],
         "pose_sha256": config["models"]["sixdrepnet360"]["sha256"],
@@ -804,9 +1079,9 @@ def approve_human_review(
     for report_key, expected_hash in expected_model_hashes.items():
         if qa_report.get(report_key) != expected_hash:
             raise PipelineError(f"QA report does not bind the configured {report_key}")
-    candidates = {float(value) for value in config["qa"]["crop_margin_candidates"]}
-    if float(crop_margin) not in candidates:
-        raise PipelineError(f"crop margin must be one of {sorted(candidates)}")
+    crop_margin = float(config["qa"]["deim_crop_margin"])
+    if not math.isclose(crop_margin, DEIM_CROP_MARGIN, abs_tol=1e-12):
+        raise PipelineError("effective QA policy has an invalid DEIM crop margin")
     if not evaluation_protocol.exists():
         raise PipelineError(f"evaluation protocol not found: {evaluation_protocol}")
     validate_evaluation_protocol(evaluation_protocol)
@@ -820,12 +1095,19 @@ def approve_human_review(
         raise PipelineError("prepare human review and sign calibration before approval")
     qa_rows = {
         row["custom_id"]: row
-        for row in (json.loads(line) for line in (run_dir / "auto_qa.jsonl").read_text(encoding="utf-8").splitlines())
+        for row in (
+            json.loads(line)
+            for line in (run_dir / "auto_qa.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        )
     }
     review_path = run_dir / "human_review.csv"
     with review_path.open(encoding="utf-8", newline="") as stream:
         review_rows = list(csv.DictReader(stream))
-    if len(review_rows) != len(qa_rows) or {row["custom_id"] for row in review_rows} != set(qa_rows):
+    if len(review_rows) != len(qa_rows) or {
+        row["custom_id"] for row in review_rows
+    } != set(qa_rows):
         raise PipelineError("human review rows do not exactly match auto QA")
     if state["stage"] in {"validation", "pilot"}:
         rear_policy = rear_reliability_policy(
@@ -841,7 +1123,12 @@ def approve_human_review(
     for row in review_rows:
         custom_id = row["custom_id"]
         qa = qa_rows[custom_id]
-        if any(row[field] not in PASS_FAIL for field in ("photorealism", "framing", "body_integrity")):
+        integrity_fields = (
+            "photorealism",
+            "framing",
+            "head_neck_shoulders_integrity",
+        )
+        if any(row[field] not in PASS_FAIL for field in integrity_fields):
             raise PipelineError(f"incomplete pass/fail review for {custom_id}")
         if row["intent_match"] not in INTENT_VALUES:
             raise PipelineError(f"incomplete intent review for {custom_id}")
@@ -852,7 +1139,7 @@ def approve_human_review(
         image_path = run_dir / "images" / row["filename"]
         if not image_path.exists() or row["reviewed_sha256"] != sha256_file(image_path):
             raise PipelineError(f"reviewed image changed for {custom_id}")
-        human_pass = all(row[field] == "pass" for field in ("photorealism", "framing", "body_integrity"))
+        human_pass = all(row[field] == "pass" for field in integrity_fields)
         intent_pass = row["intent_match"] in {"match", "off-by-one-bin"}
         pan_quality = bool(qa["pan_quality_pass_auto"] and human_pass and intent_pass)
         elevation = row["camera_elevation_class"]
@@ -874,7 +1161,8 @@ def approve_human_review(
                 "human_review": {key: row[key] for key in REVIEW_COLUMNS if key in row},
                 "pan_quality_pass": pan_quality,
                 "camera_elevation_class": elevation,
-                "counts_toward_high_angle_quota": pan_quality and elevation == "high_angle_match",
+                "counts_toward_high_angle_quota": pan_quality
+                and elevation == "high_angle_match",
                 "angle_deg": angle,
                 "label_source": label_source,
                 "label_confidence": 1.0 if pan_quality else 0.0,
@@ -885,10 +1173,16 @@ def approve_human_review(
             raise PipelineError(
                 "Validation approval requires the configured snapshot to be explicitly account-verified"
             )
-        matches = sum(row["human_review"]["intent_match"] == "match" for row in approved_rows)
+        matches = sum(
+            row["human_review"]["intent_match"] == "match" for row in approved_rows
+        )
         if matches < 15:
-            raise PipelineError(f"Validation requires at least 15/19 exact intent matches, got {matches}")
-        calibration = json.loads((run_dir / "pitch_calibration.json").read_text(encoding="utf-8"))
+            raise PipelineError(
+                f"Validation requires at least 15/19 exact intent matches, got {matches}"
+            )
+        calibration = json.loads(
+            (run_dir / "pitch_calibration.json").read_text(encoding="utf-8")
+        )
         if not calibration.get("valid"):
             raise PipelineError("Validation pitch calibration failed")
         calibration_path = run_dir / "pitch_calibration.json"
@@ -908,7 +1202,8 @@ def approve_human_review(
     )
     landmark_calibration_path = run_dir / "landmark_calibration.json"
     landmark_calibration_path.write_text(
-        json.dumps(landmark_calibration, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        json.dumps(landmark_calibration, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
     )
     rear_policy.update(
         {
@@ -920,7 +1215,11 @@ def approve_human_review(
     rear_policy_path.write_text(
         json.dumps(rear_policy, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
-    elevation_counts = Counter(row["camera_elevation_class"] for row in approved_rows if row["pan_quality_pass"])
+    elevation_counts = Counter(
+        row["camera_elevation_class"]
+        for row in approved_rows
+        if row["pan_quality_pass"]
+    )
     approval = {
         "approved": True,
         "stage": state["stage"],
@@ -953,5 +1252,7 @@ def approve_human_review(
         "elevation_counts": dict(elevation_counts),
     }
     approval_path = run_dir / "approval.json"
-    approval_path.write_text(json.dumps(approval, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    approval_path.write_text(
+        json.dumps(approval, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     return approval

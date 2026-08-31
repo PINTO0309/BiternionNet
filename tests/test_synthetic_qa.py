@@ -4,18 +4,32 @@ import numpy as np
 import pytest
 
 from biternionnet.synthetic.generate import load_config
-from biternionnet.synthetic.landmarks import LandmarkResult, crop_transform, landmark_annotation
+from biternionnet.synthetic.landmarks import (
+    LandmarkResult,
+    crop_transform,
+    landmark_annotation,
+)
 from biternionnet.synthetic.qa import (
+    REVIEW_COLUMNS,
     calibrate_pitch,
     classify_elevation,
+    direction_bin_distance,
     direction_consistent,
+    effective_qa_config,
     landmark_human_calibration,
     quality_reasons,
     rear_reliability_policy,
     summarize_landmarks,
 )
 
-CONFIG = Path(__file__).resolve().parents[1] / "configs" / "synthetic_towncentre_batch.yaml"
+CONFIG = (
+    Path(__file__).resolve().parents[1] / "configs" / "synthetic_towncentre_batch.yaml"
+)
+
+
+def test_human_integrity_review_is_scoped_to_head_surroundings():
+    assert "head_neck_shoulders_integrity" in REVIEW_COLUMNS
+    assert "body_integrity" not in REVIEW_COLUMNS
 
 
 def _quality_row(abs_pan, residual, pitch, cam=45):
@@ -31,15 +45,23 @@ def _quality_row(abs_pan, residual, pitch, cam=45):
 
 def test_pitch_calibration_classifies_but_does_not_reject_eye_level():
     config = load_config(CONFIG)
-    rows = [_quality_row(value, residual, -35 + index) for index, (value, residual) in enumerate(
-        zip(range(0, 91, 10), [8, 9, 10, 10, 11, 12, 9, 8, 11, 10], strict=True)
-    )]
+    rows = [
+        _quality_row(value, residual, -35 + index)
+        for index, (value, residual) in enumerate(
+            zip(range(0, 91, 10), [8, 9, 10, 10, 11, 12, 9, 8, 11, 10], strict=True)
+        )
+    ]
     calibration = calibrate_pitch(rows, config)
     assert calibration["valid"] is True
-    high = _quality_row(90, calibration["bias_deg"], -40)
-    eye = _quality_row(90, 45, 0)
+    high = _quality_row(60, calibration["bias_deg"], -40)
+    eye = _quality_row(60, 45, 0)
     assert classify_elevation(high, calibration, config) == ("high_angle_match", True)
-    assert classify_elevation(eye, calibration, config) == ("eye_level_or_low_angle", False)
+    assert classify_elevation(eye, calibration, config) == (
+        "eye_level_or_low_angle",
+        False,
+    )
+    profile = _quality_row(90, calibration["bias_deg"], -40)
+    assert classify_elevation(profile, calibration, config) == ("unresolved", False)
 
 
 def test_back_view_is_allowed_and_direction_mapping_is_explicit():
@@ -62,9 +84,52 @@ def test_back_view_is_allowed_and_direction_mapping_is_explicit():
     }
     reasons, complete = quality_reasons(row, config)
     assert complete and reasons == []
-    assert direction_consistent("left_side", 90)
-    assert direction_consistent("right_side", 270)
-    assert not direction_consistent("right_side", 90)
+    assert direction_consistent("left_side", "left_side")
+    assert direction_consistent("left_front", "left_side")
+    assert direction_consistent("right_front", "front")
+    assert not direction_consistent("front", "left_side")
+    assert not direction_consistent("right_side", "left_side")
+    assert direction_bin_distance("front", "left_side") == 2
+    assert direction_bin_distance("right_front", "front") == 1
+
+
+def test_qa_policy_disables_head_height_gate_but_keeps_measurement(tmp_path):
+    config = load_config(CONFIG)
+    row = {
+        "exists": True,
+        "image_valid": True,
+        "dimension_match": True,
+        "duplicate_of": None,
+        "detector_status": "ok",
+        "head_count": 1,
+        "body_count": 1,
+        "head_height_ratio": 0.10,
+        "margin_left_head_ratio": 1.0,
+        "margin_right_head_ratio": 1.0,
+        "margin_top_head_ratio": 1.0,
+        "margin_bottom_head_ratio": 1.0,
+        "direction_consistent": True,
+    }
+    assert "head_too_small" in quality_reasons(row, config)[0]
+
+    policy_path = tmp_path / "qa-policy.yaml"
+    policy_path.write_text(
+        "schema_version: 1\n"
+        "pan_tolerance_deg: 30.0\n"
+        "enforce_head_height_ratio: false\n"
+        "deim_direction_max_bin_distance: 1\n"
+        "deim_crop_margin: 0.05\n",
+        encoding="utf-8",
+    )
+    effective, metadata = effective_qa_config(config, policy_path)
+    reasons, complete = quality_reasons(row, effective)
+    assert complete and reasons == []
+    assert row["head_height_ratio"] == 0.10
+    assert effective["qa"]["pan_tolerance_deg"] == 30.0
+    assert effective["qa"]["enforce_head_height_ratio"] is False
+    assert effective["qa"]["deim_crop_margin"] == 0.05
+    assert metadata["source"] == "qa_policy_override"
+    assert len(metadata["sha256"]) == 64
 
 
 def test_validation_pitch_trend_and_pilot_rear_policy_are_fail_closed():

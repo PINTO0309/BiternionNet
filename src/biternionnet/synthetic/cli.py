@@ -12,6 +12,7 @@ from .generate import (
     PipelineError,
     build_usage_report,
     collect_results,
+    create_edit_cycle,
     create_plan,
     load_config,
     load_state,
@@ -22,10 +23,15 @@ from .generate import (
     sha256_file,
     submit_pending,
 )
-from .materialize import materialize_run, render_crop_margin_candidates
+from .materialize import materialize_run, render_deim_crop_margin_sheet
 from .models import install_model_assets
 from .profiles import finalize_test_profiles, plan_profile_candidates
-from .qa import approve_human_review, prepare_human_review, run_auto_qa
+from .qa import (
+    approve_human_review,
+    config_from_recorded_qa_policy,
+    prepare_human_review,
+    run_auto_qa,
+)
 from .quotas import top_up_plan
 
 app = typer.Typer(help="Plan, collect, QA, and materialize TownCentre synthetic heads.")
@@ -45,7 +51,9 @@ def plan_command(
     output_root: Path = typer.Option(Path("data/synthetic")),
     seed: int = typer.Option(20260831),
     approved_batch_dir: Optional[Path] = typer.Option(None, exists=True),
-    bin_counts: Optional[str] = typer.Option(None, help="Optional comma-separated 19-bin top-up request counts."),
+    bin_counts: Optional[str] = typer.Option(
+        None, help="Optional comma-separated 19-bin top-up request counts."
+    ),
 ) -> None:
     counts = [int(value) for value in bin_counts.split(",")] if bin_counts else None
     run_dir = create_plan(
@@ -66,9 +74,50 @@ def plan_command(
             "shards": len(state["shards"]),
             "quality": state["api_request"]["quality"],
             "model": state["api_request"]["model"],
-            "documented_reference_projected_cost_usd": state["reference_projected_cost_usd"],
+            "documented_reference_projected_cost_usd": state[
+                "reference_projected_cost_usd"
+            ],
             "planning_projected_cost_usd": state["planning_projected_cost_usd"],
             "planning_cost_basis": state["planning_cost_basis"],
+            "paid_request_submitted": False,
+        }
+    )
+
+
+@app.command("edit-plan")
+def edit_plan_command(
+    parent_batch_dir: Path = typer.Option(..., exists=True, file_okay=False),
+    batch_id: str = typer.Option(...),
+    planning_cost_per_request_usd: float = typer.Option(
+        ...,
+        min=0.001,
+        help="Conservative per-edit cost used for the explicit submission spend guard.",
+    ),
+    max_edit_rounds: int = typer.Option(2, min=1, max=8),
+    include_pitch_calibration_tail: bool = typer.Option(
+        False,
+        help="Also edit the two Validation records controlling a failed pitch-calibration tail.",
+    ),
+    output_root: Path = typer.Option(Path("data/synthetic")),
+) -> None:
+    run_dir = create_edit_cycle(
+        parent_batch_dir,
+        batch_id,
+        output_root,
+        max_edit_rounds=max_edit_rounds,
+        planning_cost_per_request_usd=planning_cost_per_request_usd,
+        include_pitch_calibration_tail=include_pitch_calibration_tail,
+    )
+    state = load_state(run_dir)
+    _print(
+        {
+            "batch_dir": str(run_dir),
+            "edit_round": state["edit_round"],
+            "target_images": state["target_count"],
+            "edit_requests": state["request_count"],
+            "planning_projected_cost_usd": state["planning_projected_cost_usd"],
+            "planning_cost_basis": state["planning_cost_basis"],
+            "forced_edit_policy": state.get("forced_edit_policy"),
             "paid_request_submitted": False,
         }
     )
@@ -77,7 +126,9 @@ def plan_command(
 @app.command("submit")
 def submit_command(
     batch_dir: Path = typer.Option(..., exists=True),
-    approve_requests: int = typer.Option(..., min=1, help="Must exactly match pending requests."),
+    approve_requests: int = typer.Option(
+        ..., min=1, help="Must exactly match pending requests."
+    ),
     spend_cap_usd: float = typer.Option(..., min=0.001),
 ) -> None:
     ids = submit_pending(
@@ -102,7 +153,13 @@ def collect_command(batch_dir: Path = typer.Option(..., exists=True)) -> None:
 def resume_command(batch_dir: Path = typer.Option(..., exists=True)) -> None:
     created = prepare_resume(batch_dir)
     state = load_state(batch_dir)
-    _print({"retry_requests": created, "pending_requests": pending_request_count(state), "submitted": False})
+    _print(
+        {
+            "retry_requests": created,
+            "pending_requests": pending_request_count(state),
+            "submitted": False,
+        }
+    )
 
 
 @app.command("usage-report")
@@ -120,13 +177,23 @@ def usage_report_command(
 @app.command("qa")
 def qa_command(
     batch_dir: Path = typer.Option(..., exists=True),
-    detector_model: Optional[Path] = typer.Option(Path("data/models/deimv2_wholebody49_boxes_only.onnx")),
-    pose_model: Optional[Path] = typer.Option(Path("data/models/sixdrepnet360_1x3x224x224_full.onnx")),
+    detector_model: Optional[Path] = typer.Option(
+        Path("data/models/deimv2_wholebody49_boxes_only.onnx")
+    ),
+    pose_model: Optional[Path] = typer.Option(
+        Path("data/models/sixdrepnet360_1x3x224x224_full.onnx")
+    ),
     landmark_model: Optional[Path] = typer.Option(
         Path("data/models/hrffa_vitl_ibug68_1x3x320x320.onnx")
     ),
     calibration: Optional[Path] = typer.Option(None),
     rear_policy: Optional[Path] = typer.Option(None),
+    policy: Optional[Path] = typer.Option(
+        Path("configs/synthetic_qa_policy_v2.yaml"),
+        exists=True,
+        readable=True,
+        help="Hash-bound QA policy override. Defaults to the current repository policy.",
+    ),
     cpu: bool = typer.Option(
         False,
         help="Force CPU; otherwise prefer TensorRT, then CUDA, then CPU. All ONNX runs stay batch-1.",
@@ -140,6 +207,7 @@ def qa_command(
             landmark_model=landmark_model,
             calibration_path=calibration,
             rear_policy_path=rear_policy,
+            qa_policy_path=policy,
             cpu=cpu,
         )
     )
@@ -160,10 +228,14 @@ def margin_sheet_command(
 ) -> None:
     state = load_state(batch_dir)
     config = load_config(Path(state["config_path"]))
-    result = render_crop_margin_candidates(
+    qa_report_path = batch_dir / "qa_report.json"
+    if not qa_report_path.exists():
+        raise PipelineError("run auto QA before rendering the fixed crop margin")
+    qa_report = json.loads(qa_report_path.read_text(encoding="utf-8"))
+    config_from_recorded_qa_policy(config, qa_report)
+    result = render_deim_crop_margin_sheet(
         batch_dir,
         output=output,
-        margins=[float(value) for value in config["qa"]["crop_margin_candidates"]],
         anchor_manifest=anchor_manifest,
     )
     _print({"output": str(result)})
@@ -174,7 +246,6 @@ def approve_command(
     batch_dir: Path = typer.Option(..., exists=True),
     reviewer: str = typer.Option(...),
     sign_calibration_approved: bool = typer.Option(False, "--approve-sign-calibration"),
-    crop_margin: float = typer.Option(...),
     evaluation_protocol: Path = typer.Option(..., exists=True, readable=True),
     usage_report: Path = typer.Option(..., exists=True, readable=True),
     account_verified_snapshot: Optional[str] = typer.Option(None),
@@ -184,7 +255,6 @@ def approve_command(
             batch_dir,
             reviewer=reviewer,
             sign_calibration_approved=sign_calibration_approved,
-            crop_margin=crop_margin,
             evaluation_protocol=evaluation_protocol,
             usage_report=usage_report,
             account_verified_snapshot=account_verified_snapshot,
@@ -196,8 +266,12 @@ def approve_command(
 def materialize_command(
     batch_dir: Path = typer.Option(..., exists=True),
     output_root: Path = typer.Option(Path("data/synthetic")),
-    anchor_manifest: Path = typer.Option(Path("data/towncentre/manifest.jsonl"), exists=True),
-    neighbour_manifest: Path = typer.Option(Path("data/towncentre/manifest_nb3.jsonl"), exists=True),
+    anchor_manifest: Path = typer.Option(
+        Path("data/towncentre/manifest.jsonl"), exists=True
+    ),
+    neighbour_manifest: Path = typer.Option(
+        Path("data/towncentre/manifest_nb3.jsonl"), exists=True
+    ),
     seed: int = typer.Option(20260831),
 ) -> None:
     _print(
@@ -215,7 +289,9 @@ def materialize_command(
 def top_up_command(
     annotations: Path = typer.Option(..., exists=True, readable=True),
     target: str = typer.Option("floor_120"),
-    config: Path = typer.Option(Path("configs/synthetic_towncentre_batch.yaml"), exists=True),
+    config: Path = typer.Option(
+        Path("configs/synthetic_towncentre_batch.yaml"), exists=True
+    ),
 ) -> None:
     _print(top_up_plan(load_config(config), read_jsonl(annotations), target))
 
@@ -224,7 +300,9 @@ def top_up_command(
 def profiles_plan_command(
     output_csv: Path = typer.Option(Path("data/towncentre/test_profiles_review.csv")),
     image_root: Path = typer.Option(Path("data/TownCentreHeadImages"), exists=True),
-    existing_manifest: Path = typer.Option(Path("data/towncentre/manifest.jsonl"), exists=True),
+    existing_manifest: Path = typer.Option(
+        Path("data/towncentre/manifest.jsonl"), exists=True
+    ),
     candidate_count: int = typer.Option(600, min=200),
     seed: int = typer.Option(20260831),
 ) -> None:
@@ -243,8 +321,12 @@ def profiles_plan_command(
 def profiles_finalize_command(
     reviewed_csv: Path = typer.Option(..., exists=True, readable=True),
     output_jsonl: Path = typer.Option(Path("data/towncentre/test_profiles.jsonl")),
-    protocol_output: Path = typer.Option(Path("data/towncentre/test_profiles_protocol.json")),
-    existing_manifest: Path = typer.Option(Path("data/towncentre/manifest.jsonl"), exists=True),
+    protocol_output: Path = typer.Option(
+        Path("data/towncentre/test_profiles_protocol.json")
+    ),
+    existing_manifest: Path = typer.Option(
+        Path("data/towncentre/manifest.jsonl"), exists=True
+    ),
 ) -> None:
     _print(
         finalize_test_profiles(
@@ -270,7 +352,9 @@ def verify_model_command(
 @app.command("install-models")
 def install_models_command(
     source_repo: Path = typer.Option(..., exists=True, file_okay=False, readable=True),
-    repository_root: Path = typer.Option(Path("."), exists=True, file_okay=False, writable=True),
+    repository_root: Path = typer.Option(
+        Path("."), exists=True, file_okay=False, writable=True
+    ),
     config: Path = typer.Option(
         Path("configs/synthetic_towncentre_batch.yaml"), exists=True, readable=True
     ),

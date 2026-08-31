@@ -208,13 +208,18 @@ uv run --locked biternion-synthetic submit \
   --approve-requests 19 --spend-cap-usd 0.20
 ```
 
-After collection, run machine QA, prepare the human review/sign table, compare crop margins against real
-TownCentre crops, and record the actual account charge. Machine QA uses DEIMv2, SixDRepNet360, and the local
+After collection, run machine QA, prepare the human review/sign table, verify the fixed 5% DEIMv2-box crop
+margin against real TownCentre crops, and record the actual account charge. Machine QA uses DEIMv2,
+SixDRepNet360, and the local
 HRFFA ViT-L iBUG68 model. HRFFA always receives a square 320x320 crop with 5% padding per side of the DEIM
 long side; its landmark/visibility signals remain diagnostic until calibrated against Pilot human review.
+SixD pitch calibration is restricted to `abs_pan <= 60`: the Validation runs showed the Euler pitch folding to
+about 147--171 degrees around a 90-degree side profile, so profile/rear elevation remains unresolved.
 `review-prepare` writes both an unobstructed `review_contact_sheet.jpg` and an overlaid
 `landmark_contact_sheet.jpg`. Fill `landmark_alignment` with `match`, `mismatch`, or `unresolved` for every
-review row; genuine rear views may be unresolved. Approval writes a hash-bound `landmark_calibration.json`,
+review row; genuine rear views may be unresolved. Human integrity review is deliberately limited to the head,
+neck, shoulders, and visible upper torso. Lower-body artifacts alone are acceptable and must not reject an
+otherwise usable head-and-surroundings crop. Approval writes a hash-bound `landmark_calibration.json`,
 but it does not activate an HRFFA rejection gate. Validation approval also binds the profile-evaluation
 protocol and the account-verified Batch model identifier by SHA-256:
 
@@ -227,6 +232,34 @@ engine/timing caches for SixD and HRFFA are isolated under `data/models/trt_cach
 CUDA runtime, GPU compute capability, precision, model SHA-256, and `batch1`. Any runtime change therefore
 selects a new empty cache and can never reuse an engine produced by the previous runtime.
 
+After `qa`, failed records enter two hash-bound Batch image-edit rounds by default; an explicitly bounded
+Validation recovery may raise the recorded maximum to at most eight rounds. The edit request embeds the
+failed JPEG and gives concrete corrections derived from its framing, direction, pan, and elevation failures;
+records that passed are carried forward byte-for-byte. The pipeline never silently falls back to a synchronous
+image request. Pitch uses a bounded two-stage correction: the first edit directly corrects the head/neck pose;
+if the next QA reports the same pitch failure, the second edit adds one small deterministic pavement object near
+the lower edge and makes the whole head—not only the eyes—look down toward it. The object stays outside the
+head/neck/shoulder target region, preserves the requested pan and camera, and is recorded in edit lineage. The
+planning cost is deliberately supplied from current account evidence and remains subject to the exact
+request-count and spend-cap guard:
+
+```bash
+uv run --locked biternion-synthetic edit-plan \
+  --parent-batch-dir data/synthetic/batches/VALIDATION_RUN \
+  --batch-id VALIDATION_EDIT_RUN --max-edit-rounds 2 \
+  --planning-cost-per-request-usd CONSERVATIVE_ACCOUNT_ESTIMATE
+uv run --locked biternion-synthetic submit \
+  --batch-dir data/synthetic/batches/VALIDATION_EDIT_RUN \
+  --approve-requests EXACT_EDIT_COUNT --spend-cap-usd EXPLICIT_CAP
+```
+
+When Validation pitch calibration fails even though its tail records pass individual QA, add
+`--include-pitch-calibration-tail` to `edit-plan`. The planner hash-binds the failed calibration and selects the
+two centred residuals controlling the small-sample q90 tail. A later direction correction uses the current
+SixD pan to express an explicit relative left/right rotation, preventing an edit from turning farther in the
+already-wrong direction. The usage report distinguishes paid `completed_requests` from all carried-forward
+`completed_images` and uses automatic QA until human-approved annotations exist.
+
 ```bash
 uv run --locked biternion-synthetic collect --batch-dir data/synthetic/batches/validation-v004
 uv run --locked biternion-synthetic qa --batch-dir data/synthetic/batches/validation-v004
@@ -238,11 +271,22 @@ uv run --locked biternion-synthetic usage-report \
   --batch-dir data/synthetic/batches/validation-v004 --actual-cost-usd ACTUAL_ACCOUNT_CHARGE
 uv run --locked biternion-synthetic approve \
   --batch-dir data/synthetic/batches/validation-v004 --reviewer REVIEWER \
-  --approve-sign-calibration --crop-margin 0.15 \
+  --approve-sign-calibration \
   --evaluation-protocol data/towncentre/test_profiles_protocol.json \
   --usage-report data/synthetic/batches/validation-v004/usage_report.json \
   --account-verified-snapshot gpt-image-2
 ```
+
+Automatic QA defaults to the separately hash-bound
+`configs/synthetic_qa_policy_v2.yaml`: requested pan may differ by at most 30 degrees. DEIMv2 still measures
+`head_height_ratio`, but that measurement is diagnostic only and never adds `head_too_small` or
+`head_too_large` to the rejection reasons. DEIMv2 direction uses the cyclic eight-direction classes: the
+detected and expected classes may differ by zero or one bin, while a distance of two or more bins is rejected.
+The final head crop expands the DEIMv2 box by exactly 5% on each box axis; approval no longer accepts a crop
+margin argument, and materialization rejects any approval carrying a different value. Each `auto_qa.jsonl` row
+records the effective pan tolerance, height-gate state, DEIM bin distance, and permitted maximum;
+`qa_report.json` and Validation `pitch_calibration.json` bind the policy path and SHA-256. This keeps completed
+Batch generation configs immutable while making the current acceptance policy explicit and auditable.
 
 Pilot planning refuses to proceed without this approved Validation evidence. Materialization writes a
 high-angle-only training manifest and an all-elevations ablation manifest. Correctly labelled eye-level or

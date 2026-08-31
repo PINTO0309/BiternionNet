@@ -3,12 +3,22 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import pytest
 
 from biternionnet.data import write_manifest
-from biternionnet.synthetic.generate import create_plan, load_state, read_plan, sha256_file, write_jsonl
+from biternionnet.synthetic.generate import (
+    PipelineError,
+    create_plan,
+    load_state,
+    read_plan,
+    sha256_file,
+    write_jsonl,
+)
 from biternionnet.synthetic.materialize import materialize_run
 
-CONFIG = Path(__file__).resolve().parents[1] / "configs" / "synthetic_towncentre_batch.yaml"
+CONFIG = (
+    Path(__file__).resolve().parents[1] / "configs" / "synthetic_towncentre_batch.yaml"
+)
 
 
 def _image(path: Path, height: int, width: int, value: int = 120):
@@ -17,7 +27,9 @@ def _image(path: Path, height: int, width: int, value: int = 120):
 
 
 def test_materialize_retains_eye_level_but_keeps_it_out_of_high_angle_view(tmp_path):
-    run = create_plan(CONFIG, "validation", "fixture-validation", tmp_path / "synthetic", seed=1)
+    run = create_plan(
+        CONFIG, "validation", "fixture-validation", tmp_path / "synthetic", seed=1
+    )
     state = load_state(run)
     record = next(iter(read_plan(run, state).values()))
     _image(run / "images" / record["filename"], 200, 200)
@@ -39,7 +51,7 @@ def test_materialize_retains_eye_level_but_keeps_it_out_of_high_angle_view(tmp_p
     review.write_text("fixture-review\n", encoding="utf-8")
     approval = {
         "approved": True,
-        "crop_margin": 0.15,
+        "crop_margin": 0.05,
         "annotations_path": annotations.name,
         "annotations_sha256": sha256_file(annotations),
         "review_path": review.name,
@@ -52,13 +64,34 @@ def test_materialize_retains_eye_level_but_keeps_it_out_of_high_angle_view(tmp_p
     anchor = tmp_path / "towncentre" / "manifest.jsonl"
     neighbour = tmp_path / "towncentre" / "manifest_nb3.jsonl"
     rows = [
-        {"split": "train", "task": "angle_deg", "angle_deg": 0.0, "image": "../real/train.jpg"},
-        {"split": "test", "task": "angle_deg", "angle_deg": 180.0, "image": "../real/test.jpg"},
+        {
+            "split": "train",
+            "task": "angle_deg",
+            "angle_deg": 0.0,
+            "image": "../real/train.jpg",
+        },
+        {
+            "split": "test",
+            "task": "angle_deg",
+            "angle_deg": 180.0,
+            "image": "../real/test.jpg",
+        },
     ]
     write_manifest(rows, anchor)
     write_manifest(rows, neighbour)
     original = neighbour.read_bytes()
     output = tmp_path / "materialized"
+    bad_approval = {**approval, "crop_margin": 0.15}
+    (run / "approval.json").write_text(json.dumps(bad_approval), encoding="utf-8")
+    with pytest.raises(PipelineError, match="must be fixed to 0.05"):
+        materialize_run(
+            run,
+            output_root=output,
+            anchor_manifest=anchor,
+            neighbour_manifest=neighbour,
+            seed=1,
+        )
+    (run / "approval.json").write_text(json.dumps(approval), encoding="utf-8")
     report = materialize_run(
         run,
         output_root=output,
@@ -67,11 +100,17 @@ def test_materialize_retains_eye_level_but_keeps_it_out_of_high_angle_view(tmp_p
         seed=1,
     )
     assert report["materialized_this_run"] == 1
+    assert report["crop_margin"] == 0.05
     assert report["high_angle_total"] == 0
-    all_rows = [json.loads(line) for line in (output / "manifest.jsonl").read_text().splitlines()]
+    all_rows = [
+        json.loads(line)
+        for line in (output / "manifest.jsonl").read_text().splitlines()
+    ]
     assert all_rows[0]["camera_elevation_class"] == "eye_level_or_low_angle"
     assert (output / "manifest_high_angle.jsonl").read_text() == ""
     high_combined = tmp_path / "towncentre" / "manifest_nb3_synthetic.jsonl"
-    all_combined = tmp_path / "towncentre" / "manifest_nb3_synthetic_all_elevations.jsonl"
+    all_combined = (
+        tmp_path / "towncentre" / "manifest_nb3_synthetic_all_elevations.jsonl"
+    )
     assert high_combined.read_bytes() == original
     assert len(all_combined.read_text().splitlines()) == 3

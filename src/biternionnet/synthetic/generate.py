@@ -12,9 +12,12 @@ import binascii
 import hashlib
 import io
 import json
+import math
 import os
 import random
+import shutil
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -22,6 +25,7 @@ import yaml
 from PIL import Image, UnidentifiedImageError
 
 ENDPOINT = "/v1/images/generations"
+EDIT_ENDPOINT = "/v1/images/edits"
 QUALITY = "low"
 BACKGROUND = "opaque"
 OUTPUT_FORMAT = "jpeg"
@@ -30,6 +34,18 @@ N_IMAGES = 1
 COMPLETION_WINDOW = "24h"
 BATCH_IMAGE_MODEL = "gpt-image-2"
 ALLOWED_SIZES = {"1024x1536", "1024x1024", "1536x1024"}
+DEIM_CROP_MARGIN = 0.05
+PITCH_EDIT_REASONS = {
+    "head_looks_up_at_camera",
+    "pitch_unusable",
+    "pitch_calibration_tail",
+}
+PITCH_REFERENCE_OBJECTS = (
+    "a small matte yellow tennis ball",
+    "a small plain red paper cup lying on its side",
+    "a small matte blue beanbag",
+    "a small flat orange pavement marker disc",
+)
 STATE_NAME = "batch_state.json"
 PLAN_NAME = "generation_plan.jsonl"
 TERMINAL_STATUSES = {"completed", "failed", "expired", "cancelled"}
@@ -87,7 +103,11 @@ def _jsonable(value: Any) -> Any:
 
 
 def _get(value: Any, key: str, default: Any = None) -> Any:
-    return value.get(key, default) if isinstance(value, dict) else getattr(value, key, default)
+    return (
+        value.get(key, default)
+        if isinstance(value, dict)
+        else getattr(value, key, default)
+    )
 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
@@ -119,7 +139,9 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
             try:
                 rows.append(json.loads(line))
             except json.JSONDecodeError as exc:
-                raise PipelineError(f"invalid JSONL at {path}:{line_number}: {exc}") from exc
+                raise PipelineError(
+                    f"invalid JSONL at {path}:{line_number}: {exc}"
+                ) from exc
     return rows
 
 
@@ -133,17 +155,25 @@ def validate_evaluation_protocol(path: Path) -> dict[str, Any]:
     records = int(protocol.get("records", 0))
     people = int(protocol.get("people", 0))
     if not 200 <= records <= 300 or people < 150:
-        raise PipelineError("evaluation protocol needs 200..300 records and at least 150 people")
+        raise PipelineError(
+            "evaluation protocol needs 200..300 records and at least 150 people"
+        )
     if int(protocol.get("bootstrap_resamples", 0)) < 10_000:
-        raise PipelineError("evaluation protocol needs at least 10000 bootstrap resamples")
+        raise PipelineError(
+            "evaluation protocol needs at least 10000 bootstrap resamples"
+        )
     if "95% CI" not in str(protocol.get("promotion_rule", "")):
         raise PipelineError("evaluation protocol promotion rule must use a 95% CI")
     manifest_digest = str(protocol.get("manifest_sha256", ""))
     if len(manifest_digest) != 64:
-        raise PipelineError("evaluation protocol must bind the test_profiles manifest SHA-256")
+        raise PipelineError(
+            "evaluation protocol must bind the test_profiles manifest SHA-256"
+        )
     manifest_value = protocol.get("manifest_path")
     if not manifest_value:
-        raise PipelineError("evaluation protocol must record the test_profiles manifest path")
+        raise PipelineError(
+            "evaluation protocol must record the test_profiles manifest path"
+        )
     manifest_path = Path(str(manifest_value))
     if not manifest_path.exists() or sha256_file(manifest_path) != manifest_digest:
         raise PipelineError("test_profiles manifest is missing or changed")
@@ -171,7 +201,9 @@ def load_config(path: Path) -> dict[str, Any]:
     if not isinstance(api.get("model"), str) or not api["model"].strip():
         raise PipelineError("config api.model must be non-empty")
     if set(api.get("allowed_sizes") or []) != ALLOWED_SIZES:
-        raise PipelineError(f"config api.allowed_sizes must equal {sorted(ALLOWED_SIZES)}")
+        raise PipelineError(
+            f"config api.allowed_sizes must equal {sorted(ALLOWED_SIZES)}"
+        )
     storage = config.get("storage") or {}
     if storage.get("format") != "jpeg" or storage.get("quality") != OUTPUT_COMPRESSION:
         raise PipelineError("storage must be JPEG quality 92")
@@ -180,18 +212,29 @@ def load_config(path: Path) -> dict[str, Any]:
     if set(models) != expected_models:
         raise PipelineError(f"models must define exactly {sorted(expected_models)}")
     for name, asset in models.items():
-        if not all(isinstance(asset.get(key), str) and asset[key] for key in ("source", "target")):
+        if not all(
+            isinstance(asset.get(key), str) and asset[key]
+            for key in ("source", "target")
+        ):
             raise PipelineError(f"models.{name} must define source and target")
         digest = asset.get("sha256")
-        if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
-            raise PipelineError(f"models.{name}.sha256 must be a lowercase SHA-256 digest")
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(c not in "0123456789abcdef" for c in digest)
+        ):
+            raise PipelineError(
+                f"models.{name}.sha256 must be a lowercase SHA-256 digest"
+            )
     targets = config.get("targets") or {}
     bins = list(targets.get("abs_pan_bins") or [])
     if bins != list(range(0, 181, 10)):
         raise PipelineError("targets.abs_pan_bins must be 0..180 in 10-degree steps")
     validation = config.get("validation") or []
     if len(validation) != 19 or [int(row["abs_pan"]) for row in validation] != bins:
-        raise PipelineError("validation must contain exactly one ordered record per absolute pan bin")
+        raise PipelineError(
+            "validation must contain exactly one ordered record per absolute pan bin"
+        )
     stages = config.get("stages") or {}
     for stage, stage_config in stages.items():
         count = int(stage_config["count"])
@@ -199,7 +242,9 @@ def load_config(path: Path) -> dict[str, Any]:
         if count <= 0 or not 1 <= shard_size <= 500:
             raise PipelineError(f"invalid stage size for {stage}")
         bin_counts = stage_config.get("bin_counts")
-        if bin_counts is not None and (len(bin_counts) != 19 or sum(map(int, bin_counts)) != count):
+        if bin_counts is not None and (
+            len(bin_counts) != 19 or sum(map(int, bin_counts)) != count
+        ):
             raise PipelineError(f"invalid bin_counts for {stage}")
     return config
 
@@ -220,11 +265,67 @@ def expected_direction(pan_deg: float) -> str:
     return DIR8_BY_CENTRE[sector_centre(pan_deg)]
 
 
-def _exact_schedule(config_rows: list[dict[str, Any]], total: int, rng: random.Random) -> list[str]:
+def _pan_detail(signed_pan: int) -> str:
+    """Spell out the continuous turn so image generation preserves sign and sector."""
+    amount = abs(int(signed_pan))
+    if amount == 0:
+        return (
+            "Keep the head exactly frontal and symmetric; do not turn it left or right."
+        )
+    image_side = "right" if signed_pan > 0 else "left"
+    subject_side = "left" if signed_pan > 0 else "right"
+    if amount <= 20:
+        return (
+            f"Turn the nose exactly {amount} degrees from frontal toward image-{image_side}, "
+            f"showing slightly more of the subject's {subject_side} side. Keep the face mostly "
+            "frontal; do not produce a three-quarter view, profile, or the opposite turn."
+        )
+    if amount <= 60:
+        return (
+            f"Turn the nose exactly {amount} degrees from frontal toward image-{image_side}, "
+            f"showing the subject's {subject_side} three-quarter-front view. Keep facial features "
+            "visible; do not produce a pure side profile, rear view, or the opposite turn."
+        )
+    if amount <= 90:
+        return (
+            f"Turn exactly {amount} degrees from frontal toward image-{image_side}, showing the "
+            f"subject's {subject_side} near-profile view. Do not cross into a rear view or the "
+            "opposite side."
+        )
+    if amount <= 110:
+        past_profile = amount - 90
+        return (
+            f"Turn exactly {amount} degrees from frontal: {past_profile} degrees past the subject's "
+            f"{subject_side} side profile toward the rear. Keep this close to profile, not a "
+            "three-quarter rear or full-back view."
+        )
+    if amount <= 150:
+        return (
+            f"Turn exactly {amount} degrees from frontal through the subject's {subject_side} side, "
+            "forming a three-quarter-rear view. Show the back of the skull plus only the intended "
+            "side; do not produce a profile, full-back view, or the opposite side."
+        )
+    if amount < 180:
+        short_of_back = 180 - amount
+        return (
+            f"Turn exactly {amount} degrees from frontal through the subject's {subject_side} side, "
+            f"only {short_of_back} degrees short of a full-back view. The back of the head must "
+            "dominate, with at most a narrow sliver of the intended side and none of the opposite side."
+        )
+    return "Show an exact full-back view centered on the rear of the skull; no face or side profile."
+
+
+def _exact_schedule(
+    config_rows: list[dict[str, Any]], total: int, rng: random.Random
+) -> list[str]:
     result: list[str] = []
     allocated = 0
     for index, row in enumerate(config_rows):
-        count = total - allocated if index == len(config_rows) - 1 else total * int(row["share"]) // 100
+        count = (
+            total - allocated
+            if index == len(config_rows) - 1
+            else total * int(row["share"]) // 100
+        )
         result.extend([str(row["value"])] * count)
         allocated += count
     rng.shuffle(result)
@@ -250,7 +351,9 @@ def _make_prompt(config: dict[str, Any], record: dict[str, Any]) -> str:
     )
 
 
-def _custom_id(signed_pan: int, camera_elevation: int, head_pitch: int, serial: int) -> str:
+def _custom_id(
+    signed_pan: int, camera_elevation: int, head_pitch: int, serial: int
+) -> str:
     return (
         f"pan{signed_pan:+04d}_cam{camera_elevation:+03d}_"
         f"pitch{head_pitch:+04d}_{serial:06d}"
@@ -299,10 +402,13 @@ def _record(
         "size": size,
         "expected_direction": DIR8_BY_CENTRE[centre],
         "orientation": ORIENTATION_BY_CENTRE[centre],
+        "pan_detail": _pan_detail(signed_pan),
         "scene": prompt["scenes"][index % len(prompt["scenes"])],
         "lighting": prompt["lighting"][index % len(prompt["lighting"])],
         "age": prompt["ages"][index % len(prompt["ages"])],
-        "gender": prompt["gender_presentations"][index % len(prompt["gender_presentations"])],
+        "gender": prompt["gender_presentations"][
+            index % len(prompt["gender_presentations"])
+        ],
         "skin_tone": prompt["skin_tones"][index % len(prompt["skin_tones"])],
         "hair": prompt["hair"][index % len(prompt["hair"])],
         "clothing": prompt["clothing"][index % len(prompt["clothing"])],
@@ -414,9 +520,45 @@ def batch_request(record: dict[str, Any], api: dict[str, Any]) -> dict[str, Any]
     return request
 
 
-def validate_batch_request(request: dict[str, Any], api: dict[str, Any]) -> None:
-    if request.get("method") != "POST" or request.get("url") != ENDPOINT:
-        raise PipelineError(f"every request must POST to {ENDPOINT}")
+def edit_batch_request(
+    record: dict[str, Any], api: dict[str, Any], source: Path, prompt: str
+) -> dict[str, Any]:
+    if not _valid_image(source, record["size"]):
+        raise PipelineError(f"edit source is not the expected JPEG: {source}")
+    encoded = base64.b64encode(source.read_bytes()).decode("ascii")
+    request = {
+        "custom_id": record["custom_id"],
+        "method": "POST",
+        "url": EDIT_ENDPOINT,
+        "body": {
+            "model": api["model"],
+            "images": [{"image_url": f"data:image/jpeg;base64,{encoded}"}],
+            "prompt": prompt,
+            "n": N_IMAGES,
+            "size": record["size"],
+            "quality": QUALITY,
+            "background": BACKGROUND,
+            "output_format": OUTPUT_FORMAT,
+            "output_compression": OUTPUT_COMPRESSION,
+        },
+    }
+    validate_batch_request(request, api, expected_endpoint=EDIT_ENDPOINT)
+    return request
+
+
+def validate_batch_request(
+    request: dict[str, Any],
+    api: dict[str, Any],
+    *,
+    expected_endpoint: str | None = None,
+) -> None:
+    endpoint = request.get("url")
+    if request.get("method") != "POST" or endpoint not in {ENDPOINT, EDIT_ENDPOINT}:
+        raise PipelineError(f"every request must POST to {ENDPOINT} or {EDIT_ENDPOINT}")
+    if expected_endpoint is not None and endpoint != expected_endpoint:
+        raise PipelineError(
+            f"request endpoint {endpoint!r} does not match {expected_endpoint!r}"
+        )
     if not isinstance(request.get("custom_id"), str) or not request["custom_id"]:
         raise PipelineError("custom_id must be non-empty")
     body = request.get("body")
@@ -437,20 +579,54 @@ def validate_batch_request(request: dict[str, Any], api: dict[str, Any]) -> None
         raise PipelineError(f"unsupported image size: {body.get('size')!r}")
     if not isinstance(body.get("prompt"), str) or not body["prompt"].strip():
         raise PipelineError("prompt must be non-empty")
-    if set(body) != {
-        "model", "prompt", "n", "size", "quality", "background", "output_format",
+    expected_keys = {
+        "model",
+        "prompt",
+        "n",
+        "size",
+        "quality",
+        "background",
+        "output_format",
         "output_compression",
-    }:
-        raise PipelineError("unexpected or missing image generation request options")
+    }
+    if endpoint == EDIT_ENDPOINT:
+        expected_keys.add("images")
+        images = body.get("images")
+        if (
+            not isinstance(images, list)
+            or len(images) != 1
+            or not isinstance(images[0], dict)
+        ):
+            raise PipelineError(
+                "image edit request must contain exactly one image reference"
+            )
+        reference = images[0]
+        if set(reference) != {"image_url"}:
+            raise PipelineError("image edit reference must contain only image_url")
+        image_url = reference.get("image_url")
+        if not isinstance(image_url, str) or not image_url.startswith(
+            "data:image/jpeg;base64,"
+        ):
+            raise PipelineError("image edit reference must be a base64 JPEG data URL")
+        if "input_fidelity" in body:
+            raise PipelineError("gpt-image-2 edit requests must omit input_fidelity")
+    if set(body) != expected_keys:
+        raise PipelineError("unexpected or missing image request options")
 
 
-def validate_batch_jsonl(path: Path, api: dict[str, Any]) -> list[str]:
+def validate_batch_jsonl(
+    path: Path, api: dict[str, Any], *, expected_endpoint: str | None = None
+) -> list[str]:
     custom_ids: list[str] = []
+    endpoints: set[str] = set()
     for row in read_jsonl(path):
-        validate_batch_request(row, api)
+        validate_batch_request(row, api, expected_endpoint=expected_endpoint)
         custom_ids.append(row["custom_id"])
+        endpoints.add(str(row["url"]))
     if not custom_ids or len(custom_ids) != len(set(custom_ids)):
         raise PipelineError(f"empty or duplicate custom IDs in {path}")
+    if len(endpoints) != 1:
+        raise PipelineError("one Batch input file cannot mix endpoints")
     return custom_ids
 
 
@@ -468,37 +644,46 @@ def _approved_parent(parent: Path, required_stage: str) -> dict[str, Any]:
     if not protocol_value:
         raise PipelineError("approved run does not bind an evaluation protocol")
     protocol = Path(protocol_value)
-    if not protocol.exists() or approval.get("evaluation_protocol_sha256") != sha256_file(protocol):
+    if not protocol.exists() or approval.get(
+        "evaluation_protocol_sha256"
+    ) != sha256_file(protocol):
         raise PipelineError("approved evaluation protocol is missing or changed")
     validate_evaluation_protocol(protocol)
     usage_value = approval.get("usage_report")
     if not usage_value:
         raise PipelineError("approved run does not bind a usage/cost report")
     usage_report = Path(usage_value)
-    if not usage_report.exists() or approval.get("usage_report_sha256") != sha256_file(usage_report):
+    if not usage_report.exists() or approval.get("usage_report_sha256") != sha256_file(
+        usage_report
+    ):
         raise PipelineError("approved usage/cost report is missing or changed")
     sign_value = approval.get("sign_calibration_path")
     if approval.get("sign_calibration_approved") is not True or not sign_value:
         raise PipelineError("approved run does not bind sign calibration")
     sign_path = parent / str(sign_value)
-    if not sign_path.exists() or approval.get("sign_calibration_sha256") != sha256_file(sign_path):
+    if not sign_path.exists() or approval.get("sign_calibration_sha256") != sha256_file(
+        sign_path
+    ):
         raise PipelineError("approved sign calibration is missing or changed")
     calibration_value = approval.get("pitch_calibration")
     if not calibration_value:
         raise PipelineError("approved run does not bind pitch calibration")
     calibration_path = Path(str(calibration_value))
-    if (
-        not calibration_path.exists()
-        or approval.get("pitch_calibration_sha256") != sha256_file(calibration_path)
-    ):
+    if not calibration_path.exists() or approval.get(
+        "pitch_calibration_sha256"
+    ) != sha256_file(calibration_path):
         raise PipelineError("approved pitch calibration is missing or changed")
     if required_stage == "pilot":
         rear_value = approval.get("rear_label_policy_path")
         if not rear_value:
             raise PipelineError("approved Pilot does not bind a rear label policy")
         rear_path = parent / str(rear_value)
-        if not rear_path.exists() or approval.get("rear_label_policy_sha256") != sha256_file(rear_path):
-            raise PipelineError("approved Pilot rear label policy is missing or changed")
+        if not rear_path.exists() or approval.get(
+            "rear_label_policy_sha256"
+        ) != sha256_file(rear_path):
+            raise PipelineError(
+                "approved Pilot rear label policy is missing or changed"
+            )
     return approval
 
 
@@ -521,14 +706,26 @@ def create_plan(
             f"Batch image generation requires api.model={BATCH_IMAGE_MODEL!r}; "
             "dated GPT-Image-2 snapshots are not accepted by the Batch API"
         )
-    required_parent = {"pilot": "validation", "floor_120": "pilot", "uniform_200": "pilot"}.get(stage)
+    required_parent = {
+        "pilot": "validation",
+        "floor_120": "pilot",
+        "uniform_200": "pilot",
+    }.get(stage)
     parent_approval = None
     if required_parent:
         if approved_batch_dir is None:
-            raise PipelineError(f"{stage} planning requires an approved {required_parent} directory")
+            raise PipelineError(
+                f"{stage} planning requires an approved {required_parent} directory"
+            )
         parent_approval = _approved_parent(approved_batch_dir, required_parent)
-        if required_parent == "validation" and parent_approval.get("account_verified_snapshot") != config["api"]["model"]:
-            raise PipelineError("Validation did not verify the configured snapshot for Pilot")
+        if (
+            required_parent == "validation"
+            and parent_approval.get("account_verified_snapshot")
+            != config["api"]["model"]
+        ):
+            raise PipelineError(
+                "Validation did not verify the configured snapshot for Pilot"
+            )
         parent_usage = json.loads(
             Path(parent_approval["usage_report"]).read_text(encoding="utf-8")
         )
@@ -567,6 +764,7 @@ def create_plan(
                 "attempts": [
                     {
                         "number": 0,
+                        "endpoint": ENDPOINT,
                         "input_path": input_name,
                         "input_sha256": sha256_file(input_path),
                         "custom_ids": custom_ids,
@@ -581,11 +779,15 @@ def create_plan(
                 ],
             }
         )
-    reference_cost = float(config["api"].get("documented_reference_cost_per_image_usd", 0.0))
+    reference_cost = float(
+        config["api"].get("documented_reference_cost_per_image_usd", 0.0)
+    )
     planning_cost = reference_cost
     cost_basis = "documented_reference"
     if parent_approval is not None:
-        usage_report = json.loads(Path(parent_approval["usage_report"]).read_text(encoding="utf-8"))
+        usage_report = json.loads(
+            Path(parent_approval["usage_report"]).read_text(encoding="utf-8")
+        )
         observed_cost = usage_report.get("actual_cost_per_completed_usd")
         if observed_cost is not None:
             planning_cost = float(observed_cost)
@@ -603,9 +805,13 @@ def create_plan(
         "plan_sha256": sha256_file(run_dir / PLAN_NAME),
         "created_at": utc_now(),
         "updated_at": utc_now(),
-        "parent_batch_dir": str(approved_batch_dir.resolve()) if approved_batch_dir else None,
+        "parent_batch_dir": str(approved_batch_dir.resolve())
+        if approved_batch_dir
+        else None,
         "parent_approval_sha256": (
-            sha256_file(approved_batch_dir / "approval.json") if parent_approval else None
+            sha256_file(approved_batch_dir / "approval.json")
+            if parent_approval
+            else None
         ),
         "target_count": len(records),
         "request_count": len(records),
@@ -641,12 +847,16 @@ def load_state(run_dir: Path) -> dict[str, Any]:
 def save_state(run_dir: Path, state: dict[str, Any]) -> None:
     attempts = [attempt for shard in state["shards"] for attempt in shard["attempts"]]
     statuses = [str(attempt.get("status")) for attempt in attempts]
-    if state["items"] and all(item.get("status") == "success" for item in state["items"].values()):
-        state["status"] = "collected"
-    elif any(status in ACTIVE_STATUSES for status in statuses):
-        state["status"] = next(status for status in statuses if status in ACTIVE_STATUSES)
+    if any(status in ACTIVE_STATUSES for status in statuses):
+        state["status"] = next(
+            status for status in statuses if status in ACTIVE_STATUSES
+        )
     elif any(status == "planned" for status in statuses):
         state["status"] = "planned"
+    elif state["items"] and all(
+        item.get("status") == "success" for item in state["items"].values()
+    ):
+        state["status"] = "collected"
     elif statuses and all(status == "completed" for status in statuses):
         state["status"] = "completed"
     elif statuses and all(status in TERMINAL_STATUSES for status in statuses):
@@ -655,7 +865,9 @@ def save_state(run_dir: Path, state: dict[str, Any]) -> None:
     _atomic_json(run_dir / STATE_NAME, state)
 
 
-def read_plan(run_dir: Path, state: dict[str, Any] | None = None) -> dict[str, dict[str, Any]]:
+def read_plan(
+    run_dir: Path, state: dict[str, Any] | None = None
+) -> dict[str, dict[str, Any]]:
     state = state or load_state(run_dir)
     return {row["custom_id"]: row for row in read_jsonl(run_dir / state["plan_path"])}
 
@@ -721,16 +933,24 @@ def submit_pending(
         raise PipelineError(
             f"explicit approved request count {approved_request_count} does not match pending {pending}"
         )
-    projected = float(
-        state.get("planning_cost_per_request_usd", state.get("reference_cost_per_request_usd", 0.0))
-    ) * pending
-    if spend_cap_usd <= 0 or projected > spend_cap_usd:
+    cost_per_request = state.get(
+        "planning_cost_per_request_usd",
+        state.get("reference_cost_per_request_usd", 0.0),
+    )
+    projected_decimal = Decimal(str(cost_per_request)) * pending
+    spend_cap_decimal = Decimal(str(spend_cap_usd))
+    projected = float(projected_decimal)
+    if spend_cap_decimal <= 0 or projected_decimal > spend_cap_decimal:
         raise PipelineError(
             f"{state.get('planning_cost_basis', 'documented_reference')} projection "
             f"${projected:.4f} exceeds spend cap ${spend_cap_usd:.4f}"
         )
-    if state.get("parent_batch_dir"):
-        required = {"pilot": "validation", "floor_120": "pilot", "uniform_200": "pilot"}[state["stage"]]
+    if state.get("parent_batch_dir") and state.get("parent_approval_sha256"):
+        required = {
+            "pilot": "validation",
+            "floor_120": "pilot",
+            "uniform_200": "pilot",
+        }[state["stage"]]
         parent = Path(state["parent_batch_dir"])
         _approved_parent(parent, required)
         if sha256_file(parent / "approval.json") != state.get("parent_approval_sha256"):
@@ -744,7 +964,10 @@ def submit_pending(
             input_path = run_dir / attempt["input_path"]
             if sha256_file(input_path) != attempt["input_sha256"]:
                 raise PipelineError(f"Batch input changed: {input_path}")
-            custom_ids = validate_batch_jsonl(input_path, state["api_request"])
+            endpoint = str(attempt.get("endpoint", ENDPOINT))
+            custom_ids = validate_batch_jsonl(
+                input_path, state["api_request"], expected_endpoint=endpoint
+            )
             if custom_ids != attempt["custom_ids"]:
                 raise PipelineError(f"Batch input IDs changed: {input_path}")
             metadata = {
@@ -767,7 +990,7 @@ def submit_pending(
             save_state(run_dir, state)
             batch = client.batches.create(
                 input_file_id=attempt["input_file_id"],
-                endpoint=ENDPOINT,
+                endpoint=endpoint,
                 completion_window=COMPLETION_WINDOW,
                 metadata=metadata,
             )
@@ -804,7 +1027,9 @@ def refresh_status(run_dir: Path, client: Any | None = None) -> dict[str, Any]:
         "stage": state["stage"],
         "status": state["status"],
         "batches": batches,
-        "local_success": sum(item.get("status") == "success" for item in state["items"].values()),
+        "local_success": sum(
+            item.get("status") == "success" for item in state["items"].values()
+        ),
         "pending_requests": pending_request_count(state),
         "total": len(state["items"]),
     }
@@ -831,6 +1056,506 @@ def _valid_image(path: Path, expected_size: str) -> bool:
         return False
 
 
+def _qa_edit_reasons(row: dict[str, Any], config: dict[str, Any]) -> list[str]:
+    reasons = [str(value) for value in row.get("quality_gate_reasons") or []]
+    abs_pan = int(row["abs_pan_bin"])
+    if abs_pan <= 90:
+        if row.get("pose_status") != "ok":
+            reasons.append("pose_unusable")
+        elif float(row.get("pan_error_deg", 999.0)) > float(
+            row.get("qa_pan_tolerance_deg", config["qa"]["pan_tolerance_deg"])
+        ):
+            reasons.append("pan_out_of_tolerance")
+    elif not bool(row.get("direction_consistent")):
+        reasons.append("direction_conflict")
+    # Match the empirically stable SixD pitch range used by QA calibration.
+    # Around side profiles the Euler pitch folds toward 180 degrees.
+    if abs_pan <= 60:
+        if row.get("pose_status") != "ok":
+            reasons.append("pitch_unusable")
+        else:
+            requested_camera = float(row["camera_elevation"])
+            minimum_ratio = float(
+                config["qa"]["elevation"]["minimum_negative_camera_ratio"]
+            )
+            if (
+                float(row.get("sixd_pitch_deg", 999.0))
+                > -minimum_ratio * requested_camera
+            ):
+                reasons.append("head_looks_up_at_camera")
+    return list(dict.fromkeys(reasons))
+
+
+def _pitch_calibration_tail_candidates(
+    qa_rows: dict[str, dict[str, Any]],
+    calibration: dict[str, Any],
+    config: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if calibration.get("valid") is not False:
+        raise PipelineError("pitch calibration tail retry requires invalid calibration")
+    data_threshold = float(calibration.get("data_threshold_deg", 0.0))
+    hard_maximum = float(calibration.get("hard_maximum_deg", 0.0))
+    if data_threshold <= hard_maximum:
+        raise PipelineError(
+            "pitch calibration tail retry requires a data-threshold hard-limit failure"
+        )
+    eligible = [
+        row
+        for row in qa_rows.values()
+        if int(row["abs_pan_bin"]) <= 60
+        and row.get("pose_status") == "ok"
+        and row.get("quality_gate_pass")
+    ]
+    if len(eligible) != int(calibration.get("sample_count", -1)):
+        raise PipelineError("pitch calibration no longer matches automatic QA rows")
+    bias = float(calibration["bias_deg"])
+    quantile = float(config["qa"]["elevation"]["quantile"])
+    # Linear q90 for a small Validation set is controlled by the two largest
+    # centred residuals. Retry at least those two records so the next
+    # calibration is not dependent on one lucky edit.
+    tail_count = min(len(eligible), max(2, math.ceil((1.0 - quantile) * len(eligible))))
+    ranked = sorted(
+        eligible,
+        key=lambda row: (
+            -abs(float(row["pitch_residual_deg"]) - bias),
+            int(row["abs_pan_bin"]),
+            str(row["custom_id"]),
+        ),
+    )
+    return [
+        {
+            "custom_id": row["custom_id"],
+            "filename": row["filename"],
+            "abs_pan_bin": int(row["abs_pan_bin"]),
+            "pitch_residual_deg": float(row["pitch_residual_deg"]),
+            "centred_abs_residual_deg": round(
+                abs(float(row["pitch_residual_deg"]) - bias), 6
+            ),
+        }
+        for row in ranked[:tail_count]
+    ]
+
+
+def _pitch_reference_object_instruction(
+    record: dict[str, Any], row: dict[str, Any]
+) -> dict[str, Any]:
+    """Build a deterministic second-stage physical gaze/pitch reference."""
+    horizontal_position = "lower-nose-aligned"
+    object_description = PITCH_REFERENCE_OBJECTS[
+        (int(record["serial"]) - 1) % len(PITCH_REFERENCE_OBJECTS)
+    ]
+    requested_camera = float(record["camera_elevation"])
+    observed_pitch = row.get("sixd_pitch_deg")
+    try:
+        correction = float(observed_pitch) - (-requested_camera)
+    except (TypeError, ValueError):
+        correction = 15.0
+    if not math.isfinite(correction):
+        correction = 15.0
+    downward_deg = int(round(max(10.0, min(25.0, correction)) / 5.0) * 5)
+    instruction = (
+        "The previous direct pitch correction failed. Change only the head/neck pose and add exactly one "
+        f"physical gaze-reference object: {object_description}. Place it on the pavement near the "
+        "lower edge directly below the subject's nose at the same horizontal image coordinate as the nose. "
+        "Do not place it farther left or right than the nose, because the object must change pitch without "
+        "changing yaw. Keep it fully visible, smaller than 5% of image height, separated from the person, "
+        "and outside the head/neck/shoulder target region. Have the subject naturally focus on that "
+        f"object by rotating the entire head downward at the neck by about {downward_deg} degrees from the "
+        "current pose, not merely moving the eyes. The nose and visible eye(s) must point toward the object "
+        "while the requested left/right head pan remains unchanged. Show more crown and less underside of the "
+        "chin; the subject must not look toward the elevated camera. This object-assisted instruction "
+        "overrides only the original numeric head-pitch instruction. Preserve the camera position, camera "
+        "angle, person position, framing, identity, background, and requested pan. The object must be plain, "
+        "matte, non-reflective, and contain no text, logo, face, or person-like shape. Do not add another "
+        "person, another object, a hand interaction, or an occlusion of the subject."
+    )
+    return {
+        "description": object_description,
+        "position": horizontal_position,
+        "downward_correction_deg": downward_deg,
+        "instruction": instruction,
+    }
+
+
+def _edit_prompt(
+    record: dict[str, Any],
+    row: dict[str, Any],
+    reasons: list[str],
+    *,
+    pitch_reference: dict[str, Any] | None = None,
+) -> str:
+    corrections: list[str] = []
+    if "head_too_small" in reasons:
+        corrections.append(
+            "Recompose closer so the complete detected head occupies 30% to 40% of image height; "
+            "show only the upper torso, never the full body."
+        )
+    if "head_too_large" in reasons:
+        corrections.append(
+            "Recompose slightly wider so the complete detected head occupies 30% to 40% of image height."
+        )
+    if "insufficient_margin" in reasons:
+        sides = [
+            side
+            for side in ("left", "right", "top", "bottom")
+            if float(row.get(f"margin_{side}_head_ratio", 0.0)) < 0.5
+        ]
+        side_text = ", ".join(sides) if sides else "every side"
+        corrections.append(
+            f"Expand or reposition the framing at the {side_text} so every image edge is at least "
+            "half a head width or height away from the complete head."
+        )
+    if any(
+        reason in reasons
+        for reason in ("direction_conflict", "pan_out_of_tolerance", "pose_unusable")
+    ):
+        if row.get("pose_status") == "ok" and row.get("estimated_pan_deg") is not None:
+            current_pan = float(row["estimated_pan_deg"])
+            target_pan = float(record["intent_pan_deg"])
+            relative_correction = wrap180(target_pan - current_pan)
+            if abs(relative_correction) >= 1.0:
+                correction_direction = (
+                    "toward image-right"
+                    if relative_correction > 0
+                    else "toward image-left"
+                )
+                corrections.append(
+                    f"The current image is estimated at pan {wrap180(current_pan):+.1f} degrees. "
+                    f"From this current pose, rotate the entire head and nose about "
+                    f"{abs(relative_correction):.1f} degrees {correction_direction}, back toward the "
+                    f"target pan {wrap180(target_pan):+.1f} degrees. This is a relative correction "
+                    "from the supplied image, not an instruction to turn farther in its current direction."
+                )
+        corrections.append(record["pan_detail"])
+        corrections.append(
+            f"The final head pan must be {int(record['signed_pan']):+d} degrees; do not mirror the "
+            "image or reverse left and right."
+        )
+    if any(reason in reasons for reason in PITCH_EDIT_REASONS):
+        if pitch_reference is not None:
+            corrections.append(str(pitch_reference["instruction"]))
+        else:
+            corrections.append(
+                f"Keep the camera {int(record['camera_elevation']):+d} degrees above the subject, but "
+                f"set the person's own head pitch to {int(record['head_pitch']):+d} degrees relative "
+                "to the ground. Keep the neck upright, show the crown from above, and do not let the "
+                "subject tilt the face upward toward the camera."
+            )
+    if any(reason in reasons for reason in ("head_not_detected", "head_count_not_one")):
+        corrections.append(
+            "Show exactly one complete, clearly detectable human head and no other person."
+        )
+    if "body_not_detected" in reasons:
+        corrections.append(
+            "Keep the neck, both shoulders, and a coherent upper torso clearly visible."
+        )
+    if "duplicate_image" in reasons:
+        corrections.append(
+            "Keep the requested geometry but change non-label attributes such as clothing texture and background details."
+        )
+    if any(reason in reasons for reason in ("invalid_image", "wrong_dimensions")):
+        corrections.append(f"Return one valid JPEG at exactly {record['size']} pixels.")
+    if not corrections:
+        corrections.append(
+            "Correct the recorded QA failure while satisfying the full target description."
+        )
+    reason_text = ", ".join(reasons)
+    return " ".join(
+        [
+            "Edit the supplied source image instead of creating an unrelated scene.",
+            "Preserve the same fictional person's identity, age, hair, clothing, background, lighting, "
+            "surveillance style, and camera location except where a correction below requires reframing.",
+            "Preserve photorealism and anatomical integrity of the head, neck, shoulders, and visible upper "
+            "torso. Any visible lower-body artifacts alone are acceptable and are outside QA scope; they "
+            "must not distract from the requested correction. Do not add people, text, watermarks, borders, "
+            "collages, reflections, or AI artifacts around the target region.",
+            f"Recorded QA failures: {reason_text}.",
+            *corrections,
+            "All requirements from the target remain binding:",
+            record["prompt"],
+        ]
+    )
+
+
+def _chunk_batch_requests(
+    requests: list[dict[str, Any]],
+    *,
+    max_records: int,
+    max_bytes: int = 190 * 1024 * 1024,
+) -> list[list[dict[str, Any]]]:
+    chunks: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    current_bytes = 0
+    for request in requests:
+        request_bytes = len(json.dumps(request, ensure_ascii=False).encode("utf-8")) + 1
+        if request_bytes > max_bytes:
+            raise PipelineError(
+                "one image edit request exceeds the safe Batch JSONL size"
+            )
+        if current and (
+            len(current) >= max_records or current_bytes + request_bytes > max_bytes
+        ):
+            chunks.append(current)
+            current = []
+            current_bytes = 0
+        current.append(request)
+        current_bytes += request_bytes
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def create_edit_cycle(
+    parent_run_dir: Path,
+    batch_id: str,
+    output_root: Path,
+    *,
+    max_edit_rounds: int,
+    planning_cost_per_request_usd: float,
+    include_pitch_calibration_tail: bool = False,
+) -> Path:
+    if not batch_id or any(character in batch_id for character in "/\\"):
+        raise PipelineError("batch-id must be one safe path component")
+    if max_edit_rounds < 1:
+        raise PipelineError("max edit rounds must be positive")
+    if planning_cost_per_request_usd <= 0:
+        raise PipelineError("planning cost per edit request must be positive")
+    parent_run_dir = parent_run_dir.resolve()
+    parent_state = load_state(parent_run_dir)
+    parent_plan = read_plan(parent_run_dir, parent_state)
+    qa_path = parent_run_dir / "auto_qa.jsonl"
+    if not qa_path.exists():
+        raise PipelineError("run auto QA before planning image edits")
+    qa_rows = {row["custom_id"]: row for row in read_jsonl(qa_path)}
+    if set(qa_rows) != set(parent_plan):
+        raise PipelineError(
+            "auto QA rows do not exactly match the parent generation plan"
+        )
+    edit_round = int(parent_state.get("edit_round", 0)) + 1
+    if edit_round > max_edit_rounds:
+        raise PipelineError(
+            f"edit round {edit_round} exceeds configured maximum {max_edit_rounds}; discard or regenerate"
+        )
+    config_path = Path(parent_state["config_path"])
+    config = load_config(config_path)
+    if config["api"]["model"] != BATCH_IMAGE_MODEL:
+        raise PipelineError(
+            f"Batch image editing requires api.model={BATCH_IMAGE_MODEL!r}"
+        )
+    calibration_tail: list[dict[str, Any]] = []
+    calibration_path = parent_run_dir / "pitch_calibration.json"
+    if include_pitch_calibration_tail:
+        if parent_state["stage"] != "validation" or not calibration_path.exists():
+            raise PipelineError(
+                "pitch calibration tail retry requires Validation pitch_calibration.json"
+            )
+        calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
+        if calibration.get("run_id") != parent_state["local_batch_id"]:
+            raise PipelineError("pitch calibration belongs to a different run")
+        calibration_tail = _pitch_calibration_tail_candidates(
+            qa_rows, calibration, config
+        )
+    calibration_tail_ids = {
+        str(candidate["custom_id"]) for candidate in calibration_tail
+    }
+    run_dir = output_root / "batches" / batch_id
+    if run_dir.exists():
+        raise PipelineError(f"refusing to overwrite existing run: {run_dir}")
+    run_dir.mkdir(parents=True)
+    (run_dir / "images").mkdir()
+    (run_dir / "edit_inputs").mkdir()
+
+    records: list[dict[str, Any]] = []
+    old_to_new: dict[str, str] = {}
+    for parent_record in sorted(
+        parent_plan.values(), key=lambda value: int(value["serial"])
+    ):
+        record = dict(parent_record)
+        core_id = str(parent_record["custom_id"]).split("--", 1)[-1]
+        record["custom_id"] = f"{batch_id}--{core_id}"
+        record["filename"] = _image_filename(
+            int(record["signed_pan"]),
+            int(record["camera_elevation"]),
+            int(record["head_pitch"]),
+            int(record["serial"]),
+            batch_id=batch_id,
+        )
+        record["edit_round"] = edit_round
+        record["parent_custom_id"] = parent_record["custom_id"]
+        records.append(record)
+        old_to_new[parent_record["custom_id"]] = record["custom_id"]
+    write_jsonl(run_dir / PLAN_NAME, records)
+
+    lineage: list[dict[str, Any]] = []
+    items: dict[str, dict[str, Any]] = {}
+    requests_by_endpoint: dict[str, list[dict[str, Any]]] = {
+        ENDPOINT: [],
+        EDIT_ENDPOINT: [],
+    }
+    records_by_id = {record["custom_id"]: record for record in records}
+    for parent_id, parent_record in parent_plan.items():
+        record = records_by_id[old_to_new[parent_id]]
+        row = qa_rows[parent_id]
+        reasons = _qa_edit_reasons(row, config)
+        if parent_id in calibration_tail_ids:
+            reasons = list(dict.fromkeys([*reasons, "pitch_calibration_tail"]))
+        parent_item = parent_state.get("items", {}).get(parent_id, {})
+        previous_reasons = {
+            str(value) for value in parent_item.get("edit_reasons") or []
+        }
+        pitch_reference = (
+            _pitch_reference_object_instruction(record, row)
+            if PITCH_EDIT_REASONS.intersection(reasons)
+            and (
+                PITCH_EDIT_REASONS.intersection(previous_reasons)
+                or "pitch_calibration_tail" in reasons
+                or int(record["edit_round"]) > 1
+            )
+            else None
+        )
+        source = parent_run_dir / "images" / parent_record["filename"]
+        source_valid = _valid_image(source, parent_record["size"])
+        source_sha256 = sha256_file(source) if source_valid else None
+        item = {
+            "filename": record["filename"],
+            "parent_custom_id": parent_id,
+            "parent_filename": parent_record["filename"],
+            "parent_sha256": source_sha256,
+            "edit_round": edit_round,
+            "edit_reasons": reasons,
+            "previous_edit_reasons": sorted(previous_reasons),
+            "pitch_reference_object": pitch_reference,
+        }
+        if not reasons:
+            if not source_valid:
+                raise PipelineError(
+                    f"QA passed but parent image is unavailable: {source}"
+                )
+            target = run_dir / "images" / record["filename"]
+            shutil.copy2(source, target)
+            if sha256_file(target) != source_sha256:
+                raise PipelineError("carried-forward image changed while copying")
+            item.update(
+                {
+                    "status": "success",
+                    "operation": "carry_forward",
+                    "sha256": source_sha256,
+                }
+            )
+            lineage.append({"custom_id": record["custom_id"], **item})
+            items[record["custom_id"]] = item
+            continue
+        if source_valid:
+            edit_source = run_dir / "edit_inputs" / parent_record["filename"]
+            shutil.copy2(source, edit_source)
+            prompt = _edit_prompt(record, row, reasons, pitch_reference=pitch_reference)
+            request = edit_batch_request(record, config["api"], edit_source, prompt)
+            operation = "edit"
+            item["edit_prompt"] = prompt
+        else:
+            request = batch_request(record, config["api"])
+            operation = "regenerate_missing_source"
+        requests_by_endpoint[request["url"]].append(request)
+        item.update({"status": "planned", "operation": operation})
+        lineage.append({"custom_id": record["custom_id"], **item})
+        items[record["custom_id"]] = item
+    selected_count = sum(len(requests) for requests in requests_by_endpoint.values())
+    if selected_count == 0:
+        raise PipelineError("auto QA found no actionable image edit candidates")
+    write_jsonl(run_dir / "edit_lineage.jsonl", lineage)
+
+    shard_size = int(config["stages"][parent_state["stage"]]["shard_size"])
+    shards: list[dict[str, Any]] = []
+    shard_index = 0
+    for endpoint in (EDIT_ENDPOINT, ENDPOINT):
+        for chunk in _chunk_batch_requests(
+            requests_by_endpoint[endpoint], max_records=shard_size
+        ):
+            input_name = f"batch_input_{shard_index:03d}_attempt_00.jsonl"
+            input_path = run_dir / input_name
+            write_jsonl(input_path, chunk)
+            custom_ids = validate_batch_jsonl(
+                input_path, config["api"], expected_endpoint=endpoint
+            )
+            if input_path.stat().st_size > 200 * 1024 * 1024:
+                raise PipelineError("Batch input exceeds the 200 MB API limit")
+            shards.append(
+                {
+                    "index": shard_index,
+                    "custom_ids": custom_ids,
+                    "attempts": [
+                        {
+                            "number": 0,
+                            "endpoint": endpoint,
+                            "input_path": input_name,
+                            "input_sha256": sha256_file(input_path),
+                            "custom_ids": custom_ids,
+                            "input_file_id": None,
+                            "batch_id": None,
+                            "status": "planned",
+                            "output_file_id": None,
+                            "error_file_id": None,
+                            "request_counts": None,
+                            "history": [
+                                {"at": utc_now(), "status": "planned_edit_cycle"}
+                            ],
+                        }
+                    ],
+                }
+            )
+            shard_index += 1
+    state = {
+        "schema_version": 1,
+        "local_batch_id": batch_id,
+        "stage": parent_state["stage"],
+        "status": "planned",
+        "seed": parent_state["seed"],
+        "config_path": str(config_path.resolve()),
+        "config_sha256": sha256_file(config_path),
+        "api_request": config["api"],
+        "plan_path": PLAN_NAME,
+        "plan_sha256": sha256_file(run_dir / PLAN_NAME),
+        "created_at": utc_now(),
+        "updated_at": utc_now(),
+        "parent_batch_dir": str(parent_run_dir),
+        "parent_state_sha256": sha256_file(parent_run_dir / STATE_NAME),
+        "parent_plan_sha256": parent_state["plan_sha256"],
+        "parent_qa_sha256": sha256_file(qa_path),
+        "parent_approval_sha256": None,
+        "edit_round": edit_round,
+        "max_edit_rounds": max_edit_rounds,
+        "target_count": len(records),
+        "request_count": selected_count,
+        "reference_cost_per_request_usd": float(
+            config["api"].get("documented_reference_cost_per_image_usd", 0.0)
+        ),
+        "reference_projected_cost_usd": round(
+            float(config["api"].get("documented_reference_cost_per_image_usd", 0.0))
+            * selected_count,
+            6,
+        ),
+        "planning_cost_per_request_usd": float(planning_cost_per_request_usd),
+        "planning_projected_cost_usd": round(
+            float(planning_cost_per_request_usd) * selected_count, 6
+        ),
+        "planning_cost_basis": "user_conservative_edit_estimate",
+        "forced_edit_policy": (
+            {
+                "type": "pitch_calibration_tail",
+                "calibration_path": str(calibration_path),
+                "calibration_sha256": sha256_file(calibration_path),
+                "selection": calibration_tail,
+            }
+            if include_pitch_calibration_tail
+            else None
+        ),
+        "items": items,
+        "shards": shards,
+    }
+    _atomic_json(run_dir / STATE_NAME, state)
+    return run_dir
+
+
 def process_output_jsonl(
     path: Path,
     run_dir: Path,
@@ -850,7 +1575,9 @@ def process_output_jsonl(
             body = response.get("body") or {}
             data = body.get("data") or []
             if len(data) != 1 or not isinstance(data[0].get("b64_json"), str):
-                raise PipelineError("response does not contain exactly one b64_json image")
+                raise PipelineError(
+                    "response does not contain exactly one b64_json image"
+                )
             raw = base64.b64decode(data[0]["b64_json"], validate=True)
             target = run_dir / "images" / plan[custom_id]["filename"]
             temporary = target.with_suffix(".jpg.tmp")
@@ -875,9 +1602,17 @@ def process_output_jsonl(
                     "response_id": response.get("request_id"),
                 }
             )
-        except (PipelineError, OSError, ValueError, binascii.Error, UnidentifiedImageError) as exc:
+        except (
+            PipelineError,
+            OSError,
+            ValueError,
+            binascii.Error,
+            UnidentifiedImageError,
+        ) as exc:
             if custom_id in state["items"]:
-                state["items"][custom_id].update({"status": "collect_error", "error": str(exc)})
+                state["items"][custom_id].update(
+                    {"status": "collect_error", "error": str(exc)}
+                )
             else:
                 state.setdefault("collection_errors", []).append(
                     {"file": path.name, "line": line_number, "error": str(exc)}
@@ -888,8 +1623,13 @@ def process_output_jsonl(
 def _process_error_jsonl(path: Path, state: dict[str, Any]) -> None:
     for row in read_jsonl(path):
         custom_id = row.get("custom_id")
-        if custom_id in state["items"] and state["items"][custom_id].get("status") != "success":
-            state["items"][custom_id].update({"status": "api_error", "api_error": row.get("error")})
+        if (
+            custom_id in state["items"]
+            and state["items"][custom_id].get("status") != "success"
+        ):
+            state["items"][custom_id].update(
+                {"status": "api_error", "api_error": row.get("error")}
+            )
 
 
 def _hash_manifest(run_dir: Path, state: dict[str, Any]) -> None:
@@ -905,7 +1645,12 @@ def _hash_manifest(run_dir: Path, state: dict[str, Any]) -> None:
         item["sha256"] = digest
         item["duplicate_of"] = duplicate_of
         rows.append(
-            {"custom_id": custom_id, "filename": path.name, "sha256": digest, "duplicate_of": duplicate_of}
+            {
+                "custom_id": custom_id,
+                "filename": path.name,
+                "sha256": digest,
+                "duplicate_of": duplicate_of,
+            }
         )
     write_jsonl(run_dir / "image_sha256.jsonl", rows)
 
@@ -948,7 +1693,9 @@ def collect_results(run_dir: Path, client: Any | None = None) -> dict[str, Any]:
     return {
         "stage": state["stage"],
         "changed": len(changed),
-        "success": sum(item.get("status") == "success" for item in state["items"].values()),
+        "success": sum(
+            item.get("status") == "success" for item in state["items"].values()
+        ),
         "total": len(state["items"]),
         "usage_records": len(usage),
     }
@@ -962,7 +1709,10 @@ def prepare_resume(run_dir: Path) -> int:
         missing = [
             custom_id
             for custom_id in shard["custom_ids"]
-            if not _valid_image(run_dir / "images" / plan[custom_id]["filename"], plan[custom_id]["size"])
+            if not _valid_image(
+                run_dir / "images" / plan[custom_id]["filename"],
+                plan[custom_id]["size"],
+            )
         ]
         if not missing:
             continue
@@ -975,11 +1725,28 @@ def prepare_resume(run_dir: Path) -> int:
         number = len(shard["attempts"])
         input_name = f"batch_input_{shard['index']:03d}_attempt_{number:02d}.jsonl"
         input_path = run_dir / input_name
-        write_jsonl(input_path, (batch_request(plan[custom_id], state["api_request"]) for custom_id in missing))
-        validate_batch_jsonl(input_path, state["api_request"])
+        endpoint = str(latest.get("endpoint", ENDPOINT))
+        if state.get("edit_round"):
+            previous_requests = {
+                row["custom_id"]: row
+                for row in read_jsonl(run_dir / latest["input_path"])
+            }
+            if not set(missing).issubset(previous_requests):
+                raise PipelineError("edit retry source requests are incomplete")
+            retry_requests = [previous_requests[custom_id] for custom_id in missing]
+        else:
+            retry_requests = [
+                batch_request(plan[custom_id], state["api_request"])
+                for custom_id in missing
+            ]
+        write_jsonl(input_path, retry_requests)
+        validate_batch_jsonl(
+            input_path, state["api_request"], expected_endpoint=endpoint
+        )
         shard["attempts"].append(
             {
                 "number": number,
+                "endpoint": endpoint,
                 "input_path": input_name,
                 "input_sha256": sha256_file(input_path),
                 "custom_ids": missing,
@@ -1012,11 +1779,20 @@ def _sum_numeric_usage(rows: list[dict[str, Any]]) -> dict[str, float]:
     return totals
 
 
-def build_usage_report(run_dir: Path, *, actual_cost_usd: float | None = None) -> dict[str, Any]:
+def build_usage_report(
+    run_dir: Path, *, actual_cost_usd: float | None = None
+) -> dict[str, Any]:
     state = load_state(run_dir)
     usage_path = run_dir / "usage.jsonl"
     usage_rows = read_jsonl(usage_path) if usage_path.exists() else []
     success = sum(item.get("status") == "success" for item in state["items"].values())
+    requested_ids = {
+        str(custom_id) for shard in state["shards"] for custom_id in shard["custom_ids"]
+    }
+    completed_requests = sum(
+        state["items"].get(custom_id, {}).get("status") == "success"
+        for custom_id in requested_ids
+    )
     image_paths = [
         run_dir / "images" / item["filename"]
         for item in state["items"].values()
@@ -1024,13 +1800,35 @@ def build_usage_report(run_dir: Path, *, actual_cost_usd: float | None = None) -
     ]
     approved_path = run_dir / "approved_annotations.jsonl"
     approved = read_jsonl(approved_path) if approved_path.exists() else []
-    pan_quality = sum(bool(row.get("pan_quality_pass")) for row in approved)
-    high_angle = sum(bool(row.get("counts_toward_high_angle_quota")) for row in approved)
-    eye_level = sum(
-        bool(row.get("pan_quality_pass"))
-        and row.get("camera_elevation_class") == "eye_level_or_low_angle"
-        for row in approved
-    )
+    if approved:
+        quality_rows = approved
+        quality_source = "approved_annotations"
+        pan_quality = sum(bool(row.get("pan_quality_pass")) for row in quality_rows)
+        high_angle = sum(
+            bool(row.get("counts_toward_high_angle_quota")) for row in quality_rows
+        )
+        eye_level = sum(
+            bool(row.get("pan_quality_pass"))
+            and row.get("camera_elevation_class") == "eye_level_or_low_angle"
+            for row in quality_rows
+        )
+    else:
+        auto_path = run_dir / "auto_qa.jsonl"
+        quality_rows = read_jsonl(auto_path) if auto_path.exists() else []
+        quality_source = "auto_qa" if quality_rows else None
+        pan_quality = sum(
+            bool(row.get("pan_quality_pass_auto")) for row in quality_rows
+        )
+        high_angle = sum(
+            bool(row.get("pan_quality_pass_auto"))
+            and row.get("camera_elevation_class_auto") == "high_angle_match"
+            for row in quality_rows
+        )
+        eye_level = sum(
+            bool(row.get("pan_quality_pass_auto"))
+            and row.get("camera_elevation_class_auto") == "eye_level_or_low_angle"
+            for row in quality_rows
+        )
     if actual_cost_usd is not None and actual_cost_usd <= 0:
         raise PipelineError("actual cost must be positive when supplied")
     models = sorted({str(row["model"]) for row in usage_rows if row.get("model")})
@@ -1041,8 +1839,9 @@ def build_usage_report(run_dir: Path, *, actual_cost_usd: float | None = None) -
         "requested_model": state["api_request"]["model"],
         "response_models": models,
         "requested": state["request_count"],
+        "completed_requests": completed_requests,
         "completed_images": success,
-        "failed_or_missing": state["request_count"] - success,
+        "failed_or_missing": max(0, state["request_count"] - completed_requests),
         "usage_records": len(usage_rows),
         "usage_path": str(usage_path) if usage_path.exists() else None,
         "usage_sha256": sha256_file(usage_path) if usage_path.exists() else None,
@@ -1050,22 +1849,35 @@ def build_usage_report(run_dir: Path, *, actual_cost_usd: float | None = None) -
         "image_bytes": total_bytes,
         "bytes_per_completed": total_bytes / success if success else None,
         "pan_quality_pass": pan_quality,
+        "quality_source": quality_source,
         "high_angle_qualified": high_angle,
         "retained_eye_level": eye_level,
         "actual_cost_usd": actual_cost_usd,
         "actual_cost_per_completed_usd": (
-            actual_cost_usd / success if actual_cost_usd is not None and success else None
+            actual_cost_usd / completed_requests
+            if actual_cost_usd is not None and completed_requests
+            else None
         ),
         "actual_cost_per_pan_quality_usd": (
-            actual_cost_usd / pan_quality if actual_cost_usd is not None and pan_quality else None
+            actual_cost_usd / pan_quality
+            if actual_cost_usd is not None and pan_quality
+            else None
         ),
         "actual_cost_per_high_angle_usd": (
-            actual_cost_usd / high_angle if actual_cost_usd is not None and high_angle else None
+            actual_cost_usd / high_angle
+            if actual_cost_usd is not None and high_angle
+            else None
         ),
-        "documented_reference_cost_per_request_usd": state.get("reference_cost_per_request_usd"),
-        "cost_basis": "account_observed" if actual_cost_usd is not None else "documented_reference_only",
+        "documented_reference_cost_per_request_usd": state.get(
+            "reference_cost_per_request_usd"
+        ),
+        "cost_basis": "account_observed"
+        if actual_cost_usd is not None
+        else "documented_reference_only",
         "created_at": utc_now(),
     }
     report_path = run_dir / "usage_report.json"
-    report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    report_path.write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     return report

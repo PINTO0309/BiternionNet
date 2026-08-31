@@ -14,7 +14,15 @@ import cv2
 import numpy as np
 
 from ..data import read_manifest
-from .generate import PipelineError, load_config, load_state, sector_centre, sha256_file, write_jsonl
+from .generate import (
+    DEIM_CROP_MARGIN,
+    PipelineError,
+    load_config,
+    load_state,
+    sector_centre,
+    sha256_file,
+    write_jsonl,
+)
 
 
 def expanded_crop(image: np.ndarray, box: list[float], margin: float) -> np.ndarray:
@@ -85,14 +93,23 @@ def _domain_stats(paths: list[Path]) -> dict[str, Any]:
         values["width_px"].append(float(image.shape[1]))
         values["brightness_mean"].append(float(gray.mean()))
         values["contrast_std"].append(float(gray.std()))
-        values["laplacian_variance"].append(float(cv2.Laplacian(gray, cv2.CV_64F).var()))
+        values["laplacian_variance"].append(
+            float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        )
     if not values["height_px"]:
         raise PipelineError("cannot compute domain statistics without readable images")
-    return {"count": len(values["height_px"]), **{key: _summary(value) for key, value in values.items()}}
+    return {
+        "count": len(values["height_px"]),
+        **{key: _summary(value) for key, value in values.items()},
+    }
 
 
 def _comparison_sheet(
-    real_paths: list[Path], synthetic_paths: list[Path], output: Path, *, resize_50: bool
+    real_paths: list[Path],
+    synthetic_paths: list[Path],
+    output: Path,
+    *,
+    resize_50: bool,
 ) -> None:
     rows = min(12, len(real_paths), len(synthetic_paths))
     if rows == 0:
@@ -111,7 +128,9 @@ def _comparison_sheet(
             cv2.LINE_AA,
         )
     for row_index in range(rows):
-        for column, path in enumerate((real_paths[row_index], synthetic_paths[row_index])):
+        for column, path in enumerate(
+            (real_paths[row_index], synthetic_paths[row_index])
+        ):
             image = cv2.imread(str(path), cv2.IMREAD_COLOR)
             if image is None:
                 continue
@@ -121,7 +140,10 @@ def _comparison_sheet(
                 scale = min((cell - 8) / image.shape[0], (cell - 8) / image.shape[1])
                 image = cv2.resize(
                     image,
-                    (max(1, round(image.shape[1] * scale)), max(1, round(image.shape[0] * scale))),
+                    (
+                        max(1, round(image.shape[1] * scale)),
+                        max(1, round(image.shape[0] * scale)),
+                    ),
                     interpolation=cv2.INTER_AREA,
                 )
             top = (row_index + 1) * cell + (cell - image.shape[0]) // 2
@@ -150,7 +172,11 @@ def _atomic_combined_manifest(
         for row in synthetic_rows:
             adjusted = dict(row)
             adjusted["image"] = "../synthetic/" + str(row["image"])
-            stream.write((json.dumps(adjusted, ensure_ascii=False, sort_keys=True) + "\n").encode())
+            stream.write(
+                (
+                    json.dumps(adjusted, ensure_ascii=False, sort_keys=True) + "\n"
+                ).encode()
+            )
         stream.flush()
         os.fsync(stream.fileno())
     temporary.replace(output)
@@ -177,8 +203,18 @@ def materialize_run(
         raise PipelineError("approved annotations changed after approval")
     if sha256_file(run_dir / approval["review_path"]) != approval["review_sha256"]:
         raise PipelineError("human review changed after approval")
-    margin = float(approval["crop_margin"])
-    rows = [json.loads(line) for line in annotations_path.read_text(encoding="utf-8").splitlines()]
+    margin_value = approval.get("crop_margin")
+    if not isinstance(margin_value, (int, float)):
+        raise PipelineError("approval does not bind the fixed DEIM crop margin")
+    margin = float(margin_value)
+    if not np.isclose(margin, DEIM_CROP_MARGIN, rtol=0.0, atol=1e-12):
+        raise PipelineError(
+            f"approved DEIM crop margin must be fixed to {DEIM_CROP_MARGIN:.2f}"
+        )
+    rows = [
+        json.loads(line)
+        for line in annotations_path.read_text(encoding="utf-8").splitlines()
+    ]
     sizes = _real_sizes(anchor_manifest)
     crops_dir = output_root / "crops"
     crops_dir.mkdir(parents=True, exist_ok=True)
@@ -190,7 +226,9 @@ def materialize_run(
         source = run_dir / "images" / row["filename"]
         image = cv2.imread(str(source), cv2.IMREAD_COLOR)
         if image is None or not row.get("head_box_xyxy"):
-            rejected.append({"custom_id": row["custom_id"], "reason": "missing_image_or_head_box"})
+            rejected.append(
+                {"custom_id": row["custom_id"], "reason": "missing_image_or_head_box"}
+            )
             continue
         try:
             crop = expanded_crop(image, row["head_box_xyxy"], margin)
@@ -199,13 +237,19 @@ def materialize_run(
             continue
         rng = _stable_rng(row["custom_id"], seed)
         target_height, target_width = sizes[rng.randrange(len(sizes))]
-        resized = cv2.resize(crop, (target_width, target_height), interpolation=cv2.INTER_AREA)
+        resized = cv2.resize(
+            crop, (target_width, target_height), interpolation=cv2.INTER_AREA
+        )
         output_name = Path(str(row["filename"])).name
         output_path = crops_dir / output_name
         if output_path.exists():
-            raise PipelineError(f"refusing to overwrite existing materialized crop: {output_path}")
+            raise PipelineError(
+                f"refusing to overwrite existing materialized crop: {output_path}"
+            )
         if not cv2.imwrite(
-            str(output_path), resized, [cv2.IMWRITE_JPEG_QUALITY, int(config["storage"]["quality"])]
+            str(output_path),
+            resized,
+            [cv2.IMWRITE_JPEG_QUALITY, int(config["storage"]["quality"])],
         ):
             raise PipelineError(f"failed to write crop: {output_path}")
         run_manifest_rows.append(
@@ -220,7 +264,9 @@ def materialize_run(
                 "label_source": row["label_source"],
                 "label_confidence": float(row["label_confidence"]),
                 "camera_elevation_class": row["camera_elevation_class"],
-                "counts_toward_high_angle_quota": bool(row["counts_toward_high_angle_quota"]),
+                "counts_toward_high_angle_quota": bool(
+                    row["counts_toward_high_angle_quota"]
+                ),
                 "generation_run": state["local_batch_id"],
                 "sha256": sha256_file(output_path),
                 "native_height": target_height,
@@ -233,11 +279,16 @@ def materialize_run(
     if annotations_store.exists():
         existing = {
             row["custom_id"]: row
-            for row in (json.loads(line) for line in annotations_store.read_text(encoding="utf-8").splitlines())
+            for row in (
+                json.loads(line)
+                for line in annotations_store.read_text(encoding="utf-8").splitlines()
+            )
         }
     for row in run_manifest_rows:
         if row["custom_id"] in existing and existing[row["custom_id"]] != row:
-            raise PipelineError(f"conflicting materialized annotation: {row['custom_id']}")
+            raise PipelineError(
+                f"conflicting materialized annotation: {row['custom_id']}"
+            )
         existing[row["custom_id"]] = row
     all_rows = [existing[key] for key in sorted(existing)]
     high_rows = [row for row in all_rows if row["counts_toward_high_angle_quota"]]
@@ -264,14 +315,26 @@ def materialize_run(
     comparison_path.write_text(
         json.dumps(domain_comparison, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
-    _comparison_sheet(real_paths, synthetic_paths, output_root / "comparison_native.jpg", resize_50=False)
-    _comparison_sheet(real_paths, synthetic_paths, output_root / "comparison_resize50.jpg", resize_50=True)
+    _comparison_sheet(
+        real_paths,
+        synthetic_paths,
+        output_root / "comparison_native.jpg",
+        resize_50=False,
+    )
+    _comparison_sheet(
+        real_paths,
+        synthetic_paths,
+        output_root / "comparison_resize50.jpg",
+        resize_50=True,
+    )
     report = {
         "run_id": state["local_batch_id"],
         "materialized_this_run": len(run_manifest_rows),
         "materialized_total": len(all_rows),
         "high_angle_total": len(high_rows),
-        "elevation_counts": dict(Counter(row["camera_elevation_class"] for row in all_rows)),
+        "elevation_counts": dict(
+            Counter(row["camera_elevation_class"] for row in all_rows)
+        ),
         "rejected": rejected,
         "crop_margin": margin,
         "anchor_manifest": str(anchor_manifest),
@@ -288,20 +351,23 @@ def materialize_run(
     return report
 
 
-def render_crop_margin_candidates(
+def render_deim_crop_margin_sheet(
     run_dir: Path,
     *,
     output: Path,
-    margins: list[float],
     anchor_manifest: Path,
     limit: int = 19,
 ) -> Path:
+    margins = (DEIM_CROP_MARGIN,)
     qa_path = run_dir / "auto_qa.jsonl"
     if not qa_path.exists():
         raise PipelineError("auto_qa.jsonl is required")
     rows = [
         row
-        for row in (json.loads(line) for line in qa_path.read_text(encoding="utf-8").splitlines())
+        for row in (
+            json.loads(line)
+            for line in qa_path.read_text(encoding="utf-8").splitlines()
+        )
         if row.get("head_box_xyxy")
     ][:limit]
     real_by_sector: dict[int, list[tuple[int, Path]]] = {}
@@ -315,17 +381,23 @@ def render_crop_margin_candidates(
         if image is None:
             continue
         sector = sector_centre(float(anchor["angle_deg"]))
-        real_by_sector.setdefault(sector, []).append((int(image.shape[0] * image.shape[1]), image_path))
+        real_by_sector.setdefault(sector, []).append(
+            (int(image.shape[0] * image.shape[1]), image_path)
+        )
     for candidates in real_by_sector.values():
         candidates.sort(key=lambda value: (value[0], str(value[1])))
     if not real_by_sector:
-        raise PipelineError(f"no readable TownCentre training anchors in {anchor_manifest}")
+        raise PipelineError(
+            f"no readable TownCentre training anchors in {anchor_manifest}"
+        )
     cell = 160
     columns = len(margins) + 1
     canvas = np.full(((len(rows) + 1) * cell, columns * cell, 3), 255, dtype=np.uint8)
     for row_index, row in enumerate(rows, 1):
         sector = sector_centre(float(row["intent_pan_deg"]))
-        candidates = real_by_sector.get(sector) or [item for group in real_by_sector.values() for item in group]
+        candidates = real_by_sector.get(sector) or [
+            item for group in real_by_sector.values() for item in group
+        ]
         quantile = (row_index - 1) / max(1, len(rows) - 1)
         real_path = candidates[round(quantile * (len(candidates) - 1))][1]
         real = cv2.imread(str(real_path), cv2.IMREAD_COLOR)
@@ -339,7 +411,9 @@ def render_crop_margin_candidates(
             crop = expanded_crop(image, row["head_box_xyxy"], margin)
             thumb = cv2.resize(crop, (cell, cell), interpolation=cv2.INTER_AREA)
             left = (column + 1) * cell
-            canvas[row_index * cell : (row_index + 1) * cell, left : left + cell] = thumb
+            canvas[row_index * cell : (row_index + 1) * cell, left : left + cell] = (
+                thumb
+            )
     cv2.putText(
         canvas,
         "TownCentre real",
