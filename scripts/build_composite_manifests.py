@@ -29,6 +29,7 @@ def main(
     neighbor_cap: int = typer.Option(10, min=1, help="Maximum |frame offset| for train-balancing and test_neighbor."),
     balance_target: Optional[int] = typer.Option(None, help="Flip-effective per-10-degree-bin target (default: auto = the achievable maximum)."),
     synthetic_holdout: float = typer.Option(0.1, min=0.0, max=0.5, help="Fraction of synthetic records moved to the test_synthetic split (per-bin stratified)."),
+    current_cap_effective: Optional[int] = typer.Option(None, help="Also write manifest_current_capped.jsonl: trim neighbour records of bins whose flip-effective count exceeds this ceiling (-1 = auto: the highest non-self-mirrored pair, i.e. flatten only the 0/180-deg spikes)."),
     seed: int = typer.Option(0),
 ) -> None:
     summary = build_composite_manifests(
@@ -38,6 +39,7 @@ def main(
         neighbor_cap=neighbor_cap,
         balance_target=balance_target,
         synthetic_holdout=synthetic_holdout,
+        current_cap_effective=current_cap_effective,
         seed=seed,
     )
     typer.echo(json.dumps(summary, indent=2, sort_keys=True))

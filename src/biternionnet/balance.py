@@ -89,9 +89,11 @@ def build_composite_manifests(
     neighbor_cap: int = 10,
     balance_target: int | None = None,
     synthetic_holdout: float = 0.1,
+    current_cap_effective: int | None = None,
     seed: int = 0,
     current_name: str = "manifest_current.jsonl",
     balanced_name: str = "manifest_balanced.jsonl",
+    current_capped_name: str = "manifest_current_capped.jsonl",
 ) -> dict[str, Any]:
     combined = Path(combined)
     source = Path(source)
@@ -166,6 +168,37 @@ def build_composite_manifests(
         achieved[pair] += gain
         achieved[(-pair) % N_BINS] = achieved[pair]
 
+    # --- current with capped peaks: trim only neighbour records of over-exposed bins ----------
+    # ``current_cap_effective``: flip-effective ceiling per 10-deg bin. -1 = auto (the highest
+    # effective count among the non-self-mirrored mirror pairs, so the 0/180 self-mirror spikes
+    # are brought down to the level of their surroundings). Farthest |frame_offset| dropped first.
+    capped_neighbors: list[dict[str, Any]] | None = None
+    cap_value: float | None = None
+    if current_cap_effective is not None:
+        counts = np.zeros(N_BINS)
+        for r in anchors + synthetic_train + current_neighbors:
+            counts[bin_of(r["angle_deg"])] += 1
+        eff = flip_effective(counts)
+        if current_cap_effective < 0:
+            non_self_mirror = [eff[b] for b in range(N_BINS) if b not in (0, N_BINS // 2)]
+            cap_value = float(max(non_self_mirror))
+        else:
+            cap_value = float(current_cap_effective)
+        keep_rank: dict[int, list[tuple[int, float, int]]] = defaultdict(list)
+        for i, r in enumerate(current_neighbors):
+            b = bin_of(r["angle_deg"])
+            pair = min(b, (-b) % N_BINS)
+            keep_rank[pair].append((abs(int(r.get("frame_offset", 0))), rng.random(), i))
+        drop: set[int] = set()
+        for pair in keep_rank:
+            excess_eff = eff[pair] - cap_value
+            if excess_eff <= 0:
+                continue
+            n_drop = int(round(excess_eff if pair in (0, N_BINS // 2) else 2.0 * excess_eff))
+            for _, _, i in sorted(keep_rank[pair], reverse=True)[:n_drop]:
+                drop.add(i)
+        capped_neighbors = [r for i, r in enumerate(current_neighbors) if i not in drop]
+
     # --- write -------------------------------------------------------------------------------
     test_side = test_anchors + test_neighbors + test_synthetic
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -173,6 +206,9 @@ def build_composite_manifests(
     balanced_path = output_dir / balanced_name
     write_manifest(anchors + current_neighbors + synthetic_train + others + test_side, current_path)
     write_manifest(anchors + balanced_neighbors + synthetic_train + others + test_side, balanced_path)
+    capped_path = output_dir / current_capped_name
+    if capped_neighbors is not None:
+        write_manifest(anchors + capped_neighbors + synthetic_train + others + test_side, capped_path)
 
     summary = {
         "target": target,
@@ -192,4 +228,8 @@ def build_composite_manifests(
         "balanced_effective_min": float(achieved[top > 0].min()) if (top > 0).any() else 0.0,
         "balanced_effective_max": float(achieved[top > 0].max()) if (top > 0).any() else 0.0,
     }
+    if capped_neighbors is not None:
+        summary["current_capped"] = str(capped_path)
+        summary["current_cap_effective"] = cap_value
+        summary["counts"]["current_capped_neighbors"] = len(capped_neighbors)
     return summary

@@ -159,3 +159,32 @@ over the nb3 reference.
 **Working default going forward: balanced manifest + swish** (best macro and profile bins, negligible
 cost on test). Open items: seeds 1-2, the 225-deg sector (needs measured rear labels or real data), and
 the resize-46 ablation (004 §3.1.1).
+
+## 11. Current with capped peaks (2026-08-31)
+
+The 0/180-deg bins are their own flip mirrors, so unlike every other bin their raw counts are not
+averaged with a sparse opposite side; with the x6.9 neighbour expansion this makes the 175-185 deg
+exposure ~1.6x its surroundings in the current pattern (raw anchors there are not even the maximum -
+bin 170 has 287 vs 254). `--current-cap-effective` writes a third manifest,
+`manifest_current_capped.jsonl`, that trims **only neighbour records** (farthest |frame_offset| first,
+deterministic) of bins whose flip-effective count exceeds the ceiling; `-1` = auto (the highest
+non-self-mirrored pair). Anchors, synthetic and the shared test side are untouched;
+`manifest_current` / `manifest_balanced` stay byte-identical.
+
+Real numbers: cap 1,267.5 -> bins 0/180 come down from 1,796 / 1,997 to 1,267 / 1,268 by dropping 580
+of 22,993 neighbours; train 33,842 (339 steps/epoch; same 350/301/50 command applies). The rest of the
+distribution is unchanged (min bin still 630), so this sits between current (as-is) and balanced (flat).
+
+Numeric variant iterations (user request): first 1,100, then 900 and 700, then **600 adopted**. `--current-cap-effective 1100` trims every bin above 1,100
+(bins 0 / 40 / 170-pair / 180 hit the ceiling; 1,318 of 22,993 neighbours dropped). Train 33,104
+(332 steps/epoch), effective range 630..1,100 (max/min 1.75 vs 2.7 current / 1.0 balanced).
+At 900: 13 of the 19 mirror-pair bins sit at the ceiling (0-10, 30-60, 140-180 and their mirrors),
+4,325 of 22,993 neighbours dropped, train 30,097 (301 steps/epoch), effective range 630..900
+(max/min 1.43) - approaching the balanced shape from above, with the sub-ceiling bins untouched.
+At 700: 16 of 19 pair bins at the ceiling (only 100/110/120 deg stay below: 656/630/672), 9,503 of
+22,993 neighbours dropped, train 24,919 (250 steps/epoch), max/min 1.11 - effectively a "balanced-lite"
+at T=700 that *discards* data, where the balanced manifest reaches the same flatness at T=1,313 by
+*adding* neighbours. Below ~650 the cap cannot flatten further (the valley bins have no surplus to trim).
+At 600 every bin can be trimmed to the ceiling: fully flat (max/min 1.00) at T=600, 12,822 of 22,993
+neighbours dropped, train 21,600 (216 steps/epoch) - the same shape as the balanced manifest with 2.2x
+less data per bin, which makes the balanced-vs-capped-600 pair a clean flatness-vs-data-volume ablation.

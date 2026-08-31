@@ -124,3 +124,29 @@ def test_deterministic(composite):
     first = (out / "manifest_balanced.jsonl").read_bytes()
     build_composite_manifests(out / "combined.jsonl", tmp_path / "TownCentreHeadImages", out, neighbor_cap=10, synthetic_holdout=0.1, seed=0)
     assert (out / "manifest_balanced.jsonl").read_bytes() == first
+
+
+def test_current_cap_trims_only_neighbor_records(composite):
+    tmp_path, out, _ = composite
+    summary = build_composite_manifests(
+        out / "combined.jsonl", tmp_path / "TownCentreHeadImages", out,
+        neighbor_cap=10, synthetic_holdout=0.1, seed=0, current_cap_effective=-1,
+    )
+    capped = _load(out / "manifest_current_capped.jsonl")
+    current = _load(out / "manifest_current.jsonl")
+    # anchors / synthetic / test side identical; only neighbour records may be removed
+    strip = lambda rs, split: [r for r in rs if r["split"] == split and r.get("source") != "neighbor"]
+    for split in ("train", "test", "test_neighbor", "test_synthetic"):
+        assert strip(capped, split) == strip(current, split)
+    n_cur = sum(1 for r in current if r["split"] == "train" and r.get("source") == "neighbor")
+    n_cap = sum(1 for r in capped if r["split"] == "train" and r.get("source") == "neighbor")
+    assert n_cap <= n_cur == summary["counts"]["current_neighbors"]
+    # effective counts respect the cap (within rounding)
+    import numpy as np
+    from biternionnet.balance import bin_of, flip_effective
+    counts = np.zeros(36)
+    for r in capped:
+        if r["split"] == "train":
+            counts[bin_of(r["angle_deg"])] += 1
+    eff = flip_effective(counts)
+    assert eff.max() <= summary["current_cap_effective"] + 1
