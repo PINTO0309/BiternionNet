@@ -111,6 +111,18 @@ D3 no-crop 64x64:    ... --resize-size 64 64 --input-size 64 64    --output runs
 (reference = the same command with the preset 50x50 + crop, i.e. synth-biternion-vonmises-relu/swish)
 ```
 
+**D1 result (2026-08-31, `runs/abl-resize46-swish`, balanced manifest, swish, 350/301/50 = 165k steps):**
+
+| | test last7 | test macro | test_nb MAAD | test_nb macro | test_nb 45 | test_nb 90 |
+|---|---|---|---|---|---|---|
+| reference: balanced swish (50->46 crop + jitter) | 18.32 +- 0.12 | 18.80 | 20.74 | 22.48 | 18.6 | 24.1 |
+| D1 pure 46x46 resize (no crop, no jitter) | 20.26 +- 0.05 | 22.46 | 21.89 | 24.72 | **27.8** | 27.6 |
+
+Removing the crop/scale augmentation costs ~2 deg overall and ~2.2 deg macro; the 45-deg sector collapses
+(+9 deg). The 46-from-50 random crop (+ scale jitter) is load-bearing, not a legacy detail - **D1 rejected**.
+D2 (46x46 resize + scale jitter, which re-introduces crops from 46-51 px) would separate the translation
+component from the scale component if the question becomes relevant again.
+
 D3 (`--input-size`, added the same day) resizes straight to a 64x64 network input: the backbone then
 yields a 64@9x9 map (`Linear(5184, 512)`, ~2.9 M params vs 1.6 M at 46). Note the TownCentre crops have a
 median height of 29 px, so 64 px is >2x upsampling - the scenario probes whether the extra resolution of
