@@ -188,3 +188,30 @@ at T=700 that *discards* data, where the balanced manifest reaches the same flat
 At 600 every bin can be trimmed to the ceiling: fully flat (max/min 1.00) at T=600, 12,822 of 22,993
 neighbours dropped, train 21,600 (216 steps/epoch) - the same shape as the balanced manifest with 2.2x
 less data per bin, which makes the balanced-vs-capped-600 pair a clean flatness-vs-data-volume ablation.
+
+## 12. Flatness vs data volume resolved (2026-08-31, capped600 swish arm)
+
+`runs/synth-capped600-biternion-vonmises-swish`: `manifest_capped600.jsonl` (flat at T=600 by trimming),
+same command family (350/301/50, swish, no label jitter), 75,600 steps.
+
+test_neighbor (swish arms):
+
+| | steps | MAAD | macro | 45 | 90 | 225 | 270 |
+|---|---|---|---|---|---|---|---|
+| current (peaked) | 121k | 21.24 | 23.29 | 19.3 | 26.4 | 37.4 | 25.2 |
+| capped600 (flat, T=600) | 76k | 20.88 | 22.77 | **16.6** | 27.2 | 38.3 | 23.6 |
+| capped600 + label jitter 1.5 | 76k | 20.81 | 22.57 | 15.7 | 28.3 | 37.7 | 22.0 |
+| balanced (flat, T=1,313) | 165k | **20.74** | **22.48** | 18.6 | **24.1** | 37.0 | **22.4** |
+
+test: capped600 18.63 +- 0.23 / macro 19.90; with `--neighbor-label-jitter 1.5` 18.32 +- 0.06 / 20.01
+(balanced 18.32 / 18.80; current 18.11 / 19.31).
+
+Reading:
+
+- **Flatness alone recovers most of the overall gain**: capped600 matches balanced's test_neighbor MAAD
+  to within noise (20.88 vs 20.74) with 2.2x less data per bin and 46 % of the steps.
+- **The profile-bin gains need the extra data, not just the shape**: at 90 deg capped600 (27.2) is even
+  worse than current (26.4) - capping *removed* valley-bin records - while balanced's unique +-10-frame
+  fillings bring it to 24.1. Same direction at 270 deg.
+- Working default stays **balanced + swish**; capped600 is the budget option when training cost matters
+  more than the profile bins.

@@ -169,4 +169,6 @@ Neighbour records copy their anchor's integer angle, so tens of samples share on
 as 1-deg spikes in the training-label donuts even for the flat manifests. `--neighbor-label-jitter J`
 adds uniform +-J deg online (fresh draw each access, anchors and synthetic untouched, stored in the
 checkpoint config). Suggested J = 1.5 (the measured head-turn rate is ~0.14 deg/frame, so +-10 frames
-drift ~1.4 deg). Off by default; not yet ablated.
+drift ~1.4 deg). Off by default. First ablation (capped600 swish pair, 017 §12): jitter 1.5 improves test 18.63 -> 18.32
+(+-0.06 epoch noise) and test_neighbor macro 22.77 -> 22.57, overall test_neighbor -0.07 - small but
+consistently non-negative at zero cost; recommended for neighbour-heavy manifests, single seed so far.
