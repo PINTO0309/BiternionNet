@@ -56,6 +56,11 @@ class ExperimentConfig:
     # ``resize_size`` before the random crop.
     photometric: str | None = None
     scale_jitter: tuple[float, float] | None = None
+    # Uniform +-J degrees added online to the angle label of neighbour-frame records during
+    # training (fresh draw every access). Neighbour labels are copies of their anchor's label,
+    # so tens of records share one integer degree; a small jitter (~the measured 0.14 deg/frame
+    # head-turn rate times the offset) spreads those 1-deg spikes without changing the bin.
+    neighbor_label_jitter_deg: float = 0.0
 
 
 CLASS_FLIPS_4 = {"front": "front", "back": "back", "left": "right", "right": "left", "background": "background"}
@@ -212,6 +217,7 @@ def with_overrides(
     scale_jitter: tuple[float, float] | None = None,
     resize_size: tuple[int, int] | None = None,
     input_size: tuple[int, int] | None = None,
+    neighbor_label_jitter_deg: float | None = None,
 ) -> ExperimentConfig:
     changes = {}
     if epochs is not None:
@@ -254,6 +260,10 @@ def with_overrides(
         changes["resize_size"] = tuple(int(x) for x in resize_size)
     if input_size is not None:
         changes["input_size"] = tuple(int(x) for x in input_size)
+    if neighbor_label_jitter_deg is not None:
+        if neighbor_label_jitter_deg < 0:
+            raise ValueError("neighbor_label_jitter_deg must be >= 0")
+        changes["neighbor_label_jitter_deg"] = float(neighbor_label_jitter_deg)
     result = replace(config, **changes)
     get_photometric_preset(result.photometric)  # validates the preset name
     if result.scale_jitter is not None:

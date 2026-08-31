@@ -151,12 +151,14 @@ class ManifestDataset(Dataset):
         quantization_borders: np.ndarray | None = None,
         quantization_centres: np.ndarray | None = None,
         photometric: PhotometricConfig | None = None,
+        neighbor_label_jitter_deg: float = 0.0,
     ) -> None:
         self.manifest = Path(manifest)
         self.root = self.manifest.parent
         self.target_kind = target_kind
         self.crop = crop
         self.photometric = None if photometric is None or photometric.is_noop() else photometric
+        self.neighbor_label_jitter_deg = neighbor_label_jitter_deg
         self.class_to_idx = class_to_idx or {}
         self.class_flip_map = class_flip_map or {}
         self.flip_probability = flip_probability
@@ -179,6 +181,10 @@ class ManifestDataset(Dataset):
         if not image_path.is_absolute():
             image_path = self.root / image_path
         image = load_image(image_path)
+
+        if self.neighbor_label_jitter_deg > 0.0 and record.get("source") == "neighbor" and "angle_deg" in record:
+            jitter = random.uniform(-self.neighbor_label_jitter_deg, self.neighbor_label_jitter_deg)
+            record = {**record, "angle_deg": (float(record["angle_deg"]) + jitter) % 360.0}
 
         if self.flip_probability > 0.0 and random.random() < self.flip_probability:
             image = np.ascontiguousarray(image[:, ::-1])

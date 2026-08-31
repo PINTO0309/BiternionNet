@@ -162,3 +162,11 @@ kept as optional checks.
 - Angle interpolation between labelled frames (only where the change is small), or self-training on the 480 k
   unlabelled frames with the best model as teacher.
 - Per-bin (8 x 45 deg) MAAD in the evaluation to see whether the rare profiles (002 §3) improve.
+
+## 3.1.2 Neighbour-label jitter (2026-08-31)
+
+Neighbour records copy their anchor's integer angle, so tens of samples share one exact degree - visible
+as 1-deg spikes in the training-label donuts even for the flat manifests. `--neighbor-label-jitter J`
+adds uniform +-J deg online (fresh draw each access, anchors and synthetic untouched, stored in the
+checkpoint config). Suggested J = 1.5 (the measured head-turn rate is ~0.14 deg/frame, so +-10 frames
+drift ~1.4 deg). Off by default; not yet ablated.

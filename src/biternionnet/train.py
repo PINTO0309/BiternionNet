@@ -134,6 +134,7 @@ def build_datasets(
         quantization_borders=borders,
         quantization_centres=centres,
         photometric=get_photometric_preset(config.photometric),
+        neighbor_label_jitter_deg=config.neighbor_label_jitter_deg,
     )
     test_dataset = _eval_dataset(config, manifest, "test", class_to_idx)
     val_dataset = None
@@ -308,6 +309,7 @@ def train_model(
     scale_jitter: tuple[float, float] | None = None,
     resize_size: tuple[int, int] | None = None,
     input_size: tuple[int, int] | None = None,
+    neighbor_label_jitter_deg: float | None = None,
     resume_from: str | Path | None = None,
     seed: int = 0,
     device_name: str | None = None,
@@ -354,6 +356,7 @@ def train_model(
         scale_jitter=scale_jitter,
         resize_size=resize_size,
         input_size=input_size,
+        neighbor_label_jitter_deg=neighbor_label_jitter_deg,
     )
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)

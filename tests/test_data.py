@@ -144,3 +144,27 @@ def test_resize_equal_to_crop_disables_translation():
         random.seed(seed)
         assert np.array_equal(prepare_image(image, crop), first)  # no crop jitter left
     assert first.shape == (46, 46, 3)
+
+
+def test_neighbor_label_jitter_applies_only_to_neighbors(tmp_path):
+    import random
+
+    _write_image(tmp_path / "images" / "a.jpg")
+    _write_image(tmp_path / "images" / "b.jpg")
+    manifest = tmp_path / "manifest.jsonl"
+    write_manifest(
+        [
+            {"split": "train", "image": "images/a.jpg", "task": "angle_deg", "angle_deg": 100.0},
+            {"split": "train", "image": "images/b.jpg", "task": "angle_deg", "angle_deg": 100.0, "source": "neighbor", "anchor_frame": 1, "frame_offset": 1},
+        ],
+        manifest,
+    )
+    ds = ManifestDataset(manifest, "train", "angle_deg", crop=CropConfig((46, 46)), neighbor_label_jitter_deg=2.0)
+    random.seed(0)
+    anchor_targets = {float(ds[0][1]) for _ in range(10)}
+    neighbor_targets = [float(ds[1][1]) for _ in range(50)]
+    assert anchor_targets == {100.0}  # anchors untouched
+    assert all(98.0 <= t <= 102.0 for t in neighbor_targets)
+    assert len(set(neighbor_targets)) > 10  # fresh draw each access
+    # records themselves are not mutated
+    assert ds.records[1]["angle_deg"] == 100.0

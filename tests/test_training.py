@@ -305,3 +305,13 @@ def test_input_size_override_no_crop_64(tmp_path):
     assert tuple(saved["input_size"]) == (64, 64) and tuple(saved["resize_size"]) == (64, 64)
     metrics = evaluate_checkpoint(result["last_checkpoint"], manifest, device_name="cpu", batch_size=2)
     assert "maad_deg" in metrics
+
+
+def test_neighbor_label_jitter_stored_in_checkpoint(tmp_path):
+    import torch
+
+    manifest = _angle_manifest(tmp_path)
+    result = train_model("smoke-biternion", manifest, tmp_path / "run", epochs=1, batch_size=2,
+                         neighbor_label_jitter_deg=1.5, device_name="cpu")
+    saved = torch.load(result["last_checkpoint"], map_location="cpu")["experiment"]
+    assert saved["neighbor_label_jitter_deg"] == 1.5
