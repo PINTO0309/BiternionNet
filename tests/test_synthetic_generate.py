@@ -61,6 +61,11 @@ def test_plan_fixes_low_quality_and_is_immutable(tmp_path):
     assert all(row["body"]["output_format"] == "jpeg" for row in requests)
     assert all(row["body"]["output_compression"] == 92 for row in requests)
     assert all(row["custom_id"].startswith("validation-v001--") for row in requests)
+    plan = read_plan(run, state)
+    filenames = [row["filename"] for row in plan.values()]
+    assert filenames == sorted(filenames)
+    assert filenames[1] == "validation-v001_000002--pan-010_cam+45_pitch+002.jpg"
+    assert state["items"][requests[1]["custom_id"]]["filename"] == filenames[1]
     local_status = refresh_status(run)
     assert local_status["status"] == "planned"
     assert local_status["pending_requests"] == 19

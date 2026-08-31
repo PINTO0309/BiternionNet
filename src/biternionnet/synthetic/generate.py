@@ -256,6 +256,21 @@ def _custom_id(signed_pan: int, camera_elevation: int, head_pitch: int, serial: 
     )
 
 
+def _image_filename(
+    signed_pan: int,
+    camera_elevation: int,
+    head_pitch: int,
+    serial: int,
+    *,
+    batch_id: str | None = None,
+) -> str:
+    prefix = f"{batch_id}_" if batch_id else ""
+    return (
+        f"{prefix}{serial:06d}--pan{signed_pan:+04d}_"
+        f"cam{camera_elevation:+03d}_pitch{head_pitch:+04d}.jpg"
+    )
+
+
 def _record(
     config: dict[str, Any],
     *,
@@ -293,7 +308,12 @@ def _record(
         "accessory": prompt["accessories"][index % len(prompt["accessories"])],
     }
     record["custom_id"] = _custom_id(signed_pan, camera_elevation, head_pitch, serial)
-    record["filename"] = record["custom_id"] + ".jpg"
+    record["filename"] = _image_filename(
+        signed_pan,
+        camera_elevation,
+        head_pitch,
+        serial,
+    )
     record["prompt"] = _make_prompt(config, record)
     return record
 
@@ -513,7 +533,13 @@ def create_plan(
     records = build_plan(config, stage, seed, bin_counts=bin_counts)
     for record in records:
         record["custom_id"] = f"{batch_id}--{record['custom_id']}"
-        record["filename"] = record["custom_id"] + ".jpg"
+        record["filename"] = _image_filename(
+            int(record["signed_pan"]),
+            int(record["camera_elevation"]),
+            int(record["head_pitch"]),
+            int(record["serial"]),
+            batch_id=batch_id,
+        )
     run_dir = output_root / "batches" / batch_id
     if run_dir.exists():
         raise PipelineError(f"refusing to overwrite existing run: {run_dir}")

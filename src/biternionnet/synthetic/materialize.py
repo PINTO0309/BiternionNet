@@ -200,7 +200,7 @@ def materialize_run(
         rng = _stable_rng(row["custom_id"], seed)
         target_height, target_width = sizes[rng.randrange(len(sizes))]
         resized = cv2.resize(crop, (target_width, target_height), interpolation=cv2.INTER_AREA)
-        output_name = row["custom_id"] + ".jpg"
+        output_name = Path(str(row["filename"])).name
         output_path = crops_dir / output_name
         if output_path.exists():
             raise PipelineError(f"refusing to overwrite existing materialized crop: {output_path}")
