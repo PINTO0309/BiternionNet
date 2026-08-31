@@ -27,8 +27,9 @@ TEXT_SECONDARY = "#52514e"
 GRID = "#e4e3df"
 SERIES = "#2a78d6"
 # fixed categorical order (dataviz palette): source identity keeps its hue everywhere
-SOURCE_COLORS = {"anchor": "#2a78d6", "synthetic": "#eb6834", "neighbor": "#1baf7a"}
-SOURCE_ORDER = ("anchor", "neighbor", "synthetic")
+SOURCE_COLORS = {"anchor": "#2a78d6", "synthetic": "#eb6834", "neighbor": "#1baf7a",
+                 "test": "#2a78d6", "test_neighbor": "#1baf7a", "test_synthetic": "#eb6834"}
+SOURCE_ORDER = ("anchor", "neighbor", "synthetic", "test", "test_neighbor", "test_synthetic")
 
 app = typer.Typer(add_completion=False)
 
@@ -108,21 +109,34 @@ def main(
     output: Path | None = typer.Option(None, help="Output .jpg (default: <manifest dir>/angle_distribution.jpg)."),
     bin_width: float = typer.Option(10.0, min=1.0, max=180.0, help="Bin width in degrees (360 must be a multiple)."),
     flip_effective: bool = typer.Option(False, help="Show train counts as (raw(a)+raw(360-a))/2 - what training with p=0.5 horizontal flips effectively sees. Test panels stay raw."),
+    merge_test: bool = typer.Option(False, help="Merge the test / test_neighbor / test_synthetic panels into one stacked panel."),
     dpi: int = typer.Option(150, min=50),
 ) -> None:
     if abs(360.0 / bin_width - round(360.0 / bin_width)) > 1e-9:
         raise typer.BadParameter("360 must be a multiple of --bin-width")
     records = [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines() if line.strip()]
-    splits = [s for s in ("train", "val", "test", "test_neighbor", "test_synthetic") if any(r.get("split") == s for r in records)]
-    panels = [(None, "all")] + [(s, s) for s in splits]
+    test_splits = [s for s in ("test", "test_neighbor", "test_synthetic") if any(r.get("split") == s for r in records)]
+    if merge_test and len(test_splits) > 1:
+        splits = [s for s in ("train", "val") if any(r.get("split") == s for r in records)]
+        panels = [(None, "all")] + [(s, s) for s in splits] + [("__test__", "test side (stacked by split)")]
+    else:
+        splits = [s for s in ("train", "val", *test_splits) if any(r.get("split") == s for r in records)]
+        panels = [(None, "all")] + [(s, s) for s in splits]
 
     fig, axes = plt.subplots(len(panels), 1, figsize=(10, 3.2 * len(panels)), facecolor=SURFACE, squeeze=False)
     for ax, (split, label) in zip(axes[:, 0], panels):
-        fe = flip_effective and split in (None, "train")
-        angles = _angles(records, split)
-        centres, counts = _histogram(angles, bin_width, fe)
-        by_source = _angles_by_source(records, split)
-        stacks = {k: _histogram(v, bin_width, fe)[1] for k, v in by_source.items()} if len(by_source) > 1 else None
+        if split == "__test__":
+            by_source = {s: _angles(records, s) for s in test_splits}
+            angles = np.concatenate(list(by_source.values()))
+            centres, counts = _histogram(angles, bin_width)
+            stacks = {k: _histogram(v, bin_width)[1] for k, v in by_source.items()}
+            fe = False
+        else:
+            fe = flip_effective and split in (None, "train")
+            angles = _angles(records, split)
+            centres, counts = _histogram(angles, bin_width, fe)
+            by_source = _angles_by_source(records, split)
+            stacks = {k: _histogram(v, bin_width, fe)[1] for k, v in by_source.items()} if len(by_source) > 1 else None
         subtitle = f"{len(angles):,} heads · {int(round(360.0 / bin_width))} bins of {bin_width:g}° centred on 0°"
         if fe:
             subtitle += " · flip-effective"

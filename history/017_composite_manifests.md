@@ -201,10 +201,16 @@ test_neighbor (swish arms):
 | current (peaked) | 121k | 21.24 | 23.29 | 19.3 | 26.4 | 37.4 | 25.2 |
 | capped600 (flat, T=600) | 76k | 20.88 | 22.77 | **16.6** | 27.2 | 38.3 | 23.6 |
 | capped600 + label jitter 1.5 | 76k | 20.81 | 22.57 | 15.7 | 28.3 | 37.7 | 22.0 |
-| balanced (flat, T=1,313) | 165k | **20.74** | **22.48** | 18.6 | **24.1** | 37.0 | **22.4** |
+| balanced (flat, T=1,313) | 165k | **20.74** | **22.48** | 18.6 | 24.1 | 37.0 | **22.4** |
+| balanced + label jitter 1.5 | 165k | 20.84 | 22.73 | 15.3 | **23.5** | 40.9 | 25.2 |
 
 test: capped600 18.63 +- 0.23 / macro 19.90; with `--neighbor-label-jitter 1.5` 18.32 +- 0.06 / 20.01
-(balanced 18.32 / 18.80; current 18.11 / 19.31).
+(balanced 18.32 / 18.80; balanced + jitter 18.79 +- 0.16 / 20.99; current 18.11 / 19.31).
+
+Label jitter verdict (both pairs, seed 0): it helps the data-starved capped600 (-0.31 test) but hurts the
+data-rich balanced (+0.47 test, macro +0.25 on test_neighbor, 225 deg +3.9) - the numerous unique
+neighbours of the balanced manifest already provide the regularisation, and extra label noise only blurs
+the targets. **Default stays balanced + swish without jitter**; use jitter only on trimmed manifests.
 
 Reading:
 
@@ -215,3 +221,30 @@ Reading:
   fillings bring it to 24.1. Same direction at 270 deg.
 - Working default stays **balanced + swish**; capped600 is the budget option when training cost matters
   more than the profile bins.
+
+## 13. Third synthetic batch: near-level 8,400 (2026-09-01)
+
+`production-nearlevel8400-v005-edit04-quality` adds 8,400 heads aimed at the valley bins (8x45-deg
+histogram `[1197, 1053, 1626, 727, 341, 726, 1631, 1099]`; 280-390 per 10-deg bin across 70-120 /
+240-290 deg). Labels: sixdrepnet360 1,556 / intent 6,844; camera-elevation class is **eye_level for the
+whole batch**, so the 005 viewpoint caveat now applies to a third of the synthetic pool. Synthetic total
+16,775; regenerated with the same command (`--current-cap-effective 600`):
+
+| manifest | train | steps/epoch | effective range | note |
+|---|---|---|---|---|
+| current | 41,976 | 420 | 894-1,752 | valleys lifted from 630 to 894 by the new batch alone |
+| balanced | 56,736 | 568 | **1,576 flat** | T up from 1,313 - the limiting valley pair gained synthetic mass |
+| current_capped (600) | 22,687 | 227 | 600-877, **no longer flat** | anchors+synthetic alone exceed 600 in several bins; only 3,704 neighbours left |
+
+Holdout grew 850 -> 1,696 (hash-bound: all previous members retained, so earlier test_synthetic numbers
+remain comparable as a subset but the split itself changed again). `test` / `test_neighbor` unchanged.
+The frozen `manifest_capped600.jsonl` snapshot still holds the OLD dataset (pre-batch-3) and stays valid
+for the runs recorded in §12; a flat trim-variant on the new data would need a cap >= 894.
+
+Budget at 350/301/50: balanced = 198,800 steps. Synthetic natural share is now 36 % of current train and
+27 % of balanced - the domain-shift exposure has grown accordingly.
+
+Batch-3 trim variant (user request, iterated 1,100 -> **1,000 adopted**): `manifest_capped1000.jsonl` =
+`--current-cap-effective 1000` on the new data. 16 of 19 pair bins at the 1,000 ceiling, valleys
+894-926 (max/min 1.12), 6,680 of 22,993 neighbours dropped, train 35,296 (353 steps/epoch). The old
+`manifest_capped600.jsonl` snapshot (batch-2 data, §12 runs) is kept unchanged for reproducibility.
