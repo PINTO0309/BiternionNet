@@ -33,6 +33,7 @@ OUTPUT_COMPRESSION = 92
 N_IMAGES = 1
 COMPLETION_WINDOW = "24h"
 BATCH_IMAGE_MODEL = "gpt-image-2"
+BATCH_ENQUEUED_TOKEN_LIMIT = 1_000_000
 ALLOWED_SIZES = {"1024x1536", "1024x1024", "1536x1024"}
 DEIM_CROP_MARGIN = 0.05
 PITCH_EDIT_REASONS = {
@@ -132,17 +133,19 @@ def write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
     temporary.replace(path)
 
 
-def read_jsonl(path: Path) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
+def iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
     with path.open(encoding="utf-8") as stream:
         for line_number, line in enumerate(stream, 1):
             try:
-                rows.append(json.loads(line))
+                yield json.loads(line)
             except json.JSONDecodeError as exc:
                 raise PipelineError(
                     f"invalid JSONL at {path}:{line_number}: {exc}"
                 ) from exc
-    return rows
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    return list(iter_jsonl(path))
 
 
 def validate_evaluation_protocol(path: Path) -> dict[str, Any]:
@@ -348,6 +351,20 @@ def _make_prompt(config: dict[str, Any], record: dict[str, Any]) -> str:
             prompt["framing"],
             prompt["realism"],
         ]
+    )
+
+
+def _make_compact_production_prompt(record: dict[str, Any]) -> str:
+    """Keep the production controls while minimizing queued Batch text tokens."""
+    return (
+        f"Photorealistic overhead CCTV: one fictional {record['age']} {record['gender']}; "
+        f"{record['skin_tone']}, {record['hair']}, {record['clothing']}, {record['accessory']}. "
+        f"Camera {record['camera_elevation']:+d}deg above, looking down; crown visible. "
+        f"Head pan {record['signed_pan']:+d}deg ({record['expected_direction']}), "
+        f"pitch {record['head_pitch']:+d}, roll 0; upright neck, never look up. "
+        "One uncropped head, neck, shoulders, upper torso; head 30-40% height, clear margins. "
+        f"{record['scene']}; {record['lighting']}. "
+        "No extra people or faces, legs, text, watermark, CGI, or anatomy defects."
     )
 
 
@@ -696,6 +713,9 @@ def create_plan(
     approved_batch_dir: Path | None = None,
     *,
     bin_counts: list[int] | None = None,
+    direct_production: bool = False,
+    single_batch: bool = False,
+    compact_prompts: bool = False,
 ) -> Path:
     if not batch_id or any(character in batch_id for character in "/\\"):
         raise PipelineError("batch-id must be one safe path component")
@@ -706,11 +726,23 @@ def create_plan(
             f"Batch image generation requires api.model={BATCH_IMAGE_MODEL!r}; "
             "dated GPT-Image-2 snapshots are not accepted by the Batch API"
         )
-    required_parent = {
-        "pilot": "validation",
-        "floor_120": "pilot",
-        "uniform_200": "pilot",
-    }.get(stage)
+    if direct_production and stage != "uniform_200":
+        raise PipelineError("direct production is only allowed for uniform_200")
+    if direct_production and approved_batch_dir is not None:
+        raise PipelineError("direct production cannot also use an approved parent")
+    if direct_production and not single_batch:
+        raise PipelineError("direct production requires --single-batch")
+    if compact_prompts and not direct_production:
+        raise PipelineError("compact prompts require direct production")
+    required_parent = (
+        {
+            "pilot": "validation",
+            "floor_120": "pilot",
+            "uniform_200": "pilot",
+        }.get(stage)
+        if not direct_production
+        else None
+    )
     parent_approval = None
     if required_parent:
         if approved_batch_dir is None:
@@ -734,6 +766,9 @@ def create_plan(
                 f"{stage} planning requires the approved {required_parent} run's actual account cost"
             )
     records = build_plan(config, stage, seed, bin_counts=bin_counts)
+    if compact_prompts:
+        for record in records:
+            record["prompt"] = _make_compact_production_prompt(record)
     for record in records:
         record["custom_id"] = f"{batch_id}--{record['custom_id']}"
         record["filename"] = _image_filename(
@@ -749,7 +784,9 @@ def create_plan(
     run_dir.mkdir(parents=True)
     (run_dir / "images").mkdir()
     write_jsonl(run_dir / PLAN_NAME, records)
-    shard_size = int(config["stages"][stage]["shard_size"])
+    shard_size = (
+        len(records) if single_batch else int(config["stages"][stage]["shard_size"])
+    )
     shards: list[dict[str, Any]] = []
     for shard_index, start in enumerate(range(0, len(records), shard_size)):
         chunk = records[start : start + shard_size]
@@ -820,6 +857,15 @@ def create_plan(
         "planning_cost_per_request_usd": planning_cost,
         "planning_projected_cost_usd": round(planning_cost * len(records), 6),
         "planning_cost_basis": cost_basis,
+        "direct_production": direct_production,
+        "single_batch": single_batch,
+        "prompt_profile": "compact_direct_v1" if compact_prompts else "full_v4",
+        "approval_policy": (
+            "operator_direct_no_human_review"
+            if direct_production
+            else "staged_human_review"
+        ),
+        "intermediate_stages_waived": direct_production,
         "items": {
             row["custom_id"]: {"status": "planned", "filename": row["filename"]}
             for row in records
@@ -933,6 +979,13 @@ def submit_pending(
         raise PipelineError(
             f"explicit approved request count {approved_request_count} does not match pending {pending}"
         )
+    if state.get("stage") == "uniform_200" and not state.get("parent_batch_dir"):
+        if state.get("direct_production") is not True:
+            raise PipelineError(
+                "uniform_200 without a parent requires an explicit direct-production plan"
+            )
+        if state.get("single_batch") is not True or len(state["shards"]) != 1:
+            raise PipelineError("direct production must remain a single Batch")
     cost_per_request = state.get(
         "planning_cost_per_request_usd",
         state.get("reference_cost_per_request_usd", 0.0),
@@ -1057,7 +1110,17 @@ def _valid_image(path: Path, expected_size: str) -> bool:
 
 
 def _qa_edit_reasons(row: dict[str, Any], config: dict[str, Any]) -> list[str]:
-    reasons = [str(value) for value in row.get("quality_gate_reasons") or []]
+    reasons = [
+        str(value)
+        for value in row.get("quality_gate_reasons") or []
+        if str(value) != "direction_conflict"
+    ]
+    if (
+        row.get("label_acceptance_policy_auto")
+        == "direct_all_quality_pass_intent_fallback_v1"
+        and row.get("quality_gate_pass") is True
+    ):
+        return reasons
     abs_pan = int(row["abs_pan_bin"])
     if abs_pan <= 90:
         if row.get("pose_status") != "ok":
@@ -1066,8 +1129,6 @@ def _qa_edit_reasons(row: dict[str, Any], config: dict[str, Any]) -> list[str]:
             row.get("qa_pan_tolerance_deg", config["qa"]["pan_tolerance_deg"])
         ):
             reasons.append("pan_out_of_tolerance")
-    elif not bool(row.get("direction_consistent")):
-        reasons.append("direction_conflict")
     # Match the empirically stable SixD pitch range used by QA calibration.
     # Around side profiles the Euler pitch folds toward 180 degrees.
     if abs_pan <= 60:
@@ -1194,21 +1255,54 @@ def _edit_prompt(
         corrections.append(
             "Recompose slightly wider so the complete detected head occupies 30% to 40% of image height."
         )
-    if "insufficient_margin" in reasons:
-        sides = [
-            side
-            for side in ("left", "right", "top", "bottom")
-            if float(row.get(f"margin_{side}_head_ratio", 0.0)) < 0.5
-        ]
-        side_text = ", ".join(sides) if sides else "every side"
+    if "head_crop_outside_image" in reasons:
+        actual_size = str(row.get("actual_size") or record["size"])
+        image_width, image_height = map(int, actual_size.split("x"))
+        crop_box = row.get("head_square_crop_box_xyxy")
+        if not isinstance(crop_box, list) or len(crop_box) != 4:
+            raise PipelineError(
+                "head_crop_outside_image edit requires the recorded square crop box"
+            )
+        crop_x1, crop_y1, crop_x2, crop_y2 = map(float, crop_box)
+        crop_side = max(crop_x2 - crop_x1, crop_y2 - crop_y1)
+        available_side = min(image_width, image_height)
+        shift_x = max(0.0, -crop_x1) - max(0.0, crop_x2 - image_width)
+        shift_y = max(0.0, -crop_y1) - max(0.0, crop_y2 - image_height)
+        movements: list[str] = []
+        if abs(shift_x) >= 0.01:
+            x_percent = max(3, math.ceil(abs(shift_x) / image_width * 100.0) + 2)
+            movements.append(
+                f"{x_percent}% of the image width toward image-"
+                f"{'right' if shift_x > 0 else 'left'}"
+            )
+        if abs(shift_y) >= 0.01:
+            y_percent = max(3, math.ceil(abs(shift_y) / image_height * 100.0) + 2)
+            movements.append(
+                f"{y_percent}% of the image height "
+                f"{'downward' if shift_y > 0 else 'upward'}"
+            )
+        movement = " and ".join(movements) or "slightly toward the image centre"
+        scale_instruction = "Keep the person's proportions and head size unchanged."
+        if crop_side > available_side:
+            reduction_percent = max(
+                3,
+                math.ceil((crop_side / available_side - 1.0) * 100.0) + 2,
+            )
+            scale_instruction = (
+                "This recorded square is wider than the canvas, so uniformly reduce the entire "
+                f"person by approximately {reduction_percent}% before applying the positional "
+                "shift; preserve all body proportions."
+            )
         corrections.append(
-            f"Expand or reposition the framing at the {side_text} so every image edge is at least "
-            "half a head width or height away from the complete head."
+            "Translate the entire person—head, neck, shoulders, and visible upper torso—together "
+            f"by approximately {movement}. This must be a small positional shift within the same "
+            "canvas, not a crop, zoom, head rotation, pose change, or camera change. "
+            f"{scale_instruction} Naturally reconstruct the small "
+            "background area exposed by the move. After the shift, a square crop centred on the "
+            "detected head with side max(head width, head height) times 1.10 must stay fully inside "
+            "the image, with a small safety clearance from every edge."
         )
-    if any(
-        reason in reasons
-        for reason in ("direction_conflict", "pan_out_of_tolerance", "pose_unusable")
-    ):
+    if any(reason in reasons for reason in ("pan_out_of_tolerance", "pose_unusable")):
         if row.get("pose_status") == "ok" and row.get("estimated_pan_deg") is not None:
             current_pan = float(row["estimated_pan_deg"])
             target_pan = float(record["intent_pan_deg"])
@@ -1305,6 +1399,64 @@ def _chunk_batch_requests(
     return chunks
 
 
+def _token_based_batch_plan(
+    request_count: int,
+    observed_mean_input_tokens: float,
+    *,
+    token_limit: int = BATCH_ENQUEUED_TOKEN_LIMIT,
+) -> dict[str, Any]:
+    if request_count <= 0:
+        raise PipelineError("token-based Batch planning requires requests")
+    if observed_mean_input_tokens <= 0:
+        raise PipelineError("observed mean input tokens must be positive")
+    if token_limit <= 1:
+        raise PipelineError("Batch queued-token limit must exceed one")
+    max_records = max(1, int((token_limit - 1) // observed_mean_input_tokens))
+    batches = math.ceil(request_count / max_records)
+    return {
+        "request_count": request_count,
+        "observed_mean_input_tokens": observed_mean_input_tokens,
+        "expected_total_input_tokens": observed_mean_input_tokens * request_count,
+        "queued_token_limit_exclusive": token_limit,
+        "max_records_per_batch": max_records,
+        "minimum_batch_count": batches,
+    }
+
+
+def _observed_input_token_profile(
+    run_dir: Path, expected_endpoint: str
+) -> dict[str, Any]:
+    state = load_state(run_dir)
+    endpoint_by_custom_id: dict[str, str] = {}
+    for shard in state["shards"]:
+        for attempt in shard["attempts"]:
+            endpoint = str(attempt.get("endpoint", ENDPOINT))
+            for custom_id in attempt.get("custom_ids") or []:
+                endpoint_by_custom_id[str(custom_id)] = endpoint
+    usage_path = run_dir / "usage.jsonl"
+    if not usage_path.exists():
+        raise PipelineError(f"token evidence has no usage.jsonl: {run_dir}")
+    values = [
+        int((row.get("usage") or {}).get("input_tokens") or 0)
+        for row in read_jsonl(usage_path)
+        if endpoint_by_custom_id.get(str(row.get("custom_id"))) == expected_endpoint
+    ]
+    values = [value for value in values if value > 0]
+    if not values:
+        raise PipelineError(
+            f"token evidence has no observed {expected_endpoint} input tokens: {run_dir}"
+        )
+    return {
+        "evidence_run": str(run_dir.resolve()),
+        "usage_path": str(usage_path.resolve()),
+        "usage_sha256": sha256_file(usage_path),
+        "observed_records": len(values),
+        "observed_mean_input_tokens": sum(values) / len(values),
+        "observed_min_input_tokens": min(values),
+        "observed_max_input_tokens": max(values),
+    }
+
+
 def create_edit_cycle(
     parent_run_dir: Path,
     batch_id: str,
@@ -1313,6 +1465,8 @@ def create_edit_cycle(
     max_edit_rounds: int,
     planning_cost_per_request_usd: float,
     include_pitch_calibration_tail: bool = False,
+    edit_token_evidence_run_dir: Path | None = None,
+    only_edit_reasons: set[str] | None = None,
 ) -> Path:
     if not batch_id or any(character in batch_id for character in "/\\"):
         raise PipelineError("batch-id must be one safe path component")
@@ -1397,6 +1551,8 @@ def create_edit_cycle(
         record = records_by_id[old_to_new[parent_id]]
         row = qa_rows[parent_id]
         reasons = _qa_edit_reasons(row, config)
+        if only_edit_reasons is not None:
+            reasons = [reason for reason in reasons if reason in only_edit_reasons]
         if parent_id in calibration_tail_ids:
             reasons = list(dict.fromkeys([*reasons, "pitch_calibration_tail"]))
         parent_item = parent_state.get("items", {}).get(parent_id, {})
@@ -1464,12 +1620,37 @@ def create_edit_cycle(
         raise PipelineError("auto QA found no actionable image edit candidates")
     write_jsonl(run_dir / "edit_lineage.jsonl", lineage)
 
-    shard_size = int(config["stages"][parent_state["stage"]]["shard_size"])
+    direct_production = bool(parent_state.get("direct_production"))
+    token_batch_plans: dict[str, dict[str, Any]] = {}
+    max_records_by_endpoint: dict[str, int] = {}
+    if direct_production:
+        for endpoint, requests in requests_by_endpoint.items():
+            if not requests:
+                continue
+            evidence_run = (
+                parent_run_dir
+                if endpoint == ENDPOINT
+                else (edit_token_evidence_run_dir or parent_run_dir)
+            )
+            profile = _observed_input_token_profile(evidence_run, endpoint)
+            plan = _token_based_batch_plan(
+                len(requests), profile["observed_mean_input_tokens"]
+            )
+            token_batch_plans[endpoint] = {**profile, **plan}
+            max_records_by_endpoint[endpoint] = int(plan["max_records_per_batch"])
+    else:
+        configured_shard_size = int(
+            config["stages"][parent_state["stage"]]["shard_size"]
+        )
+        for endpoint, requests in requests_by_endpoint.items():
+            if requests:
+                max_records_by_endpoint[endpoint] = configured_shard_size
     shards: list[dict[str, Any]] = []
     shard_index = 0
     for endpoint in (EDIT_ENDPOINT, ENDPOINT):
         for chunk in _chunk_batch_requests(
-            requests_by_endpoint[endpoint], max_records=shard_size
+            requests_by_endpoint[endpoint],
+            max_records=max_records_by_endpoint.get(endpoint, 1),
         ):
             input_name = f"batch_input_{shard_index:03d}_attempt_00.jsonl"
             input_path = run_dir / input_name
@@ -1522,6 +1703,11 @@ def create_edit_cycle(
         "parent_plan_sha256": parent_state["plan_sha256"],
         "parent_qa_sha256": sha256_file(qa_path),
         "parent_approval_sha256": None,
+        "direct_production": direct_production,
+        "approval_policy": parent_state.get("approval_policy"),
+        "intermediate_stages_waived": bool(
+            parent_state.get("intermediate_stages_waived")
+        ),
         "edit_round": edit_round,
         "max_edit_rounds": max_edit_rounds,
         "target_count": len(records),
@@ -1538,7 +1724,11 @@ def create_edit_cycle(
         "planning_projected_cost_usd": round(
             float(planning_cost_per_request_usd) * selected_count, 6
         ),
-        "planning_cost_basis": "user_conservative_edit_estimate",
+        "planning_cost_basis": "operator_supplied_observed_edit_cost",
+        "token_batch_plans": token_batch_plans,
+        "edit_reason_filter": (
+            sorted(only_edit_reasons) if only_edit_reasons is not None else None
+        ),
         "forced_edit_policy": (
             {
                 "type": "pitch_calibration_tail",
@@ -1564,7 +1754,7 @@ def process_output_jsonl(
 ) -> tuple[set[str], list[dict[str, Any]]]:
     changed: set[str] = set()
     usage_rows: list[dict[str, Any]] = []
-    for line_number, row in enumerate(read_jsonl(path), 1):
+    for line_number, row in enumerate(iter_jsonl(path), 1):
         custom_id = row.get("custom_id")
         try:
             if custom_id not in plan:
@@ -1621,14 +1811,22 @@ def process_output_jsonl(
 
 
 def _process_error_jsonl(path: Path, state: dict[str, Any]) -> None:
-    for row in read_jsonl(path):
+    for row in iter_jsonl(path):
         custom_id = row.get("custom_id")
         if (
             custom_id in state["items"]
             and state["items"][custom_id].get("status") != "success"
         ):
+            response = row.get("response") or {}
+            body = response.get("body") or {}
+            error = row.get("error") or body.get("error")
             state["items"][custom_id].update(
-                {"status": "api_error", "api_error": row.get("error")}
+                {
+                    "status": "api_error",
+                    "api_error": error,
+                    "api_status_code": response.get("status_code"),
+                    "api_request_id": response.get("request_id"),
+                }
             )
 
 

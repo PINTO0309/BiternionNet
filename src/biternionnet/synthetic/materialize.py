@@ -1,9 +1,10 @@
-"""Materialize approved synthetic heads at the native TownCentre size distribution."""
+"""Materialize accepted synthetic heads at the native TownCentre size distribution."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import random
 from collections import Counter
@@ -23,19 +24,37 @@ from .generate import (
     sha256_file,
     write_jsonl,
 )
+from .landmarks import crop_transform
+from .qa import (
+    DIRECT_ALL_QUALITY_LABEL_POLICY,
+    QA_IMPLEMENTATION_VERSION,
+    config_from_recorded_qa_policy,
+)
+
+DIRECT_ANNOTATIONS_NAME = "accepted_annotations.jsonl"
+ELEVATION_CLASSES = {"high_angle_match", "eye_level_or_low_angle", "unresolved"}
 
 
-def expanded_crop(image: np.ndarray, box: list[float], margin: float) -> np.ndarray:
+def square_head_crop(image: np.ndarray, box: list[float], margin: float) -> np.ndarray:
+    """Crop the DEIM head as a long-side square with fixed per-side margin."""
     height, width = image.shape[:2]
-    x1, y1, x2, y2 = map(float, box)
-    box_width, box_height = x2 - x1, y2 - y1
-    left = max(0, int(round(x1 - box_width * margin)))
-    right = min(width, int(round(x2 + box_width * margin)))
-    top = max(0, int(round(y1 - box_height * margin)))
-    bottom = min(height, int(round(y2 + box_height * margin)))
-    if right <= left or bottom <= top:
-        raise PipelineError("head crop is empty")
-    return image[top:bottom, left:right]
+    try:
+        _, crop_box = crop_transform(box, pad=margin)
+    except ValueError as exc:
+        raise PipelineError(str(exc)) from exc
+    crop_side = crop_box[2] - crop_box[0]
+    side_px = max(1, int(round(crop_side)))
+    centre_x = (crop_box[0] + crop_box[2]) / 2.0
+    centre_y = (crop_box[1] + crop_box[3]) / 2.0
+    left = int(round(centre_x - side_px / 2.0))
+    top = int(round(centre_y - side_px / 2.0))
+    right, bottom = left + side_px, top + side_px
+    if left < 0 or top < 0 or right > width or bottom > height:
+        raise PipelineError("5% long-side square head crop extends outside image")
+    crop = image[top:bottom, left:right]
+    if crop.shape[0] != side_px or crop.shape[1] != side_px:
+        raise PipelineError("square head crop has inconsistent dimensions")
+    return crop
 
 
 def _real_sizes(manifest: Path) -> list[tuple[int, int]]:
@@ -182,19 +201,119 @@ def _atomic_combined_manifest(
     temporary.replace(output)
 
 
-def materialize_run(
-    run_dir: Path,
-    *,
-    output_root: Path,
-    anchor_manifest: Path,
-    neighbour_manifest: Path,
-    seed: int = 20260831,
-) -> dict[str, Any]:
-    state = load_state(run_dir)
-    config = load_config(Path(state["config_path"]))
+def _direct_production_annotations(
+    run_dir: Path, state: dict[str, Any], config: dict[str, Any]
+) -> tuple[list[dict[str, Any]], Path]:
+    """Normalize operator-promoted automatic QA into accepted annotations."""
+    if (
+        state.get("direct_production") is not True
+        or state.get("approval_policy") != "operator_direct_no_human_review"
+    ):
+        raise PipelineError("human approval is required before materialization")
+    qa_path = run_dir / "auto_qa.jsonl"
+    report_path = run_dir / "qa_report.json"
+    if not qa_path.exists() or not report_path.exists():
+        raise PipelineError("automatic QA and its report are required")
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    if (
+        report.get("direct_production") is not True
+        or report.get("qa_implementation_version") != QA_IMPLEMENTATION_VERSION
+        or report.get("label_acceptance_policy_auto") != DIRECT_ALL_QUALITY_LABEL_POLICY
+    ):
+        raise PipelineError("direct-production labels were not operator-promoted")
+    config_from_recorded_qa_policy(config, report)
+    expected_model_hashes = {
+        "detector_sha256": config["models"]["deimv2"]["sha256"],
+        "pose_sha256": config["models"]["sixdrepnet360"]["sha256"],
+        "landmark_sha256": config["models"]["hrffa_vitl_ibug68"]["sha256"],
+    }
+    for key, expected in expected_model_hashes.items():
+        if report.get(key) != expected:
+            raise PipelineError(f"QA report does not bind the configured {key}")
+    calibration_path = Path(str(report.get("calibration_path", "")))
+    if not calibration_path.is_file() or report.get(
+        "calibration_sha256"
+    ) != sha256_file(calibration_path):
+        raise PipelineError("QA pitch calibration is unavailable or changed")
+
+    source_rows = [
+        json.loads(line)
+        for line in qa_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    total = len(source_rows)
+    promotion = report.get("operator_label_promotion")
+    if (
+        report.get("total") != total
+        or report.get("quality_pass") != total
+        or report.get("pan_quality_pass_auto") != total
+        or not isinstance(promotion, dict)
+        or promotion.get("policy") != DIRECT_ALL_QUALITY_LABEL_POLICY
+        or promotion.get("total_accepted") != total
+    ):
+        raise PipelineError("direct-production QA report does not accept every image")
+
+    accepted_rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in source_rows:
+        custom_id = str(row.get("custom_id", ""))
+        if not custom_id or custom_id in seen:
+            raise PipelineError("automatic QA has a missing or duplicate custom_id")
+        seen.add(custom_id)
+        if (
+            row.get("quality_gate_pass") is not True
+            or row.get("pan_quality_pass_auto") is not True
+            or row.get("label_acceptance_policy_auto")
+            != DIRECT_ALL_QUALITY_LABEL_POLICY
+        ):
+            raise PipelineError(f"automatic QA row is not accepted: {custom_id}")
+        angle = row.get("angle_deg_auto")
+        confidence = row.get("label_confidence_auto")
+        label_source = row.get("label_source_auto")
+        elevation = row.get("camera_elevation_class_auto")
+        if (
+            not isinstance(angle, (int, float))
+            or not math.isfinite(float(angle))
+            or not isinstance(confidence, (int, float))
+            or float(confidence) <= 0.0
+            or not isinstance(label_source, str)
+            or not label_source
+            or elevation not in ELEVATION_CLASSES
+        ):
+            raise PipelineError(f"accepted label is incomplete: {custom_id}")
+        accepted_rows.append(
+            {
+                **row,
+                "pan_quality_pass": True,
+                "angle_deg": float(angle) % 360.0,
+                "label_source": label_source,
+                "label_confidence": float(confidence),
+                "camera_elevation_class": elevation,
+                "counts_toward_high_angle_quota": bool(
+                    row.get("counts_toward_high_angle_quota_auto")
+                ),
+                "annotation_acceptance_source": (
+                    "direct_production_operator_promoted_auto_qa"
+                ),
+            }
+        )
+    accepted_path = run_dir / DIRECT_ANNOTATIONS_NAME
+    write_jsonl(accepted_path, accepted_rows)
+    return accepted_rows, accepted_path
+
+
+def _materialization_annotations(
+    run_dir: Path, state: dict[str, Any], config: dict[str, Any]
+) -> tuple[list[dict[str, Any]], float, str, Path]:
     approval_path = run_dir / "approval.json"
     if not approval_path.exists():
-        raise PipelineError("human approval is required before materialization")
+        rows, annotations_path = _direct_production_annotations(run_dir, state, config)
+        return (
+            rows,
+            DEIM_CROP_MARGIN,
+            "direct_operator_promoted_auto_qa",
+            annotations_path,
+        )
     approval = json.loads(approval_path.read_text(encoding="utf-8"))
     if approval.get("approved") is not True:
         raise PipelineError("run is not approved")
@@ -214,7 +333,24 @@ def materialize_run(
     rows = [
         json.loads(line)
         for line in annotations_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
     ]
+    return rows, margin, "human_approved", annotations_path
+
+
+def materialize_run(
+    run_dir: Path,
+    *,
+    output_root: Path,
+    anchor_manifest: Path,
+    neighbour_manifest: Path,
+    seed: int = 20260831,
+) -> dict[str, Any]:
+    state = load_state(run_dir)
+    config = load_config(Path(state["config_path"]))
+    rows, margin, annotation_source, annotations_path = _materialization_annotations(
+        run_dir, state, config
+    )
     sizes = _real_sizes(anchor_manifest)
     crops_dir = output_root / "crops"
     crops_dir.mkdir(parents=True, exist_ok=True)
@@ -230,8 +366,10 @@ def materialize_run(
                 {"custom_id": row["custom_id"], "reason": "missing_image_or_head_box"}
             )
             continue
+        if row.get("sha256") and row["sha256"] != sha256_file(source):
+            raise PipelineError(f"QA-bound image changed: {row['custom_id']}")
         try:
-            crop = expanded_crop(image, row["head_box_xyxy"], margin)
+            crop = square_head_crop(image, row["head_box_xyxy"], margin)
         except PipelineError as exc:
             rejected.append({"custom_id": row["custom_id"], "reason": str(exc)})
             continue
@@ -271,6 +409,8 @@ def materialize_run(
                 "sha256": sha256_file(output_path),
                 "native_height": target_height,
                 "native_width": target_width,
+                "source_crop_rule": "deim_long_side_square_5pct_per_side",
+                "annotation_acceptance_source": annotation_source,
             }
         )
     output_root.mkdir(parents=True, exist_ok=True)
@@ -293,17 +433,23 @@ def materialize_run(
     all_rows = [existing[key] for key in sorted(existing)]
     high_rows = [row for row in all_rows if row["counts_toward_high_angle_quota"]]
     write_jsonl(annotations_store, all_rows)
-    write_jsonl(output_root / "manifest.jsonl", all_rows)
-    write_jsonl(output_root / "manifest_high_angle.jsonl", high_rows)
+    all_manifest = output_root / "manifest.jsonl"
+    high_manifest = output_root / "manifest_high_angle.jsonl"
+    combined_high_manifest = neighbour_manifest.parent / "manifest_nb3_synthetic.jsonl"
+    combined_all_manifest = (
+        neighbour_manifest.parent / "manifest_nb3_synthetic_all_elevations.jsonl"
+    )
+    write_jsonl(all_manifest, all_rows)
+    write_jsonl(high_manifest, high_rows)
     _atomic_combined_manifest(
         neighbour_manifest,
         high_rows,
-        neighbour_manifest.parent / "manifest_nb3_synthetic.jsonl",
+        combined_high_manifest,
     )
     _atomic_combined_manifest(
         neighbour_manifest,
         all_rows,
-        neighbour_manifest.parent / "manifest_nb3_synthetic_all_elevations.jsonl",
+        combined_all_manifest,
     )
     real_paths = _real_training_paths(anchor_manifest)
     synthetic_paths = [output_root / row["image"] for row in all_rows]
@@ -331,12 +477,21 @@ def materialize_run(
         "run_id": state["local_batch_id"],
         "materialized_this_run": len(run_manifest_rows),
         "materialized_total": len(all_rows),
+        "all_elevations_trainable_total": len(all_rows),
         "high_angle_total": len(high_rows),
         "elevation_counts": dict(
             Counter(row["camera_elevation_class"] for row in all_rows)
         ),
         "rejected": rejected,
         "crop_margin": margin,
+        "crop_rule": "max(head_box_width,head_box_height)*(1+2*margin) square",
+        "annotation_source": annotation_source,
+        "source_annotations": str(annotations_path),
+        "source_annotations_sha256": sha256_file(annotations_path),
+        "all_elevations_manifest": str(all_manifest),
+        "high_angle_manifest": str(high_manifest),
+        "combined_all_elevations_manifest": str(combined_all_manifest),
+        "combined_high_angle_manifest": str(combined_high_manifest),
         "anchor_manifest": str(anchor_manifest),
         "anchor_manifest_sha256": sha256_file(anchor_manifest),
         "neighbour_manifest": str(neighbour_manifest),
@@ -408,7 +563,7 @@ def render_deim_crop_margin_sheet(
         if image is None:
             continue
         for column, margin in enumerate(margins):
-            crop = expanded_crop(image, row["head_box_xyxy"], margin)
+            crop = square_head_crop(image, row["head_box_xyxy"], margin)
             thumb = cv2.resize(crop, (cell, cell), interpolation=cv2.INTER_AREA)
             left = (column + 1) * cell
             canvas[row_index * cell : (row_index + 1) * cell, left : left + cell] = (

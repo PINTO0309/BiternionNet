@@ -30,6 +30,7 @@ from .qa import (
     approve_human_review,
     config_from_recorded_qa_policy,
     prepare_human_review,
+    promote_direct_production_labels,
     run_auto_qa,
 )
 from .quotas import top_up_plan
@@ -54,6 +55,27 @@ def plan_command(
     bin_counts: Optional[str] = typer.Option(
         None, help="Optional comma-separated 19-bin top-up request counts."
     ),
+    direct_production: bool = typer.Option(
+        False,
+        "--direct-production",
+        help=(
+            "Plan uniform_200 directly without Validation/Pilot parent approval. "
+            "This is an explicit operator waiver of intermediate and human gates."
+        ),
+    ),
+    single_batch: bool = typer.Option(
+        False,
+        "--single-batch",
+        help="Write all planned requests to one Batch input file.",
+    ),
+    compact_prompts: bool = typer.Option(
+        False,
+        "--compact-prompts",
+        help=(
+            "Use the compact production prompt profile to fit an account's queued-token limit. "
+            "Only valid with --direct-production."
+        ),
+    ),
 ) -> None:
     counts = [int(value) for value in bin_counts.split(",")] if bin_counts else None
     run_dir = create_plan(
@@ -64,6 +86,9 @@ def plan_command(
         seed,
         approved_batch_dir,
         bin_counts=counts,
+        direct_production=direct_production,
+        single_batch=single_batch,
+        compact_prompts=compact_prompts,
     )
     state = load_state(run_dir)
     _print(
@@ -79,6 +104,9 @@ def plan_command(
             ],
             "planning_projected_cost_usd": state["planning_projected_cost_usd"],
             "planning_cost_basis": state["planning_cost_basis"],
+            "direct_production": state["direct_production"],
+            "single_batch": state["single_batch"],
+            "prompt_profile": state["prompt_profile"],
             "paid_request_submitted": False,
         }
     )
@@ -91,7 +119,7 @@ def edit_plan_command(
     planning_cost_per_request_usd: float = typer.Option(
         ...,
         min=0.001,
-        help="Conservative per-edit cost used for the explicit submission spend guard.",
+        help="Observed per-edit cost used for the explicit submission spend guard.",
     ),
     max_edit_rounds: int = typer.Option(2, min=1, max=8),
     include_pitch_calibration_tail: bool = typer.Option(
@@ -99,6 +127,24 @@ def edit_plan_command(
         help="Also edit the two Validation records controlling a failed pitch-calibration tail.",
     ),
     output_root: Path = typer.Option(Path("data/synthetic")),
+    edit_token_evidence_run: Optional[Path] = typer.Option(
+        None,
+        "--edit-token-evidence-run",
+        exists=True,
+        file_okay=False,
+        help=(
+            "Completed image-edit run whose observed input-token mean determines "
+            "the minimum number of future edit Batches."
+        ),
+    ),
+    only_reason: Optional[list[str]] = typer.Option(
+        None,
+        "--only-reason",
+        help=(
+            "Edit only records carrying this QA reason. Repeat the option to "
+            "select more than one reason."
+        ),
+    ),
 ) -> None:
     run_dir = create_edit_cycle(
         parent_batch_dir,
@@ -107,6 +153,8 @@ def edit_plan_command(
         max_edit_rounds=max_edit_rounds,
         planning_cost_per_request_usd=planning_cost_per_request_usd,
         include_pitch_calibration_tail=include_pitch_calibration_tail,
+        edit_token_evidence_run_dir=edit_token_evidence_run,
+        only_edit_reasons=set(only_reason) if only_reason else None,
     )
     state = load_state(run_dir)
     _print(
@@ -118,6 +166,7 @@ def edit_plan_command(
             "planning_projected_cost_usd": state["planning_projected_cost_usd"],
             "planning_cost_basis": state["planning_cost_basis"],
             "forced_edit_policy": state.get("forced_edit_policy"),
+            "edit_reason_filter": state.get("edit_reason_filter"),
             "paid_request_submitted": False,
         }
     )
@@ -216,6 +265,14 @@ def qa_command(
 @app.command("review-prepare")
 def review_prepare_command(batch_dir: Path = typer.Option(..., exists=True)) -> None:
     _print(prepare_human_review(batch_dir))
+
+
+@app.command("promote-direct-labels")
+def promote_direct_labels_command(
+    batch_dir: Path = typer.Option(..., exists=True, file_okay=False),
+) -> None:
+    """Accept every quality-passed direct-production image as labelled data."""
+    _print(promote_direct_production_labels(batch_dir))
 
 
 @app.command("margin-sheet")

@@ -31,7 +31,7 @@ from .generate import (
     wrap180,
     write_jsonl,
 )
-from .landmarks import HRFFAViTL, landmark_annotation
+from .landmarks import HRFFAViTL, crop_transform, landmark_annotation
 from .ort_policy import OnnxProviderPlan, build_provider_plan
 from .pose import SixDRepNet360
 
@@ -61,6 +61,8 @@ INTENT_VALUES = {"match", "off-by-one-bin", "wrong"}
 ELEVATION_VALUES = {"high_angle_match", "eye_level_or_low_angle", "unresolved"}
 LANDMARK_ALIGNMENT_VALUES = {"match", "mismatch", "unresolved"}
 QA_POLICY_SCHEMA_VERSION = 1
+QA_IMPLEMENTATION_VERSION = 4
+DIRECT_ALL_QUALITY_LABEL_POLICY = "direct_all_quality_pass_intent_fallback_v1"
 QA_POLICY_KEYS = {
     "schema_version",
     "pan_tolerance_deg",
@@ -169,6 +171,112 @@ def config_from_recorded_qa_policy(
     return effective
 
 
+def _load_reusable_parent_qa(
+    state: dict[str, Any],
+    qa_policy: dict[str, Any],
+    *,
+    target_count: int,
+    calibration_path: Path | None,
+    detector_sha256: str | None,
+    pose_sha256: str | None,
+    landmark_sha256: str | None,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """Load passed carry-forward QA rows without running model inference again."""
+    parent_value = state.get("parent_batch_dir")
+    if not parent_value or not state.get("edit_round"):
+        return {}, {
+            "parent_batch_dir": None,
+            "reused_passed_records": 0,
+            "evaluated_current_run_records": target_count,
+            "compatibility": "not_applicable",
+        }
+
+    parent_dir = Path(parent_value).resolve()
+    parent_qa_path = parent_dir / "auto_qa.jsonl"
+    parent_report_path = parent_dir / "qa_report.json"
+    if not parent_qa_path.exists() or not parent_report_path.exists():
+        raise PipelineError(
+            "edit-run QA requires the parent auto_qa.jsonl and qa_report.json"
+        )
+    expected_parent_qa_sha256 = state.get("parent_qa_sha256")
+    if (
+        not isinstance(expected_parent_qa_sha256, str)
+        or sha256_file(parent_qa_path) != expected_parent_qa_sha256
+    ):
+        raise PipelineError("parent automatic QA changed after edit-cycle planning")
+
+    parent_rows = {
+        row["custom_id"]: row
+        for row in (
+            json.loads(line)
+            for line in parent_qa_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+    }
+    items = state.get("items")
+    if not isinstance(items, dict):
+        raise PipelineError("edit-run state does not contain per-image lineage items")
+    candidate_pairs: list[tuple[str, str]] = []
+    for child_id, item in items.items():
+        if not isinstance(item, dict) or item.get("operation") != "carry_forward":
+            continue
+        parent_id = item.get("parent_custom_id")
+        parent_row = parent_rows.get(parent_id)
+        if parent_row is not None and parent_row.get("quality_gate_pass") is True:
+            candidate_pairs.append((str(child_id), str(parent_id)))
+    if not candidate_pairs:
+        return {}, {
+            "parent_batch_dir": str(parent_dir),
+            "reused_passed_records": 0,
+            "evaluated_current_run_records": target_count,
+            "compatibility": "no_passed_carry_forward_records",
+        }
+
+    parent_report = json.loads(parent_report_path.read_text(encoding="utf-8"))
+    incompatibilities: list[str] = []
+    if parent_report.get("qa_implementation_version") != QA_IMPLEMENTATION_VERSION:
+        incompatibilities.append("QA implementation version")
+    if parent_report.get("qa_policy") != qa_policy:
+        incompatibilities.append("QA policy")
+    current_hashes = {
+        "detector_sha256": detector_sha256,
+        "pose_sha256": pose_sha256,
+        "landmark_sha256": landmark_sha256,
+    }
+    for key, expected in current_hashes.items():
+        if parent_report.get(key) != expected:
+            incompatibilities.append(key)
+    if state.get("stage") != "validation":
+        if calibration_path is None or not calibration_path.exists():
+            incompatibilities.append("pitch calibration")
+        elif parent_report.get("calibration_sha256") != sha256_file(calibration_path):
+            incompatibilities.append("pitch calibration")
+    if incompatibilities:
+        details = ", ".join(dict.fromkeys(incompatibilities))
+        raise PipelineError(
+            f"refusing to re-evaluate {len(candidate_pairs)} passed carry-forward "
+            f"records because parent QA is incompatible: {details}"
+        )
+
+    reusable = {
+        child_id: parent_rows[parent_id] for child_id, parent_id in candidate_pairs
+    }
+    return reusable, {
+        "parent_batch_dir": str(parent_dir),
+        "reused_passed_records": len(reusable),
+        "evaluated_current_run_records": max(0, target_count - len(reusable)),
+        "compatibility": "matched",
+        "requirements": [
+            "parent_auto_qa_sha256",
+            "image_sha256",
+            "qa_implementation_version",
+            "qa_policy",
+            "pitch_calibration",
+            "model_sha256s",
+        ],
+    }
+
+
 def _iou(left: list[float], right: list[float]) -> float:
     x1, y1 = max(left[0], right[0]), max(left[1], right[1])
     x2, y2 = min(left[2], right[2]), min(left[3], right[3])
@@ -199,7 +307,10 @@ def direction_consistent(
 
 
 def _detection_annotation(
-    image: np.ndarray, detections: list[list[float]]
+    image: np.ndarray,
+    detections: list[list[float]],
+    *,
+    crop_margin: float,
 ) -> dict[str, Any]:
     height, width = image.shape[:2]
     heads = [row for row in detections if int(row[0]) == CLASS_HEAD]
@@ -214,6 +325,13 @@ def _detection_annotation(
     head = max(heads, key=lambda row: row[5])
     box = [float(value) for value in head[1:5]]
     head_width, head_height = box[2] - box[0], box[3] - box[1]
+    _, square_crop_box = crop_transform(box, pad=crop_margin)
+    square_crop_within_image = (
+        square_crop_box[0] >= 0.0
+        and square_crop_box[1] >= 0.0
+        and square_crop_box[2] <= width
+        and square_crop_box[3] <= height
+    )
     directions = [row for row in detections if int(row[0]) in DIR8_CLASSES]
     direction = (
         max(directions, key=lambda row: _iou(box, row[1:5])) if directions else None
@@ -224,6 +342,11 @@ def _detection_annotation(
         "head_count": len(heads),
         "body_count": len(bodies),
         "head_box_xyxy": [round(value, 2) for value in box],
+        "head_square_crop_box_xyxy": [
+            round(float(value), 3) for value in square_crop_box
+        ],
+        "head_square_crop_margin": float(crop_margin),
+        "head_square_crop_within_image": square_crop_within_image,
         "head_score": float(head[5]),
         "body_box_xyxy": [round(float(value), 2) for value in body[1:5]]
         if body
@@ -270,21 +393,15 @@ def quality_reasons(
                 reasons.append("head_too_small")
             elif float(ratio) > float(limits["max"]):
                 reasons.append("head_too_large")
-        margin_limit = float(qa["margin_min_head_ratio"])
-        margins = [
-            row.get("margin_left_head_ratio"),
-            row.get("margin_right_head_ratio"),
-            row.get("margin_top_head_ratio"),
-            row.get("margin_bottom_head_ratio"),
-        ]
-        if any(value is None or float(value) < margin_limit for value in margins):
-            reasons.append("insufficient_margin")
+        if not row.get("head_square_crop_within_image"):
+            reasons.append("head_crop_outside_image")
         # Body detection is used only to require neck/shoulder/upper-torso context.
         # Lower-body anatomy is outside this head-crop QA contract.
         if qa["require_body_detection"] and not row.get("body_count"):
             reasons.append("body_not_detected")
-        if not row.get("direction_consistent"):
-            reasons.append("direction_conflict")
+        # DEIM direction remains a recorded diagnostic. It is not an
+        # acceptance gate because image-generation direction classes are too
+        # unstable for production filtering.
     return reasons, detector_complete
 
 
@@ -392,9 +509,8 @@ def rear_reliability_policy(
             "reviewed": count,
             "sixd_within_tolerance_ratio": agreement,
             "deim_conflict_ratio": conflicts,
-            "sixd_allowed": stage == "pilot"
-            and agreement >= agreement_min
-            and conflicts <= conflict_max,
+            "sixd_allowed": stage == "pilot" and agreement >= agreement_min,
+            "deim_conflict_gate_active": False,
         }
     return {
         "schema_version": 1,
@@ -402,6 +518,7 @@ def rear_reliability_policy(
         "pan_tolerance_deg": tolerance,
         "minimum_sixd_agreement": agreement_min,
         "maximum_deim_conflict": conflict_max,
+        "deim_conflict_gate_active": False,
         "sectors": sectors,
         "fallback": "intent_rear_with_deim_and_human_intent_review",
     }
@@ -537,6 +654,7 @@ def run_auto_qa(
     cpu: bool = False,
 ) -> dict[str, Any]:
     state = load_state(run_dir)
+    direct_production = bool(state.get("direct_production"))
     generation_config = load_config(Path(state["config_path"]))
     config, qa_policy = effective_qa_config(generation_config, qa_policy_path)
     plan = list(read_plan(run_dir, state).values())
@@ -594,10 +712,41 @@ def run_auto_qa(
         landmarks = HRFFAViTL(
             landmark_model, providers=landmark_provider_plan.providers
         )
+    reusable_parent_rows, qa_reuse = _load_reusable_parent_qa(
+        state,
+        qa_policy,
+        target_count=len(plan),
+        calibration_path=calibration_path,
+        detector_sha256=detector_sha256,
+        pose_sha256=pose_sha256,
+        landmark_sha256=landmark_sha256,
+    )
     images: dict[str, np.ndarray] = {}
     rows: list[dict[str, Any]] = []
     for record in plan:
         path = run_dir / "images" / record["filename"]
+        parent_row = reusable_parent_rows.get(record["custom_id"])
+        if parent_row is not None:
+            digest = sha256_file(path) if path.exists() else None
+            if digest is None or digest != parent_row.get("sha256"):
+                raise PipelineError(
+                    f"passed carry-forward image changed: {record['custom_id']}"
+                )
+            row = deepcopy(parent_row)
+            row.update(
+                {
+                    "custom_id": record["custom_id"],
+                    "filename": record["filename"],
+                    "abs_pan_bin": record["abs_pan_bin"],
+                    "intent_pan_deg": record["intent_pan_deg"],
+                    "camera_elevation": record["camera_elevation"],
+                    "expected_direction": record["expected_direction"],
+                    "qa_reused_from_parent": True,
+                    "qa_reused_parent_custom_id": parent_row["custom_id"],
+                }
+            )
+            rows.append(row)
+            continue
         row: dict[str, Any] = {
             "custom_id": record["custom_id"],
             "filename": record["filename"],
@@ -611,6 +760,8 @@ def run_auto_qa(
             "actual_size": None,
             "sha256": None,
             "duplicate_of": None,
+            "qa_reused_from_parent": False,
+            "qa_reused_parent_custom_id": None,
         }
         if path.exists():
             try:
@@ -632,17 +783,24 @@ def run_auto_qa(
         for record in present:
             found = detector.infer(images[record["custom_id"]])
             rows[record["serial"] - 1].update(
-                _detection_annotation(images[record["custom_id"]], found)
+                _detection_annotation(
+                    images[record["custom_id"]],
+                    found,
+                    crop_margin=float(config["qa"]["deim_crop_margin"]),
+                )
             )
     else:
         for row in rows:
-            row["detector_status"] = "skipped"
+            if not row["qa_reused_from_parent"]:
+                row["detector_status"] = "skipped"
     hashes: dict[str, str] = {}
     for row in rows:
         digest = row.get("sha256")
         row["duplicate_of"] = hashes.get(digest) if digest else None
         if digest:
             hashes.setdefault(digest, row["custom_id"])
+        if row["qa_reused_from_parent"]:
+            continue
         row["direction_bin_distance"] = direction_bin_distance(
             row.get("direction"), row.get("expected_direction")
         )
@@ -732,7 +890,7 @@ def run_auto_qa(
         calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
         if not calibration.get("valid"):
             raise PipelineError("pitch calibration is not valid")
-        if state.get("parent_batch_dir"):
+        if state.get("parent_batch_dir") and not direct_production:
             parent_approval = json.loads(
                 (Path(state["parent_batch_dir"]) / "approval.json").read_text(
                     encoding="utf-8"
@@ -745,39 +903,65 @@ def run_auto_qa(
                     "QA calibration does not match the approved parent calibration"
                 )
     rear_policy: dict[str, Any] | None = None
+    rear_policy_mode = "not_applicable"
     if state["stage"] in {"floor_120", "uniform_200"}:
-        if rear_policy_path is None or not rear_policy_path.exists():
-            raise PipelineError(
-                "quota-fill QA requires --rear-policy from approved Pilot"
+        if direct_production:
+            if rear_policy_path is not None:
+                raise PipelineError(
+                    "direct-production QA uses intent rear labels without a DEIM "
+                    "direction gate; do not pass --rear-policy"
+                )
+            rear_policy_mode = "direct_all_quality_intent_fallback"
+        else:
+            if rear_policy_path is None or not rear_policy_path.exists():
+                raise PipelineError(
+                    "quota-fill QA requires --rear-policy from approved Pilot"
+                )
+            rear_policy = json.loads(rear_policy_path.read_text(encoding="utf-8"))
+            if rear_policy.get("source_stage") != "pilot":
+                raise PipelineError("rear policy must come from Pilot")
+            parent_approval = json.loads(
+                (Path(state["parent_batch_dir"]) / "approval.json").read_text(
+                    encoding="utf-8"
+                )
             )
-        rear_policy = json.loads(rear_policy_path.read_text(encoding="utf-8"))
-        if rear_policy.get("source_stage") != "pilot":
-            raise PipelineError("rear policy must come from Pilot")
-        parent_approval = json.loads(
-            (Path(state["parent_batch_dir"]) / "approval.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        if parent_approval.get("rear_label_policy_sha256") != sha256_file(
-            rear_policy_path
-        ):
-            raise PipelineError("rear policy does not match approved Pilot")
+            if parent_approval.get("rear_label_policy_sha256") != sha256_file(
+                rear_policy_path
+            ):
+                raise PipelineError("rear policy does not match approved Pilot")
+            rear_policy_mode = "approved_pilot_policy"
     tolerance = float(config["qa"]["pan_tolerance_deg"])
     for row in rows:
+        if row["qa_reused_from_parent"]:
+            continue
         elevation_class, counts = classify_elevation(row, calibration, config)
         row["camera_elevation_class_auto"] = elevation_class
         row["counts_toward_high_angle_quota_auto"] = counts
+        row["label_promoted_auto"] = False
+        row["label_promotion_reason_auto"] = None
+        row["label_acceptance_policy_auto"] = (
+            DIRECT_ALL_QUALITY_LABEL_POLICY if direct_production else "strict"
+        )
         if int(row["abs_pan_bin"]) <= 90:
             pose_pan_pass = (
                 row.get("pose_status") == "ok"
                 and float(row["pan_error_deg"]) <= tolerance
             )
-            row["label_source_auto"] = "sixdrepnet360" if pose_pan_pass else None
-            row["angle_deg_auto"] = (
-                row.get("estimated_pan_deg") if pose_pan_pass else None
-            )
+            if pose_pan_pass:
+                row["label_source_auto"] = "sixdrepnet360"
+                row["angle_deg_auto"] = row.get("estimated_pan_deg")
+            elif direct_production and row["quality_gate_pass"]:
+                row["label_source_auto"] = "intent_operator_promoted"
+                row["angle_deg_auto"] = row["intent_pan_deg"]
+                row["label_promoted_auto"] = True
+                row["label_promotion_reason_auto"] = (
+                    "operator accepted every quality-passed direct-production image"
+                )
+            else:
+                row["label_source_auto"] = None
+                row["angle_deg_auto"] = None
             row["pan_quality_pass_auto"] = bool(
-                row["quality_gate_pass"] and pose_pan_pass
+                row["quality_gate_pass"] and (pose_pan_pass or direct_production)
             )
         else:
             sector_policy = (
@@ -796,21 +980,51 @@ def run_auto_qa(
             row["angle_deg_auto"] = (
                 row.get("estimated_pan_deg") if use_sixd else row["intent_pan_deg"]
             )
-            row["pan_quality_pass_auto"] = bool(
-                row["quality_gate_pass"] and row["direction_consistent"]
-            )
+            row["pan_quality_pass_auto"] = bool(row["quality_gate_pass"])
+        row["label_confidence_auto"] = 1.0 if row["pan_quality_pass_auto"] else 0.0
     write_jsonl(run_dir / "auto_qa.jsonl", rows)
     summary = {
+        "qa_implementation_version": QA_IMPLEMENTATION_VERSION,
         "stage": state["stage"],
         "total": len(rows),
         "quality_pass": sum(bool(row["quality_gate_pass"]) for row in rows),
         "pan_quality_pass_auto": sum(
             bool(row["pan_quality_pass_auto"]) for row in rows
         ),
+        "quality_reason_counts": dict(
+            Counter(reason for row in rows for reason in row["quality_gate_reasons"])
+        ),
+        "head_square_crop_gate": {
+            "margin_per_side": float(config["qa"]["deim_crop_margin"]),
+            "square_side_formula": "max(head_box_width,head_box_height)*(1+2*margin)",
+            "evaluated": sum(row.get("detector_status") == "ok" for row in rows),
+            "within_image": sum(
+                row.get("head_square_crop_within_image") is True for row in rows
+            ),
+            "outside_image": sum(
+                row.get("detector_status") == "ok"
+                and row.get("head_square_crop_within_image") is not True
+                for row in rows
+            ),
+        },
         "elevation_counts_auto": dict(
             Counter(row["camera_elevation_class_auto"] for row in rows)
         ),
         "qa_policy": qa_policy,
+        "qa_reuse": qa_reuse,
+        "label_acceptance_policy_auto": (
+            DIRECT_ALL_QUALITY_LABEL_POLICY if direct_production else "strict"
+        ),
+        "label_source_counts_auto": dict(
+            Counter(
+                str(row["label_source_auto"])
+                for row in rows
+                if row.get("pan_quality_pass_auto")
+            )
+        ),
+        "label_promoted_auto": sum(
+            bool(row.get("label_promoted_auto")) for row in rows
+        ),
         "calibration": calibration,
         "calibration_path": (
             str((run_dir / "pitch_calibration.json").resolve())
@@ -860,11 +1074,155 @@ def run_auto_qa(
         "rear_policy_sha256": sha256_file(rear_policy_path)
         if rear_policy_path
         else None,
+        "rear_policy_mode": rear_policy_mode,
+        "direct_production": direct_production,
+        "approval_policy": state.get("approval_policy"),
+        "intermediate_stages_waived": bool(
+            state.get("intermediate_stages_waived", False)
+        ),
     }
     (run_dir / "qa_report.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     return summary
+
+
+def promote_direct_production_labels(run_dir: Path) -> dict[str, Any]:
+    """Accept every quality-passed direct-production image using intent fallback."""
+    state = load_state(run_dir)
+    if (
+        state.get("direct_production") is not True
+        or state.get("approval_policy") != "operator_direct_no_human_review"
+    ):
+        raise PipelineError(
+            "label promotion is restricted to operator-authorized direct production"
+        )
+    qa_path = run_dir / "auto_qa.jsonl"
+    report_path = run_dir / "qa_report.json"
+    if not qa_path.exists() or not report_path.exists():
+        raise PipelineError("automatic QA and its report are required before promotion")
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    if report.get("direct_production") is not True:
+        raise PipelineError("QA report is not for direct production")
+    if report.get("qa_implementation_version") not in {
+        QA_IMPLEMENTATION_VERSION - 1,
+        QA_IMPLEMENTATION_VERSION,
+    }:
+        raise PipelineError("QA report implementation is not promotion-compatible")
+
+    config = load_config(Path(state["config_path"]))
+    config_from_recorded_qa_policy(config, report)
+    expected_model_hashes = {
+        "detector_sha256": config["models"]["deimv2"]["sha256"],
+        "pose_sha256": config["models"]["sixdrepnet360"]["sha256"],
+        "landmark_sha256": config["models"]["hrffa_vitl_ibug68"]["sha256"],
+    }
+    for key, expected in expected_model_hashes.items():
+        if report.get(key) != expected:
+            raise PipelineError(f"QA report does not bind the configured {key}")
+    calibration_path = Path(str(report.get("calibration_path", "")))
+    if not calibration_path.exists() or report.get("calibration_sha256") != sha256_file(
+        calibration_path
+    ):
+        raise PipelineError("QA pitch calibration is unavailable or changed")
+
+    plan = read_plan(run_dir, state)
+    rows = [
+        json.loads(line)
+        for line in qa_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    if len(rows) != len(plan) or {row["custom_id"] for row in rows} != set(plan):
+        raise PipelineError(
+            "automatic QA rows do not exactly match the generation plan"
+        )
+    if report.get("total") != len(rows) or report.get("quality_pass") != len(rows):
+        raise PipelineError("promotion requires every planned image to pass quality QA")
+
+    promoted = 0
+    previously_accepted = 0
+    for row in rows:
+        if row.get("quality_gate_pass") is not True:
+            raise PipelineError(f"quality QA did not pass: {row['custom_id']}")
+        record = plan[row["custom_id"]]
+        image_path = run_dir / "images" / row["filename"]
+        if not image_path.exists() or row.get("sha256") != sha256_file(image_path):
+            raise PipelineError(f"QA-bound image changed: {row['custom_id']}")
+        was_accepted = bool(row.get("pan_quality_pass_auto"))
+        row["label_was_accepted_before_operator_promotion_auto"] = was_accepted
+        row["label_acceptance_policy_auto"] = DIRECT_ALL_QUALITY_LABEL_POLICY
+        row["label_confidence_auto"] = 1.0
+        if was_accepted:
+            if (
+                row.get("label_source_auto") is None
+                or row.get("angle_deg_auto") is None
+            ):
+                raise PipelineError(
+                    f"accepted label is incomplete before promotion: {row['custom_id']}"
+                )
+            row["label_promoted_auto"] = False
+            row["label_promotion_reason_auto"] = None
+            previously_accepted += 1
+        else:
+            intent = float(record["intent_pan_deg"]) % 360.0
+            if not math.isfinite(intent):
+                raise PipelineError(f"invalid intent label: {row['custom_id']}")
+            row["pan_quality_pass_auto"] = True
+            row["label_source_auto"] = "intent_operator_promoted"
+            row["angle_deg_auto"] = intent
+            row["label_promoted_auto"] = True
+            row["label_promotion_reason_auto"] = (
+                "operator accepted every quality-passed direct-production image"
+            )
+            promoted += 1
+
+    promoted_at = datetime.now(UTC).isoformat()
+    source_counts = dict(Counter(str(row["label_source_auto"]) for row in rows))
+    write_jsonl(qa_path, rows)
+    report.update(
+        {
+            "qa_implementation_version": QA_IMPLEMENTATION_VERSION,
+            "pan_quality_pass_auto": len(rows),
+            "rear_policy_mode": "direct_all_quality_intent_fallback",
+            "label_acceptance_policy_auto": DIRECT_ALL_QUALITY_LABEL_POLICY,
+            "label_source_counts_auto": source_counts,
+            "label_promoted_auto": promoted,
+            "operator_label_promotion": {
+                "applied_at": promoted_at,
+                "policy": DIRECT_ALL_QUALITY_LABEL_POLICY,
+                "previously_accepted": previously_accepted,
+                "promoted": promoted,
+                "total_accepted": len(rows),
+            },
+        }
+    )
+    report_path.write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+    audit_path = run_dir / "completion_audit.json"
+    if audit_path.exists():
+        audit = json.loads(audit_path.read_text(encoding="utf-8"))
+        automatic_quality = audit.setdefault("automatic_quality", {})
+        automatic_quality["pan_quality_pass"] = len(rows)
+        automatic_quality["label_acceptance"] = {
+            "policy": DIRECT_ALL_QUALITY_LABEL_POLICY,
+            "previously_accepted": previously_accepted,
+            "promoted": promoted,
+            "total_accepted": len(rows),
+            "label_source_counts": source_counts,
+        }
+        audit_path.write_text(
+            json.dumps(audit, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+    return {
+        "batch_dir": str(run_dir),
+        "policy": DIRECT_ALL_QUALITY_LABEL_POLICY,
+        "previously_accepted": previously_accepted,
+        "promoted": promoted,
+        "total_accepted": len(rows),
+        "label_source_counts": source_counts,
+    }
 
 
 def _contact_sheet(run_dir: Path, rows: list[dict[str, Any]], output: Path) -> None:

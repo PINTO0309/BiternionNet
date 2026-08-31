@@ -14,6 +14,7 @@ from biternionnet.synthetic.generate import (
     _edit_prompt,
     _pitch_calibration_tail_candidates,
     _qa_edit_reasons,
+    _token_based_batch_plan,
     build_plan,
     build_usage_report,
     create_edit_cycle,
@@ -116,6 +117,21 @@ def test_edit_cycle_uses_effective_pan_tolerance_recorded_by_qa():
     assert "pan_out_of_tolerance" in _qa_edit_reasons(row, config)
 
 
+def test_operator_promoted_label_does_not_trigger_pose_or_pitch_edit():
+    config = load_config(CONFIG)
+    row = {
+        "abs_pan_bin": 50,
+        "camera_elevation": 45,
+        "pose_status": "ok",
+        "pan_error_deg": 120.0,
+        "sixd_pitch_deg": 10.0,
+        "quality_gate_pass": True,
+        "quality_gate_reasons": [],
+        "label_acceptance_policy_auto": ("direct_all_quality_pass_intent_fallback_v1"),
+    }
+    assert _qa_edit_reasons(row, config) == []
+
+
 def test_pitch_calibration_tail_selects_two_controlling_residuals():
     config = load_config(CONFIG)
     residuals = [-12.5829, -10.3286, 2.6038, 22.0412, 26.1672, 3.4859]
@@ -144,6 +160,18 @@ def test_pitch_calibration_tail_selects_two_controlling_residuals():
     )
 
 
+def test_observed_token_batch_plan_uses_the_minimum_batch_count():
+    one = _token_based_batch_plan(432, 2312.0)
+    assert one["expected_total_input_tokens"] == pytest.approx(998_784)
+    assert one["max_records_per_batch"] == 432
+    assert one["minimum_batch_count"] == 1
+
+    two = _token_based_batch_plan(433, 2312.0)
+    assert two["expected_total_input_tokens"] == pytest.approx(1_001_096)
+    assert two["max_records_per_batch"] == 432
+    assert two["minimum_batch_count"] == 2
+
+
 def test_pan_edit_prompt_uses_relative_correction_from_current_pose():
     record = {
         "intent_pan_deg": 20,
@@ -152,10 +180,43 @@ def test_pan_edit_prompt_uses_relative_correction_from_current_pose():
         "prompt": "Original target.",
     }
     row = {"pose_status": "ok", "estimated_pan_deg": 57.2929}
-    prompt = _edit_prompt(record, row, ["direction_conflict"])
+    prompt = _edit_prompt(record, row, ["pan_out_of_tolerance"])
     assert "estimated at pan +57.3 degrees" in prompt
     assert "37.3 degrees toward image-left" in prompt
     assert "not an instruction to turn farther" in prompt
+
+
+def test_crop_edit_prompt_translates_person_away_from_overflowing_edges():
+    record = {
+        "size": "1024x1024",
+        "prompt": "Original target.",
+    }
+    row = {
+        "actual_size": "1024x1024",
+        "head_square_crop_box_xyxy": [-12.0, -7.0, 700.0, 705.0],
+    }
+    prompt = _edit_prompt(record, row, ["head_crop_outside_image"])
+    assert "4% of the image width toward image-right" in prompt
+    assert "3% of the image height downward" in prompt
+    assert "not a crop, zoom, head rotation" in prompt
+    assert "times 1.10 must stay fully inside" in prompt
+
+    row["head_square_crop_box_xyxy"] = [-1.0, 100.0, 1031.0, 1132.0]
+    prompt = _edit_prompt(record, row, ["head_crop_outside_image"])
+    assert "uniformly reduce the entire person by approximately 3%" in prompt
+
+
+def test_deim_direction_does_not_create_an_edit_reason():
+    config = load_config(CONFIG)
+    reasons = _qa_edit_reasons(
+        {
+            "abs_pan_bin": 120,
+            "quality_gate_reasons": ["direction_conflict"],
+            "direction_consistent": False,
+        },
+        config,
+    )
+    assert reasons == []
 
 
 def test_plan_fixes_low_quality_and_is_immutable(tmp_path):
@@ -194,6 +255,43 @@ def test_plan_rejects_snapshot_that_batch_api_does_not_support(tmp_path):
         create_plan(
             SNAPSHOT_CONFIG, "validation", "validation-snapshot", tmp_path, seed=3
         )
+
+
+def test_direct_uniform_production_requires_explicit_single_batch(tmp_path):
+    root = tmp_path / "runs"
+    with pytest.raises(PipelineError, match="requires --single-batch"):
+        create_plan(
+            CONFIG,
+            "uniform_200",
+            "production-invalid",
+            root,
+            seed=3,
+            direct_production=True,
+        )
+
+    run = create_plan(
+        CONFIG,
+        "uniform_200",
+        "production-uniform200-v001",
+        root,
+        seed=3,
+        direct_production=True,
+        single_batch=True,
+        compact_prompts=True,
+    )
+    state = load_state(run)
+    assert state["request_count"] == 6700
+    assert state["direct_production"] is True
+    assert state["single_batch"] is True
+    assert state["prompt_profile"] == "compact_direct_v1"
+    assert state["approval_policy"] == "operator_direct_no_human_review"
+    assert state["intermediate_stages_waived"] is True
+    assert state["parent_batch_dir"] is None
+    assert len(state["shards"]) == 1
+    assert len(state["shards"][0]["custom_ids"]) == 6700
+    plan = read_plan(run, state)
+    assert all("Photorealistic overhead CCTV" in row["prompt"] for row in plan.values())
+    assert all("detected head" not in row["prompt"] for row in plan.values())
 
 
 class _FakeFiles:

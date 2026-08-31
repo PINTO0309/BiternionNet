@@ -93,8 +93,11 @@ same effective coverage after the flip, the two-sided variant adds appearance di
    acceptance test and the intent as the label unless a pilot shows SixDRepNet to be reliable there.
 3. Accept if the measured pan is within 25 deg of the requested band and |pitch| <= 35 deg; bin by the
    *measured* pan, not by the request.
-4. Downscale the head crop (15 % margin) to the TownCentre size distribution (median 29 px, 17-59) before it
-   enters the pipeline, so the resize-to-50 step sees the same blur; `source: "synthetic"` in the manifest.
+4. Centre a square crop on the DEIMv2 head box with side length
+   `max(box_width, box_height) * (1 + 2 * 0.05)`, and accept it only when the complete square remains inside
+   the source image. Do not clamp an out-of-bounds crop. Downscale the accepted square to the TownCentre size
+   distribution (median 29 px, 17-59) before it enters the pipeline, so the resize-to-50 step sees the same
+   blur; record `source: "synthetic"` in the manifest.
 
 ## 5. Experiment
 

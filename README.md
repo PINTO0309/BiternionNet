@@ -208,6 +208,21 @@ uv run --locked biternion-synthetic submit \
   --approve-requests 19 --spend-cap-usd 0.20
 ```
 
+An operator may explicitly waive the staged Validation/Pilot and human-review dependencies only for the full
+`uniform_200` production target. `--direct-production` is restricted to that stage, cannot be combined with an
+approved parent, and requires `--single-batch`; the resulting state records the waiver. Paid submission still
+requires the exact 6,700-request count and an independent spend cap:
+
+```bash
+uv run --locked biternion-synthetic plan \
+  --config configs/synthetic_towncentre_batch_v4.yaml \
+  --stage uniform_200 --batch-id production-uniform200-v001 \
+  --direct-production --single-batch --compact-prompts
+uv run --locked biternion-synthetic submit \
+  --batch-dir data/synthetic/batches/production-uniform200-v001 \
+  --approve-requests 6700 --spend-cap-usd 70
+```
+
 After collection, run machine QA, prepare the human review/sign table, verify the fixed 5% DEIMv2-box crop
 margin against real TownCentre crops, and record the actual account charge. Machine QA uses DEIMv2,
 SixDRepNet360, and the local
@@ -247,11 +262,19 @@ request-count and spend-cap guard:
 uv run --locked biternion-synthetic edit-plan \
   --parent-batch-dir data/synthetic/batches/VALIDATION_RUN \
   --batch-id VALIDATION_EDIT_RUN --max-edit-rounds 2 \
-  --planning-cost-per-request-usd CONSERVATIVE_ACCOUNT_ESTIMATE
+  --planning-cost-per-request-usd OBSERVED_ACCOUNT_COST \
+  --edit-token-evidence-run data/synthetic/batches/OBSERVED_EDIT_RUN
 uv run --locked biternion-synthetic submit \
   --batch-dir data/synthetic/batches/VALIDATION_EDIT_RUN \
   --approve-requests EXACT_EDIT_COUNT --spend-cap-usd EXPLICIT_CAP
 ```
+
+For direct production repair cycles, Batch count is derived from the observed mean input-token usage in the
+parent generation run and `--edit-token-evidence-run`. The planner chooses the largest records-per-Batch value
+whose expected input is strictly below the account's 1,000,000 queued-token limit. It therefore produces one
+Batch whenever the expected total is below the limit, and only adds Batches when the observed-token arithmetic
+requires them. The evidence usage file and SHA-256, mean/min/max, expected total, per-Batch record limit, and
+minimum Batch count are recorded in `batch_state.json`.
 
 When Validation pitch calibration fails even though its tail records pass individual QA, add
 `--include-pitch-calibration-tail` to `edit-plan`. The planner hash-binds the failed calibration and selects the
@@ -280,13 +303,44 @@ uv run --locked biternion-synthetic approve \
 Automatic QA defaults to the separately hash-bound
 `configs/synthetic_qa_policy_v2.yaml`: requested pan may differ by at most 30 degrees. DEIMv2 still measures
 `head_height_ratio`, but that measurement is diagnostic only and never adds `head_too_small` or
-`head_too_large` to the rejection reasons. DEIMv2 direction uses the cyclic eight-direction classes: the
-detected and expected classes may differ by zero or one bin, while a distance of two or more bins is rejected.
-The final head crop expands the DEIMv2 box by exactly 5% on each box axis; approval no longer accepts a crop
-margin argument, and materialization rejects any approval carrying a different value. Each `auto_qa.jsonl` row
-records the effective pan tolerance, height-gate state, DEIM bin distance, and permitted maximum;
+`head_too_large` to the rejection reasons. DEIMv2 direction and its cyclic eight-direction bin distance remain
+recorded diagnostics, but they do not reject an image or trigger an edit.
+The final head crop is a square centred on the DEIMv2 head box with side length
+`max(box_width, box_height) * (1 + 2 * 0.05)`. Framing QA accepts this crop only when the entire square stays
+inside the source image. The older requirement for every source-image edge to be at least half a head width or
+height away is diagnostic only and is not an acceptance gate. Approval no longer accepts a crop-margin
+argument, and materialization rejects any approval carrying a different value. Each `auto_qa.jsonl` row
+records the square crop coordinates and in-image result as well as the effective pan tolerance, height-gate
+state, DEIM bin distance, and permitted maximum;
+materialization reuses the same long-side square and rejects an out-of-bounds crop instead of clamping it into
+a different rectangle.
 `qa_report.json` and Validation `pitch_calibration.json` bind the policy path and SHA-256. This keeps completed
 Batch generation configs immutable while making the current acceptance policy explicit and auditable.
+For an edit cycle, QA never re-runs DEIMv2, SixDRepNet360, or HRFFA on a passed carry-forward image. Its parent
+`auto_qa.jsonl` row is reused only when the image hash, parent QA hash, QA implementation version, effective QA
+policy, pitch calibration, and all model hashes match. If any binding differs, QA stops instead of silently
+re-evaluating an already-passed image. Edited images and carried-forward images that did not pass are evaluated
+normally, and `qa_report.json.qa_reuse` records both the reused and newly evaluated counts.
+For an explicitly waived direct-production run, the operator may promote every image that passed image-quality
+QA into the labelled pool with `biternion-synthetic promote-direct-labels`. A front/profile record whose SixD
+estimate is outside tolerance then uses the requested generation intent as `angle_deg_auto`, records
+`label_source_auto=intent_operator_promoted`, and preserves the SixD estimate/error and elevation class as
+diagnostics. This promotion never turns a failed image-quality record into a pass and does not rewrite the
+physical elevation classification.
+After promotion, `materialize` accepts the hash-bound direct-production QA without manufacturing a human
+`approval.json`. It writes normalized `accepted_annotations.jsonl`, verifies every source-image hash, applies
+the fixed 5% long-side square crop, and exposes all accepted elevation classes through
+`manifest_nb3_synthetic_all_elevations.jsonl`. The shorter `manifest_nb3_synthetic.jsonl` remains the explicit
+high-angle-only subset.
+
+```bash
+uv run --locked biternion-synthetic materialize \
+  --batch-dir data/synthetic/batches/production-uniform200-v004-edit02-quality
+uv run --locked biternion-train --experiment towncentre-biternion-vonmises-aug \
+  --manifest data/towncentre/manifest_nb3_synthetic_all_elevations.jsonl \
+  --synthetic-fraction 0.10 --epoch-samples 26897 --synthetic-max-repeats 4 \
+  --output runs/synthetic-all-elevations-10pct
+```
 
 Pilot planning refuses to proceed without this approved Validation evidence. Materialization writes a
 high-angle-only training manifest and an all-elevations ablation manifest. Correctly labelled eye-level or
@@ -303,8 +357,8 @@ uv run --locked biternion-train --experiment towncentre-biternion-vonmises-aug \
 
 For `floor_120` and `uniform_200`, pass both the approved Validation
 `pitch_calibration.json` and approved Pilot `rear_label_policy.json` to `biternion-synthetic qa` via
-`--calibration` and `--rear-policy`. The latter freezes the per-rear-sector 70% SixD agreement / 10% DEIM
-conflict decision; sectors that do not qualify continue to use reviewed intent labels.
+`--calibration` and `--rear-policy`. The latter freezes the per-rear-sector SixD agreement decision; DEIM
+direction is diagnostic only, and sectors that do not qualify continue to use reviewed intent labels.
 
 Use `biternion-synthetic profiles-plan` / `profiles-finalize` to build the person-disjoint 200--300-image
 `test_profiles` set before the Pilot, and `biternion-eval --predictions-output ...` plus
