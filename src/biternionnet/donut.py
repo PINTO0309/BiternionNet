@@ -151,8 +151,12 @@ def render_donut_figure(
         ax.imshow(donut_heatmap(donut_from_angles(angles, nbins, smooth), bg=(size, size), R=ring))
         ax.set_title(label, fontsize=10, color=TEXT_PRIMARY)
         ax.text(0.5, -0.04, f"n={n:,}", transform=ax.transAxes, ha="center", fontsize=8, color=TEXT_SECONDARY)
+        # notebook orientation: 0 deg at the bottom, counter-clockwise (90 right, 180 top, 270 left)
+        for deg, (tx, ty, ha, va) in {0: (0.5, 0.04, "center", "top"), 90: (0.985, 0.5, "left", "center"),
+                                      180: (0.5, 0.985, "center", "bottom"), 270: (0.015, 0.5, "right", "center")}.items():
+            ax.text(tx, ty, f"{deg}°", transform=ax.transAxes, ha=ha, va=va, fontsize=7, color=TEXT_SECONDARY)
         ax.axis("off")
-    fig.suptitle(f"Prediction distribution — split {split!r} · 0° at the top, clockwise = paper convention",
+    fig.suptitle(f"Prediction distribution — split {split!r} · 0° bottom, CCW (notebook orientation)",
                  x=0.01, ha="left", fontsize=9, color=TEXT_SECONDARY, y=0.99)
     fig.tight_layout(rect=(0, 0, 1, 0.94))
     output = Path(output)
