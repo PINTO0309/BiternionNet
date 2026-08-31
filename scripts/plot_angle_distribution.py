@@ -26,6 +26,9 @@ TEXT_PRIMARY = "#0b0b0b"
 TEXT_SECONDARY = "#52514e"
 GRID = "#e4e3df"
 SERIES = "#2a78d6"
+# fixed categorical order (dataviz palette): source identity keeps its hue everywhere
+SOURCE_COLORS = {"anchor": "#2a78d6", "synthetic": "#eb6834", "neighbor": "#1baf7a"}
+SOURCE_ORDER = ("anchor", "neighbor", "synthetic")
 
 app = typer.Typer(add_completion=False)
 
@@ -35,19 +38,45 @@ def _angles(records: list[dict], split: str | None) -> np.ndarray:
     return np.mod(np.asarray(values, dtype=np.float64), 360.0)
 
 
-def _histogram(angles: np.ndarray, bin_width: float) -> tuple[np.ndarray, np.ndarray]:
+def _angles_by_source(records: list[dict], split: str | None) -> dict[str, np.ndarray]:
+    """Split angles by record source: 'anchor' (no source field / 'real'), 'neighbor', 'synthetic'."""
+    groups: dict[str, list[float]] = {}
+    for r in records:
+        if "angle_deg" not in r or (split is not None and r.get("split") != split):
+            continue
+        source = r.get("source", "anchor")
+        if source == "real":
+            source = "anchor"
+        groups.setdefault(source, []).append(float(r["angle_deg"]))
+    return {k: np.mod(np.asarray(v, dtype=np.float64), 360.0) for k, v in groups.items()}
+
+
+def _histogram(angles: np.ndarray, bin_width: float, flip_effective: bool = False) -> tuple[np.ndarray, np.ndarray]:
     """Counts per bin with bins centred on multiples of ``bin_width`` (0 deg in the middle of bin 0)."""
     n_bins = int(round(360.0 / bin_width))
     shifted = np.mod(angles + bin_width / 2.0, 360.0)
     counts, _ = np.histogram(shifted, bins=np.linspace(0.0, 360.0, n_bins + 1))
+    if flip_effective:
+        counts = (counts + counts[(-np.arange(n_bins)) % n_bins]) / 2.0
     centres = np.arange(n_bins) * bin_width
     return centres, counts
 
 
-def _panel(ax, centres: np.ndarray, counts: np.ndarray, bin_width: float, title: str, subtitle: str) -> None:
+def _panel(ax, centres: np.ndarray, counts: np.ndarray, bin_width: float, title: str, subtitle: str, stacks: dict[str, np.ndarray] | None = None) -> None:
     ax.set_facecolor(SURFACE)
     # thin bars with a ~2px surface gap between neighbours
-    ax.bar(centres, counts, width=bin_width * 0.86, color=SERIES, linewidth=0, zorder=3)
+    if stacks is not None and len(stacks) > 1:
+        bottom = np.zeros_like(counts, dtype=np.float64)
+        for name in SOURCE_ORDER:
+            if name not in stacks:
+                continue
+            ax.bar(centres, stacks[name], width=bin_width * 0.86, bottom=bottom,
+                   color=SOURCE_COLORS.get(name, SERIES), linewidth=0.8, edgecolor=SURFACE,
+                   label=f"{name} {int(stacks[name].sum()):,}", zorder=3)
+            bottom += stacks[name]
+        ax.legend(frameon=False, fontsize=9, loc="lower right", bbox_to_anchor=(1.0, 1.0), ncols=3, labelcolor=TEXT_SECONDARY, borderaxespad=0.0, handlelength=1.2, columnspacing=1.0)
+    else:
+        ax.bar(centres, counts, width=bin_width * 0.86, color=SERIES, linewidth=0, zorder=3)
     ax.set_title(title, loc="left", fontsize=12, fontweight="bold", color=TEXT_PRIMARY, pad=14)
     ax.text(0.0, 1.02, subtitle, transform=ax.transAxes, fontsize=9, color=TEXT_SECONDARY, ha="left", va="bottom")
     ax.set_xlim(-bin_width / 2.0, 360.0 - bin_width / 2.0)
@@ -78,20 +107,26 @@ def main(
     manifest: Path = typer.Argument(..., exists=True, readable=True, help="JSONL manifest with angle_deg records."),
     output: Path | None = typer.Option(None, help="Output .jpg (default: <manifest dir>/angle_distribution.jpg)."),
     bin_width: float = typer.Option(10.0, min=1.0, max=180.0, help="Bin width in degrees (360 must be a multiple)."),
+    flip_effective: bool = typer.Option(False, help="Show train counts as (raw(a)+raw(360-a))/2 - what training with p=0.5 horizontal flips effectively sees. Test panels stay raw."),
     dpi: int = typer.Option(150, min=50),
 ) -> None:
     if abs(360.0 / bin_width - round(360.0 / bin_width)) > 1e-9:
         raise typer.BadParameter("360 must be a multiple of --bin-width")
     records = [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines() if line.strip()]
-    splits = [s for s in ("train", "val", "test") if any(r.get("split") == s for r in records)]
+    splits = [s for s in ("train", "val", "test", "test_neighbor", "test_synthetic") if any(r.get("split") == s for r in records)]
     panels = [(None, "all")] + [(s, s) for s in splits]
 
     fig, axes = plt.subplots(len(panels), 1, figsize=(10, 3.2 * len(panels)), facecolor=SURFACE, squeeze=False)
     for ax, (split, label) in zip(axes[:, 0], panels):
+        fe = flip_effective and split in (None, "train")
         angles = _angles(records, split)
-        centres, counts = _histogram(angles, bin_width)
+        centres, counts = _histogram(angles, bin_width, fe)
+        by_source = _angles_by_source(records, split)
+        stacks = {k: _histogram(v, bin_width, fe)[1] for k, v in by_source.items()} if len(by_source) > 1 else None
         subtitle = f"{len(angles):,} heads · {int(round(360.0 / bin_width))} bins of {bin_width:g}° centred on 0°"
-        _panel(ax, centres, counts, bin_width, f"Angle distribution — {label}", subtitle)
+        if fe:
+            subtitle += " · flip-effective"
+        _panel(ax, centres, counts, bin_width, f"Angle distribution — {label}", subtitle, stacks)
     fig.suptitle(f"{manifest}", x=0.01, ha="left", fontsize=9, color=TEXT_SECONDARY, y=0.995)
     fig.tight_layout(rect=(0, 0, 1, 0.985))
 

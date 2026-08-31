@@ -446,6 +446,22 @@ uv run --locked python scripts/plot_angle_distribution.py data/towncentre/manife
 - Quantized-label presets (`towncentre-q*`) are trained on bin labels but evaluated against the continuous ground-truth angle, as in Section 5 of the paper. Softmax presets report `maad_deg` (class-centre prediction), `maad_quadint_deg` (quadratic interpolation between the best bin and its neighbours), and `bin_accuracy`.
 - Not ported: the shallow "pure linear regression" baseline, the `ModuloMADCriterion` run with `N(0, 20)` last-layer init, DeepFried2's post-training BatchNorm statistics pass, multi-crop test-time augmentation, and averaging over five independently trained networks.
 
+### Composite manifests (current / balanced + enlarged test side)
+
+```bash
+uv run --locked python scripts/build_composite_manifests.py \
+  --combined data/towncentre/manifest_nb3_synthetic_all_elevations.jsonl \
+  --source data/TownCentreHeadImages --output-dir data/towncentre
+```
+
+writes `manifest_current.jsonl` and `manifest_balanced.jsonl` (select with `--manifest`). They differ only in
+train: *balanced* re-selects neighbour frames per flip-effective 10-degree bin up to an auto target so every
+bin is equally represented under the p=0.5 flip; anchors and synthetic records are kept in full (minus a 10 %
+per-bin synthetic holdout). Both share a byte-identical test side: `test` (the original 443 anchors),
+`test_neighbor` (+-10 frames of test anchors) and `test_synthetic` (the holdout) - evaluate them with
+`biternion-eval --split ...`; every angle evaluation already reports per-45-degree-bin MAAD. See
+`history/017_composite_manifests.md`.
+
 ## Experiment history
 
 `history/` holds one numbered Markdown entry per topic (fidelity fixes, dataset analysis, schedule sweep,

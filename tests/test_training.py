@@ -251,3 +251,12 @@ def test_text_logs_written_and_consistent_after_resume(tmp_path):
     assert events2[0]["event"] == "resume" and events2[0]["start_epoch"] == 3
     assert any(e["event"] == "schedule" for e in events2) and events2[-1]["event"] == "finish"
     assert events2[-1]["stopped_early"] is True
+
+
+def test_evaluate_checkpoint_reports_per_bin_metrics(tmp_path):
+    manifest = _angle_manifest(tmp_path)
+    result = train_model("smoke-biternion", manifest, tmp_path / "run", epochs=1, batch_size=2, device_name="cpu")
+    metrics = evaluate_checkpoint(result["last_checkpoint"], manifest, device_name="cpu", batch_size=2)
+    assert "bin_macro_maad_deg" in metrics
+    counts = [metrics.get(f"bin_{c:03d}_count", 0) for c in range(0, 360, 45)]
+    assert sum(counts) == 4  # the fixture's 4 test records

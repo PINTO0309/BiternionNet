@@ -33,3 +33,4 @@ work is done (or planned) so that later entries can refer back to earlier ones b
 | [014](014_deim_direction_bin_tolerance.md) | DEIM direction tolerance by cyclic bin distance | implemented; v010 re-evaluated |
 | [015](015_fixed_deim_crop_margin.md) | Fixed DEIMv2-box crop margin | implemented at 5%; v010 sheet regenerated |
 | [016](016_validation_failure_repair.md) | Validation failure repair | v013 reaches 19/19 automatic QA and valid pitch calibration |
+| [017](017_composite_manifests.md) | Composite manifests: current / balanced train + enlarged test side | done |
