@@ -28,6 +28,7 @@ OUTPUT_FORMAT = "jpeg"
 OUTPUT_COMPRESSION = 92
 N_IMAGES = 1
 COMPLETION_WINDOW = "24h"
+BATCH_IMAGE_MODEL = "gpt-image-2"
 ALLOWED_SIZES = {"1024x1536", "1024x1024", "1536x1024"}
 STATE_NAME = "batch_state.json"
 PLAN_NAME = "generation_plan.jsonl"
@@ -515,6 +516,11 @@ def create_plan(
         raise PipelineError("batch-id must be one safe path component")
     config_path = config_path.resolve()
     config = load_config(config_path)
+    if config["api"]["model"] != BATCH_IMAGE_MODEL:
+        raise PipelineError(
+            f"Batch image generation requires api.model={BATCH_IMAGE_MODEL!r}; "
+            "dated GPT-Image-2 snapshots are not accepted by the Batch API"
+        )
     required_parent = {"pilot": "validation", "floor_120": "pilot", "uniform_200": "pilot"}.get(stage)
     parent_approval = None
     if required_parent:

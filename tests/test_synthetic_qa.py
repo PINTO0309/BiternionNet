@@ -15,7 +15,7 @@ from biternionnet.synthetic.qa import (
     summarize_landmarks,
 )
 
-CONFIG = Path(__file__).resolve().parents[1] / "configs" / "synthetic_towncentre.yaml"
+CONFIG = Path(__file__).resolve().parents[1] / "configs" / "synthetic_towncentre_batch.yaml"
 
 
 def _quality_row(abs_pan, residual, pitch, cam=45):

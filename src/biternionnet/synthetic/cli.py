@@ -39,7 +39,9 @@ def _print(value: object) -> None:
 def plan_command(
     stage: str = typer.Option(..., help="validation, pilot, floor_120, or uniform_200"),
     batch_id: str = typer.Option(...),
-    config: Path = typer.Option(Path("configs/synthetic_towncentre.yaml"), exists=True, readable=True),
+    config: Path = typer.Option(
+        Path("configs/synthetic_towncentre_batch.yaml"), exists=True, readable=True
+    ),
     output_root: Path = typer.Option(Path("data/synthetic")),
     seed: int = typer.Option(20260831),
     approved_batch_dir: Optional[Path] = typer.Option(None, exists=True),
@@ -213,7 +215,7 @@ def materialize_command(
 def top_up_command(
     annotations: Path = typer.Option(..., exists=True, readable=True),
     target: str = typer.Option("floor_120"),
-    config: Path = typer.Option(Path("configs/synthetic_towncentre.yaml"), exists=True),
+    config: Path = typer.Option(Path("configs/synthetic_towncentre_batch.yaml"), exists=True),
 ) -> None:
     _print(top_up_plan(load_config(config), read_jsonl(annotations), target))
 
@@ -270,7 +272,7 @@ def install_models_command(
     source_repo: Path = typer.Option(..., exists=True, file_okay=False, readable=True),
     repository_root: Path = typer.Option(Path("."), exists=True, file_okay=False, writable=True),
     config: Path = typer.Option(
-        Path("configs/synthetic_towncentre.yaml"), exists=True, readable=True
+        Path("configs/synthetic_towncentre_batch.yaml"), exists=True, readable=True
     ),
 ) -> None:
     loaded = load_config(config)

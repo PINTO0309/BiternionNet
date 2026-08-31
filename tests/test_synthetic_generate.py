@@ -25,7 +25,8 @@ from biternionnet.synthetic.generate import (
 )
 from biternionnet.synthetic.models import install_model_assets
 
-CONFIG = Path(__file__).resolve().parents[1] / "configs" / "synthetic_towncentre.yaml"
+CONFIG = Path(__file__).resolve().parents[1] / "configs" / "synthetic_towncentre_batch.yaml"
+SNAPSHOT_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "synthetic_towncentre.yaml"
 
 
 def test_validation_and_pilot_are_deterministic_and_cover_directions():
@@ -54,6 +55,7 @@ def test_plan_fixes_low_quality_and_is_immutable(tmp_path):
     run = create_plan(CONFIG, "validation", "validation-v001", tmp_path, seed=3)
     state = load_state(run)
     assert state["request_count"] == 19
+    assert state["api_request"]["model"] == "gpt-image-2"
     assert state["api_request"]["quality"] == "low"
     assert len(state["shards"]) == 1
     requests = [json.loads(line) for line in (run / state["shards"][0]["attempts"][0]["input_path"]).read_text().splitlines()]
@@ -73,6 +75,11 @@ def test_plan_fixes_low_quality_and_is_immutable(tmp_path):
     (run / "generation_plan.jsonl").write_text("{}\n", encoding="utf-8")
     with pytest.raises(PipelineError, match="changed"):
         load_state(run)
+
+
+def test_plan_rejects_snapshot_that_batch_api_does_not_support(tmp_path):
+    with pytest.raises(PipelineError, match="dated GPT-Image-2 snapshots"):
+        create_plan(SNAPSHOT_CONFIG, "validation", "validation-snapshot", tmp_path, seed=3)
 
 
 class _FakeFiles:

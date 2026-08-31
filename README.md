@@ -189,21 +189,22 @@ uv run --locked biternion-eval \
 
 ### Synthetic TownCentre reinforcement data
 
-The staged GPT-Image-2 pipeline is configured in `configs/synthetic_towncentre.yaml`. Image quality is
-hard-fixed to `low`; planning is local and does not submit a paid request:
+The staged GPT-Image-2 pipeline is configured in `configs/synthetic_towncentre_batch.yaml`. Batch submission
+uses the Batch-supported `gpt-image-2` alias because the dated `gpt-image-2-2026-04-21` snapshot is rejected by
+the Batch API. Image quality is hard-fixed to `low`; planning is local and does not submit a paid request:
 
 ```bash
 uv run --locked biternion-synthetic install-models \
   --source-repo /home/b920405/git/High-Angle_Robust_Fast_FaceAlignment
 uv run --locked biternion-synthetic plan \
-  --stage validation --batch-id validation-v003
+  --stage validation --batch-id validation-v004
 ```
 
 Submission is deliberately separate and requires both the exact pending count and an explicit spend cap:
 
 ```bash
 uv run --locked biternion-synthetic submit \
-  --batch-dir data/synthetic/batches/validation-v003 \
+  --batch-dir data/synthetic/batches/validation-v004 \
   --approve-requests 19 --spend-cap-usd 0.20
 ```
 
@@ -215,7 +216,7 @@ long side; its landmark/visibility signals remain diagnostic until calibrated ag
 `landmark_contact_sheet.jpg`. Fill `landmark_alignment` with `match`, `mismatch`, or `unresolved` for every
 review row; genuine rear views may be unresolved. Approval writes a hash-bound `landmark_calibration.json`,
 but it does not activate an HRFFA rejection gate. Validation approval also binds the profile-evaluation
-protocol and the account-verified model snapshot by SHA-256:
+protocol and the account-verified Batch model identifier by SHA-256:
 
 All three ONNX QA models run at batch size 1. SixD and HRFFA use TensorRT, CUDA, then CPU. **DEIMv2 never uses
 TensorRT** because its TensorRT result has shown an unexplained accuracy regression; DEIM uses CUDA, then CPU.
@@ -227,20 +228,20 @@ CUDA runtime, GPU compute capability, precision, model SHA-256, and `batch1`. An
 selects a new empty cache and can never reuse an engine produced by the previous runtime.
 
 ```bash
-uv run --locked biternion-synthetic collect --batch-dir data/synthetic/batches/validation-v003
-uv run --locked biternion-synthetic qa --batch-dir data/synthetic/batches/validation-v003
-uv run --locked biternion-synthetic review-prepare --batch-dir data/synthetic/batches/validation-v003
+uv run --locked biternion-synthetic collect --batch-dir data/synthetic/batches/validation-v004
+uv run --locked biternion-synthetic qa --batch-dir data/synthetic/batches/validation-v004
+uv run --locked biternion-synthetic review-prepare --batch-dir data/synthetic/batches/validation-v004
 uv run --locked biternion-synthetic margin-sheet \
-  --batch-dir data/synthetic/batches/validation-v003 \
-  --output data/synthetic/batches/validation-v003/margin_sheet.jpg
+  --batch-dir data/synthetic/batches/validation-v004 \
+  --output data/synthetic/batches/validation-v004/margin_sheet.jpg
 uv run --locked biternion-synthetic usage-report \
-  --batch-dir data/synthetic/batches/validation-v003 --actual-cost-usd ACTUAL_ACCOUNT_CHARGE
+  --batch-dir data/synthetic/batches/validation-v004 --actual-cost-usd ACTUAL_ACCOUNT_CHARGE
 uv run --locked biternion-synthetic approve \
-  --batch-dir data/synthetic/batches/validation-v003 --reviewer REVIEWER \
+  --batch-dir data/synthetic/batches/validation-v004 --reviewer REVIEWER \
   --approve-sign-calibration --crop-margin 0.15 \
   --evaluation-protocol data/towncentre/test_profiles_protocol.json \
-  --usage-report data/synthetic/batches/validation-v003/usage_report.json \
-  --account-verified-snapshot gpt-image-2-2026-04-21
+  --usage-report data/synthetic/batches/validation-v004/usage_report.json \
+  --account-verified-snapshot gpt-image-2
 ```
 
 Pilot planning refuses to proceed without this approved Validation evidence. Materialization writes a

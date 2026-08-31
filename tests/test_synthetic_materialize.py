@@ -8,7 +8,7 @@ from biternionnet.data import write_manifest
 from biternionnet.synthetic.generate import create_plan, load_state, read_plan, sha256_file, write_jsonl
 from biternionnet.synthetic.materialize import materialize_run
 
-CONFIG = Path(__file__).resolve().parents[1] / "configs" / "synthetic_towncentre.yaml"
+CONFIG = Path(__file__).resolve().parents[1] / "configs" / "synthetic_towncentre_batch.yaml"
 
 
 def _image(path: Path, height: int, width: int, value: int = 120):

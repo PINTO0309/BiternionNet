@@ -1,0 +1,115 @@
+version: 1
+
+api:
+  model: gpt-image-2
+  endpoint: /v1/images/generations
+  completion_window: 24h
+  quality: low
+  background: opaque
+  output_format: jpeg
+  output_compression: 92
+  n: 1
+  allowed_sizes: [1024x1536, 1024x1024, 1536x1024]
+  documented_reference_cost_per_image_usd: 0.006
+
+storage:
+  format: jpeg
+  quality: 92
+
+models:
+  deimv2:
+    source: data/models/deimv2_wholebody49_boxes_only.onnx
+    target: data/models/deimv2_wholebody49_boxes_only.onnx
+    sha256: c8e9ef7e79214c6eda7b7efa4d78e3dd3924d78d7f3ee069bfae483a25bc8fe4
+    license: Apache-2.0
+  sixdrepnet360:
+    source: data/models/sixdrepnet360_1x3x224x224_full.onnx
+    target: data/models/sixdrepnet360_1x3x224x224_full.onnx
+    sha256: 422b69d17bf02e164bd1062f5e970f67f1688cadf7d700800fad5fa12a16fc82
+    license: SixDRepNet upstream terms
+  hrffa_vitl_ibug68:
+    source: data/models/hrffa_vitl_ibug68_1x3x320x320.onnx
+    target: data/models/hrffa_vitl_ibug68_1x3x320x320.onnx
+    sha256: 96618ad81661dcce65eecd542b6cc3bebd1f1b9ebe0647c4a7c2dab63c4562e7
+    license: HRFFA derived weights; review upstream derived-work terms before redistribution
+
+generation:
+  shard_size: 500
+  camera_elevation: {min: 30, max: 60}
+  head_pitch: {min: -10, max: 10}
+  roll: 0
+  size_schedule:
+    - {value: 1024x1536, share: 50}
+    - {value: 1024x1024, share: 30}
+    - {value: 1536x1024, share: 20}
+
+qa:
+  detector_score_threshold: 0.25
+  head_height_ratio: {min: 0.25, max: 0.50}
+  margin_min_head_ratio: 0.50
+  require_single_head: true
+  require_body_detection: true
+  reject_duplicates: true
+  reject_back: false
+  pan_tolerance_deg: 25
+  rear_sixd_min_agreement: 0.70
+  rear_deim_max_conflict: 0.10
+  crop_margin_candidates: [0.00, 0.05, 0.10, 0.15, 0.20]
+  elevation:
+    quantile: 0.90
+    buffer_deg: 5.0
+    minimum_threshold_deg: 10.0
+    maximum_threshold_deg: 25.0
+    minimum_negative_camera_ratio: 0.50
+
+targets:
+  abs_pan_bins: [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160, 170, 180]
+  floor_120_accepted: [0, 0, 60, 45, 0, 13, 29, 91, 116, 77, 121, 135, 117, 37, 0, 0, 0, 0, 0]
+  floor_120_initial_requests: [0, 0, 120, 90, 0, 26, 58, 182, 232, 154, 242, 270, 234, 74, 0, 0, 0, 0, 0]
+  uniform_200_accepted: [63, 152, 220, 205, 114, 173, 189, 251, 276, 237, 281, 295, 277, 197, 138, 112, 125, 45, 0]
+  uniform_200_initial_requests: [126, 304, 440, 410, 228, 346, 378, 502, 552, 474, 562, 590, 554, 394, 276, 224, 250, 90, 0]
+
+stages:
+  validation: {count: 19, shard_size: 19}
+  pilot: {count: 380, shard_size: 380, bin_counts: [20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20]}
+  floor_120: {count: 1682, shard_size: 500, bin_counts: [0, 0, 120, 90, 0, 26, 58, 182, 232, 154, 242, 270, 234, 74, 0, 0, 0, 0, 0]}
+  uniform_200: {count: 6700, shard_size: 500, bin_counts: [126, 304, 440, 410, 228, 346, 378, 502, 552, 474, 562, 590, 554, 394, 276, 224, 250, 90, 0]}
+
+prompt:
+  preamble: "Create one photorealistic, unedited-looking CCTV-style photograph of one fictional adult. The person must not resemble a real public or private individual."
+  camera: "Use a camera elevation of {camera_elevation:+d} degrees above the subject, visibly looking down toward the crown and shoulders. Keep the person's own head pitch near {head_pitch:+d} degrees and image-plane roll at 0 degrees."
+  pan: "Use head pan {signed_pan:+d} degrees ({orientation}). This orientation must dominate the image. Pure back-of-head views are allowed and required when requested."
+  framing: "Show exactly one complete head, hair, skull, chin, neck, and both shoulders. Target head height 30% to 45% of the image with clear margin on every side; never crop the head."
+  realism: "Use a natural street, plaza, station forecourt, crossing, or shopping-street background with plausible surveillance optics and lighting. No illustration, CGI, beauty filter, text, watermark, border, collage, bystander, reflection, poster face, or visible AI artifact."
+  scenes: [city sidewalk, public plaza, station forecourt, pedestrian crossing, shopping street]
+  lighting: [daylight, overcast daylight, harsh sunlight, dim but readable CCTV lighting, mixed storefront lighting]
+  ages: [20s, 30s, 40s, 50s, 60s, 70s]
+  gender_presentations: [woman, man]
+  skin_tones: [Fitzpatrick I, Fitzpatrick II, Fitzpatrick III, Fitzpatrick IV, Fitzpatrick V, Fitzpatrick VI]
+  hair: [short straight hair, long straight hair, curly hair, closely cropped hair, bald head, tied-back hair]
+  clothing: [casual cotton shirt, knit sweater, light jacket, office-casual clothing, practical outdoor clothing, plain hoodie]
+  accessories: [none, eyeglasses, hat or hood, none, none]
+
+# One immutable record per absolute 10-degree bin. Signs are chosen so that all
+# eight DEIM direction sectors, both profile sides, three camera elevations, and
+# an unambiguous back-of-head example are present.
+validation:
+  - {abs_pan: 0, signed_pan: 0, camera_elevation: 30}
+  - {abs_pan: 10, signed_pan: -10, camera_elevation: 45}
+  - {abs_pan: 20, signed_pan: 20, camera_elevation: 60}
+  - {abs_pan: 30, signed_pan: -30, camera_elevation: 30}
+  - {abs_pan: 40, signed_pan: 40, camera_elevation: 45}
+  - {abs_pan: 50, signed_pan: -50, camera_elevation: 60}
+  - {abs_pan: 60, signed_pan: 60, camera_elevation: 30}
+  - {abs_pan: 70, signed_pan: -70, camera_elevation: 45}
+  - {abs_pan: 80, signed_pan: 80, camera_elevation: 60}
+  - {abs_pan: 90, signed_pan: -90, camera_elevation: 30}
+  - {abs_pan: 100, signed_pan: 100, camera_elevation: 45}
+  - {abs_pan: 110, signed_pan: -110, camera_elevation: 60}
+  - {abs_pan: 120, signed_pan: 120, camera_elevation: 30}
+  - {abs_pan: 130, signed_pan: -130, camera_elevation: 45}
+  - {abs_pan: 140, signed_pan: 140, camera_elevation: 60}
+  - {abs_pan: 150, signed_pan: -150, camera_elevation: 30}
+  - {abs_pan: 160, signed_pan: 160, camera_elevation: 45}
+  - {abs_pan: 170, signed_pan: -170, camera_elevation: 60}
+  - {abs_pan: 180, signed_pan: 180, camera_elevation: 45}
