@@ -22,6 +22,7 @@ from .ort_policy import (
 INPUT_SIZE = 640
 CLASS_BODY = 0
 CLASS_HEAD = 7
+CLASS_FACE = 16
 DIR8_CLASSES = {
     8: "front",
     9: "right_front",
@@ -32,7 +33,9 @@ DIR8_CLASSES = {
     14: "left_side",
     15: "left_front",
 }
-KEEP_CLASSES = frozenset([CLASS_BODY, CLASS_HEAD, *DIR8_CLASSES, 16, 17, 18, 19, 20])
+KEEP_CLASSES = frozenset(
+    [CLASS_BODY, CLASS_HEAD, *DIR8_CLASSES, CLASS_FACE, 17, 18, 19, 20]
+)
 
 
 class Deimv2Detector:

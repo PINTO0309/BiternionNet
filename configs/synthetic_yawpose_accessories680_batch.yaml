@@ -1,0 +1,145 @@
+version: 1
+
+api:
+  model: gpt-image-2
+  endpoint: /v1/images/generations
+  completion_window: 24h
+  quality: low
+  background: opaque
+  output_format: jpeg
+  output_compression: 92
+  n: 1
+  allowed_sizes: [1024x1536, 1024x1024, 1536x1024]
+  documented_reference_cost_per_image_usd: 0.0032
+
+storage: {format: jpeg, quality: 92}
+
+models:
+  deimv2:
+    source: data/models/deimv2_wholebody49_boxes_only.onnx
+    target: data/models/deimv2_wholebody49_boxes_only.onnx
+    sha256: c8e9ef7e79214c6eda7b7efa4d78e3dd3924d78d7f3ee069bfae483a25bc8fe4
+    license: Apache-2.0
+  sixdrepnet360:
+    source: data/models/sixdrepnet360_1x3x224x224_full.onnx
+    target: data/models/sixdrepnet360_1x3x224x224_full.onnx
+    sha256: 422b69d17bf02e164bd1062f5e970f67f1688cadf7d700800fad5fa12a16fc82
+    license: SixDRepNet upstream terms
+  hrffa_vitl_ibug68:
+    source: data/models/hrffa_vitl_ibug68_1x3x320x320.onnx
+    target: data/models/hrffa_vitl_ibug68_1x3x320x320.onnx
+    sha256: 96618ad81661dcce65eecd542b6cc3bebd1f1b9ebe0647c4a7c2dab63c4562e7
+    license: HRFFA derived weights; review upstream derived-work terms before redistribution
+
+generation:
+  label_convention: yawpose
+  camera_regime: yawpose_rear
+  camera_elevation: {min: -30, max: 30, schedule: random_integer, zero_share: 70}
+  # 136 outer-pitch records keep the additional run at the same 80/20 split.
+  head_pitch: {min: -10, max: 10, outer_min_abs: 11, outer_max_abs: 25, outer_count: 136}
+  roll: 0
+  size_schedule:
+    - {value: 1024x1536, share: 50}
+    - {value: 1536x1024, share: 50}
+
+qa:
+  detector_score_threshold: 0.25
+  head_height_ratio: {min: 0.25, max: 0.50}
+  margin_min_head_ratio: 0.50
+  require_single_head: true
+  require_body_detection: true
+  reject_duplicates: true
+  reject_back: false
+  pan_tolerance_deg: 30
+  enforce_head_height_ratio: false
+  deim_direction_max_bin_distance: 2
+  rear_sixd_min_agreement: 0.70
+  rear_deim_max_conflict: 0.10
+  crop_margin_candidates: [0.05]
+  deim_crop_margin: 0.05
+  elevation:
+    quantile: 0.90
+    buffer_deg: 5.0
+    minimum_threshold_deg: 10.0
+    maximum_threshold_deg: 25.0
+    minimum_negative_camera_ratio: 0.50
+
+targets:
+  yaw_bins: [20, 30, 40, 50, 60, 70, 90, 100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200, 210, 220, 230, 240, 250, 260, 300, 310, 320]
+  combined_target_count: 12062
+  retained_run_count: 11382
+
+stages:
+  yawpose_accessories_680:
+    count: 680
+    shard_size: 500
+    direct_production_allowed: true
+    # This is a pure addition after the existing 11,382 records, not a replacement.
+    # Each visible accessory condition contributes exactly 20 records per eligible bin.
+    bin_counts: [40, 40, 40, 40, 40, 40, 20, 20, 20, 20, 20, 20, 20, 20, 0, 0, 20, 20, 20, 20, 20, 20, 20, 20, 40, 40, 40]
+    mask_bin_counts: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    accessory_bin_counts:
+      # Sunglasses are restricted to the nine face-visible target bins.
+      sunglasses: [20, 20, 20, 20, 20, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 20, 20, 20]
+      # Ear piercings cover every target bin except the pure-back 170–190° band.
+      ear_piercing: [20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 0, 0, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20]
+
+prompt:
+  contexts:
+    - walking away along a public walkway
+    - studying a notice board
+    - looking through a window
+    - waiting naturally in a checkout queue
+    - walking while making a phone call
+    - searching a store shelf
+    - leaving an office entrance
+    - standing on a station platform
+    - naturally looking toward a nearby conversation partner outside the frame
+  backgrounds:
+    - realistic city sidewalk
+    - everyday office interior
+    - natural retail store aisle
+    - railway station concourse
+    - residential entrance
+    - public plaza
+    - ordinary cafe interior
+    - covered shopping street
+  lighting:
+    - natural daylight
+    - overcast daylight
+    - ordinary indoor lighting
+    - warm evening light
+    - dim but readable surveillance lighting
+    - mixed storefront lighting
+  lens_feels:
+    - natural smartphone optics
+    - fixed surveillance-camera optics
+    - mild wide-angle CCTV optics without distortion
+    - ordinary documentary-photo optics
+  ages: [18-24, 25-34, 35-44, 45-54, 55-64, 65-72, 73-80]
+  gender_presentations: [woman, man]
+  skin_tones: [Fitzpatrick I, Fitzpatrick II, Fitzpatrick III, Fitzpatrick IV, Fitzpatrick V, Fitzpatrick VI]
+  hair:
+    - short straight hair
+    - long straight hair
+    - short curly hair
+    - long curly hair
+    - tied-back hair
+    - braided hair
+    - closely cropped hair
+    - shaved head
+    - thinning hair
+    - bald head
+    - layered medium-length hair
+    - natural textured hair
+  clothing:
+    - casual cotton shirt
+    - knit sweater
+    - light jacket
+    - office-casual clothing
+    - practical outdoor clothing
+    - plain hoodie
+    - collared shirt
+    - simple coat
+  # Avoid hoods/headphones/headscarves that would hide the requested eyewear or ear.
+  headwear: [none, none, plain cap, knit hat]

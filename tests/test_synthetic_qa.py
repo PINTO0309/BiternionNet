@@ -19,8 +19,10 @@ from biternionnet.synthetic.landmarks import (
 from biternionnet.synthetic.qa import (
     QA_IMPLEMENTATION_VERSION,
     REVIEW_COLUMNS,
+    _apply_detection_annotations,
     calibrate_pitch,
     classify_elevation,
+    confirm_rear_face_candidate,
     direction_bin_distance,
     direction_consistent,
     effective_qa_config,
@@ -34,6 +36,11 @@ from biternionnet.synthetic.qa import (
 
 CONFIG = (
     Path(__file__).resolve().parents[1] / "configs" / "synthetic_towncentre_batch.yaml"
+)
+YAWPOSE_CONFIG = (
+    Path(__file__).resolve().parents[1]
+    / "configs"
+    / "synthetic_yawpose_rear8000_batch.yaml"
 )
 
 
@@ -108,7 +115,25 @@ def test_back_view_is_allowed_and_direction_mapping_is_explicit():
         "head_square_crop_within_image": True,
         "direction_consistent": True,
         "direction": "back",
+        "label_convention": "yawpose",
+        "yaw_yawpose": 0,
+        "face_max_score": 0.8,
     }
+    reasons, complete = quality_reasons(row, config)
+    assert complete and reasons == []
+    row["yaw_yawpose"] = 110
+    reasons, complete = quality_reasons(row, config)
+    assert complete and reasons == []
+    row["yaw_yawpose"] = 249
+    reasons, complete = quality_reasons(row, config)
+    assert complete and reasons == ["rear_face_visible"]
+    row["landmark_status"] = "ok"
+    row["hrffa_core_face_high_conf_visible_count"] = 0
+    reasons, complete = quality_reasons(row, config)
+    assert complete and reasons == []
+    row.pop("landmark_status")
+    row.pop("hrffa_core_face_high_conf_visible_count")
+    row["yaw_yawpose"] = 250
     reasons, complete = quality_reasons(row, config)
     assert complete and reasons == []
     row["direction_consistent"] = False
@@ -187,6 +212,65 @@ def test_quality_margin_gate_uses_five_percent_square_crop_not_legacy_ratios():
     row["head_square_crop_within_image"] = False
     reasons, complete = quality_reasons(row, config)
     assert complete and reasons == ["head_crop_outside_image"]
+
+
+def test_detection_annotations_support_offset_production_serials():
+    class NoHeadDetector:
+        @staticmethod
+        def infer(_image):
+            return []
+
+    rows = [{"custom_id": "offset-sample"}]
+    plan = [{"serial": 1001, "custom_id": "offset-sample"}]
+    images = {"offset-sample": np.zeros((32, 32, 3), dtype=np.uint8)}
+
+    _apply_detection_annotations(
+        rows,
+        plan,
+        images,
+        NoHeadDetector(),
+        crop_margin=0.05,
+    )
+
+    assert rows[0]["detector_status"] == "no_head"
+    assert rows[0]["head_count"] == 0
+
+
+def test_yawpose_rear_face_detection_is_a_quality_edit_reason():
+    config = load_config(YAWPOSE_CONFIG)
+    row = {
+        "exists": True,
+        "image_valid": True,
+        "dimension_match": True,
+        "duplicate_of": None,
+        "detector_status": "ok",
+        "head_count": 1,
+        "body_count": 1,
+        "head_height_ratio": 0.35,
+        "head_square_crop_within_image": True,
+        "label_convention": "yawpose",
+        "yaw_yawpose": 100,
+        "face_max_score": 0.6,
+    }
+
+    reasons, complete = quality_reasons(row, config)
+    assert complete and reasons == []
+
+
+def test_hrffa_no_core_face_landmarks_clear_deim_rear_face_candidate():
+    row = {
+        "quality_gate_reasons": ["rear_face_visible"],
+        "quality_gate_complete": True,
+        "quality_gate_pass": False,
+        "landmark_status": "ok",
+        "hrffa_core_face_high_conf_visible_count": 0,
+    }
+
+    confirm_rear_face_candidate(row)
+
+    assert row["quality_gate_reasons"] == []
+    assert row["quality_gate_pass"] is True
+    assert row["rear_face_candidate_confirmation"].startswith("deim_false_positive")
 
 
 def test_validation_pitch_trend_and_pilot_rear_policy_are_fail_closed():
@@ -449,7 +533,7 @@ def test_edit_qa_refuses_to_re_evaluate_incompatible_passed_parent(tmp_path):
     parent_dir = _add_passed_parent_qa(run_dir, calibration_path)
     report_path = parent_dir / "qa_report.json"
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    report["qa_implementation_version"] = QA_IMPLEMENTATION_VERSION - 1
+    report["qa_implementation_version"] = QA_IMPLEMENTATION_VERSION - 4
     report_path.write_text(json.dumps(report) + "\n", encoding="utf-8")
 
     with pytest.raises(PipelineError, match="refusing to re-evaluate 1 passed"):

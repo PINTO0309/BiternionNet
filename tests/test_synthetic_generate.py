@@ -14,6 +14,7 @@ from biternionnet.synthetic.generate import (
     _edit_prompt,
     _pitch_calibration_tail_candidates,
     _qa_edit_reasons,
+    _regeneration_prompt,
     _token_based_batch_plan,
     advance_sequential_batches,
     build_plan,
@@ -30,6 +31,7 @@ from biternionnet.synthetic.generate import (
     read_plan,
     refresh_status,
     save_state,
+    seal_collected_prefix,
     sha256_file,
     submit_pending,
     write_jsonl,
@@ -46,6 +48,21 @@ NEAR_LEVEL_CONFIG = (
     Path(__file__).resolve().parents[1]
     / "configs"
     / "synthetic_towncentre_near_level_batch.yaml"
+)
+YAWPOSE_CONFIG = (
+    Path(__file__).resolve().parents[1]
+    / "configs"
+    / "synthetic_yawpose_rear8000_batch.yaml"
+)
+YAWPOSE_FULL_CONFIG = (
+    Path(__file__).resolve().parents[1]
+    / "configs"
+    / "synthetic_yawpose_full11382_batch.yaml"
+)
+YAWPOSE_ACCESSORY_CONFIG = (
+    Path(__file__).resolve().parents[1]
+    / "configs"
+    / "synthetic_yawpose_accessories680_batch.yaml"
 )
 
 
@@ -415,6 +432,255 @@ def test_near_level_plan_preserves_pan_distribution_and_submits_serially(tmp_pat
     assert client.batches.created == 1
 
 
+def test_yawpose_rear_plan_matches_shortage_distribution_and_sign_contract(tmp_path):
+    run = create_plan(
+        YAWPOSE_CONFIG,
+        "yawpose_rear_8000",
+        "production-yawpose-rear8000-v001",
+        tmp_path,
+        seed=20260901,
+        direct_production=True,
+        sequential_batches=True,
+    )
+    state = load_state(run)
+    rows = list(read_plan(run, state).values())
+    expected = [
+        91,
+        250,
+        221,
+        258,
+        419,
+        540,
+        591,
+        566,
+        728,
+        818,
+        727,
+        565,
+        592,
+        539,
+        420,
+        258,
+        221,
+        196,
+    ]
+
+    assert state["target_count"] == 8000
+    assert state["label_convention"] == "yawpose"
+    assert state["sequential_batches"] is True
+    assert [len(shard["custom_ids"]) for shard in state["shards"]] == [500] * 16
+    assert Counter(row["bin"] for row in rows) == Counter(
+        {
+            f"yaw_{start}_{start + 10}": count
+            for start, count in zip(range(90, 270, 10), expected, strict=True)
+        }
+    )
+    for start, count in zip(range(90, 270, 10), expected, strict=True):
+        integer_counts = Counter(
+            row["yaw_yawpose"]
+            for row in rows
+            if row["bin"] == f"yaw_{start}_{start + 10}"
+        )
+        assert set(integer_counts) == set(range(start, start + 10))
+        assert max(integer_counts.values()) - min(integer_counts.values()) <= 1
+        assert sum(integer_counts.values()) == count
+
+    camera_counts = Counter(row["cam"] for row in rows)
+    assert camera_counts[0] == 5600
+    assert sum(camera_counts[value] for value in range(-30, 0)) == 1200
+    assert sum(camera_counts[value] for value in range(1, 31)) == 1200
+    assert set(camera_counts[value] for value in [*range(-30, 0), *range(1, 31)]) == {
+        40
+    }
+    assert Counter(row["size"] for row in rows) == {
+        "1024x1536": 4000,
+        "1536x1024": 4000,
+    }
+    assert all(-10 <= row["pitch"] <= 10 and row["roll"] == 0 for row in rows)
+    masked = [row for row in rows if row.get("augmentation_type") == "face_mask"]
+    assert len(masked) == 152
+    assert {row["bin"] for row in masked} == {
+        "yaw_90_100",
+        "yaw_100_110",
+        "yaw_250_260",
+        "yaw_260_270",
+    }
+    assert all(
+        row["filename"]
+        == (
+            f"yawp{row['yaw_yawpose']:+04d}_pitch{row['pitch']:+03d}_"
+            f"cam{row['cam']:+03d}_{row['serial']:06d}.jpg"
+        )
+        for row in rows
+    )
+    required = {
+        "serial",
+        "bin",
+        "yaw_yawpose",
+        "pitch",
+        "cam",
+        "roll",
+        "visible_side",
+        "size",
+        "context",
+        "anchor",
+        "gender",
+        "age",
+        "skin_tone",
+        "hair",
+        "clothing",
+        "headwear",
+        "lens_feel",
+        "background",
+        "lighting",
+        "custom_id",
+        "filename",
+        "prompt",
+    }
+    assert all(required <= row.keys() for row in rows)
+    assert all("+90 degrees faces screen-left" in row["prompt"] for row in rows)
+    assert "pure centered back-of-head" in next(
+        row["anchor"] for row in rows if row["yaw_yawpose"] == 180
+    )
+
+
+def test_yawpose_v11_remainder_adds_front_bins_and_continues_serials(tmp_path):
+    run = create_plan(
+        YAWPOSE_FULL_CONFIG,
+        "yawpose_full_remainder_10382",
+        "production-yawpose-full11382-v002",
+        tmp_path,
+        seed=20260901,
+        serial_offset=1000,
+        direct_production=True,
+        sequential_batches=True,
+    )
+    state = load_state(run)
+    rows = list(read_plan(run, state).values())
+
+    assert state["target_count"] == 10382
+    assert state["serial_offset"] == 1000
+    assert min(row["serial"] for row in rows) == 1001
+    assert max(row["serial"] for row in rows) == 11382
+    assert [len(shard["custom_ids"]) for shard in state["shards"]] == [500] * 20 + [
+        382
+    ]
+    assert sum(row["visible_side"] == "three_quarter_left" for row in rows) == 1718
+    assert sum(row["visible_side"] == "three_quarter_right" for row in rows) == 552
+    assert sum(abs(row["pitch"]) > 10 for row in rows) == 2276
+    assert sum(row.get("augmentation_type") == "face_mask" for row in rows) == 610
+    assert all(
+        "both eyes remain visible" in row["anchor"]
+        for row in rows
+        if row["visible_side"].startswith("three_quarter")
+    )
+
+
+def test_yawpose_accessories_are_uniform_per_eligible_bin(tmp_path):
+    run = create_plan(
+        YAWPOSE_ACCESSORY_CONFIG,
+        "yawpose_accessories_680",
+        "production-yawpose-accessories680-v001",
+        tmp_path,
+        seed=20260902,
+        serial_offset=11382,
+        direct_production=True,
+        sequential_batches=True,
+    )
+    state = load_state(run)
+    rows = list(read_plan(run, state).values())
+
+    assert state["target_count"] == 680
+    assert state["serial_offset"] == 11382
+    assert [len(shard["custom_ids"]) for shard in state["shards"]] == [500, 180]
+    assert min(row["serial"] for row in rows) == 11383
+    assert max(row["serial"] for row in rows) == 12062
+    assert Counter(row["accessory_type"] for row in rows) == {
+        "sunglasses": 180,
+        "ear_piercing": 500,
+    }
+    assert all(row["augmentation_type"] == "accessory" for row in rows)
+    assert not any(row.get("mask_description") for row in rows)
+    assert sum(abs(row["pitch"]) > 10 for row in rows) == 136
+    assert Counter(row["size"] for row in rows) == {
+        "1024x1536": 340,
+        "1536x1024": 340,
+    }
+
+    sunglasses = [row for row in rows if row["accessory_type"] == "sunglasses"]
+    assert {int(row["bin"].split("_")[1]) for row in sunglasses} <= {
+        20,
+        30,
+        40,
+        50,
+        60,
+        70,
+        300,
+        310,
+        320,
+    }
+    assert set(Counter(row["bin"] for row in sunglasses).values()) == {20}
+    assert all("Required additional accessory:" in row["prompt"] for row in rows)
+    assert all(row["accessory_description"] in row["prompt"] for row in rows)
+
+    ear_piercings = [
+        row for row in rows if row["accessory_type"] == "ear_piercing"
+    ]
+    assert not {
+        int(row["bin"].split("_")[1]) for row in ear_piercings
+    }.intersection({170, 180})
+    assert set(Counter(row["bin"] for row in ear_piercings).values()) == {20}
+
+
+def test_seal_collected_prefix_archives_only_never_submitted_tail(tmp_path):
+    config = load_config(CONFIG)
+    config["stages"]["uniform_200"].update(
+        {
+            "count": 2,
+            "shard_size": 1,
+            "bin_counts": [1, 1] + [0] * 17,
+        }
+    )
+    config_path = tmp_path / "scope-fixture.yaml"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    run = create_plan(
+        config_path,
+        "uniform_200",
+        "scope-fixture",
+        tmp_path,
+        seed=4,
+        direct_production=True,
+        sequential_batches=True,
+    )
+    state = load_state(run)
+    plan = read_plan(run, state)
+    first_id = state["shards"][0]["custom_ids"][0]
+    first = plan[first_id]
+    image_path = run / "images" / first["filename"]
+    width, height = map(int, first["size"].split("x"))
+    Image.new("RGB", (width, height), "gray").save(image_path, "JPEG")
+    state["items"][first_id].update(
+        {"status": "success", "sha256": sha256_file(image_path)}
+    )
+    state["shards"][0]["attempts"][0].update(
+        {"status": "completed", "batch_id": "batch-completed"}
+    )
+    save_state(run, state)
+
+    result = seal_collected_prefix(run)
+    sealed = load_state(run)
+
+    assert result["sealed_target_count"] == 1
+    assert result["discarded_unsubmitted_requests"] == 1
+    assert sealed["status"] == "collected"
+    assert sealed["target_count"] == sealed["request_count"] == 1
+    assert len(sealed["shards"]) == len(sealed["items"]) == 1
+    archive = run / "superseded_unsubmitted"
+    assert (archive / "original_batch_state.json").is_file()
+    assert len((archive / "original_generation_plan.jsonl").read_text().splitlines()) == 2
+    assert len((run / "generation_plan.jsonl").read_text().splitlines()) == 1
+
+
 class _FakeFiles:
     def __init__(self):
         self.created = 0
@@ -643,6 +909,109 @@ def test_qa_failures_create_hash_bound_high_fidelity_edit_cycle(tmp_path):
     )
     assert assisted["pitch_reference_object"]["downward_correction_deg"] == 25
     assert assisted["pitch_reference_object"]["position"] == "lower-nose-aligned"
+
+
+def test_final_edit_failures_can_be_regenerated_without_another_image_edit(tmp_path):
+    root = tmp_path / "runs"
+    parent = create_plan(CONFIG, "validation", "validation-edit04", root, seed=3)
+    state = load_state(parent)
+    state["edit_round"] = 4
+    save_state(parent, state)
+    plan = read_plan(parent, state)
+    failed_parent_id = next(iter(plan))
+    qa_rows = []
+    for record in plan.values():
+        width, height = map(int, record["size"].split("x"))
+        Image.new("RGB", (width, height), (30, 60, 90)).save(
+            parent / "images" / record["filename"], "JPEG", quality=92
+        )
+        failed = record["custom_id"] == failed_parent_id
+        qa_rows.append(
+            {
+                "custom_id": record["custom_id"],
+                "abs_pan_bin": record["abs_pan_bin"],
+                "camera_elevation": record["camera_elevation"],
+                "pose_status": "ok",
+                "pan_error_deg": 40.0 if failed else 0.0,
+                "sixd_pitch_deg": -float(record["camera_elevation"]),
+                "direction_consistent": True,
+                "quality_gate_reasons": ["rear_face_visible"] if failed else [],
+            }
+        )
+    write_jsonl(parent / "auto_qa.jsonl", qa_rows)
+
+    child = create_edit_cycle(
+        parent,
+        "validation-regen01",
+        root,
+        max_edit_rounds=4,
+        planning_cost_per_request_usd=0.03,
+        regenerate_quality_failures=True,
+    )
+    child_state = load_state(child)
+    request = json.loads(
+        (child / child_state["shards"][0]["attempts"][0]["input_path"])
+        .read_text()
+        .splitlines()[0]
+    )
+    regenerated = next(
+        item
+        for item in child_state["items"].values()
+        if item["operation"] == "regenerate_quality_failure"
+    )
+    assert child_state["edit_round"] == 5
+    assert child_state["max_edit_rounds"] == 4
+    assert child_state["regenerate_quality_failures"] is True
+    assert request["url"] == "/v1/images/generations"
+    assert "no eye, eyebrow, nose bridge" in request["body"]["prompt"]
+    assert "Generate a completely new independent image" in request["body"]["prompt"]
+    assert "edit_prompt" not in regenerated
+    assert regenerated["regeneration_prompt"] == request["body"]["prompt"]
+    assert not list((child / "edit_inputs").glob("*.jpg"))
+
+
+@pytest.mark.parametrize(("labelled_yaw", "retry_yaw"), [(97, 122), (253, 228)])
+def test_rear_face_regeneration_aims_within_tolerance_toward_full_back(
+    labelled_yaw, retry_yaw
+):
+    prompt = _regeneration_prompt(
+        {
+            "label_convention": "yawpose",
+            "yaw_yawpose": labelled_yaw,
+            "anchor": "Keep the named rear-side anchor.",
+            "prompt": "Original labelled target.",
+        },
+        {},
+        ["rear_face_visible"],
+    )
+    assert f"physical head yaw visually {retry_yaw:+d} degrees" in prompt
+    assert "within the allowed 30-degree label tolerance" in prompt
+
+
+@pytest.mark.parametrize(
+    ("labelled_yaw", "estimated_yaw", "retry_yaw"),
+    [(92, 52.4, 117), (20, 60.6, 355), (268, 300.8, 243)],
+)
+def test_pan_regeneration_compensates_observed_bias_within_tolerance(
+    labelled_yaw, estimated_yaw, retry_yaw
+):
+    prompt = _regeneration_prompt(
+        {
+            "label_convention": "yawpose",
+            "yaw_yawpose": labelled_yaw,
+            "pan_detail": "Keep the requested directional anchor.",
+            "prompt": "Original labelled target.",
+        },
+        {"pose_status": "ok", "estimated_pan_deg": estimated_yaw},
+        ["yawpose_out_of_tolerance"],
+    )
+    assert f"physical head visually at {retry_yaw:+d} degrees" in prompt
+    assert "within the allowed 30-degree tolerance" in prompt
+    assert f"annotation label at {labelled_yaw:+d} degrees" in prompt
+    if labelled_yaw == 20:
+        assert "both eyes and both cheeks must be visible" in prompt
+    else:
+        assert "unmistakable strict side profile" in prompt
 
 
 def test_mask_augmentation_plans_twenty_percent_as_separate_edits(tmp_path):

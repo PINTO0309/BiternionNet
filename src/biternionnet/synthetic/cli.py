@@ -24,9 +24,11 @@ from .generate import (
     prepare_resume,
     read_jsonl,
     refresh_status,
+    seal_collected_prefix,
     sha256_file,
     submit_pending,
 )
+from .interp import materialize_yawpose_runs
 from .materialize import materialize_run, render_deim_crop_margin_sheet
 from .models import install_model_assets
 from .profiles import finalize_test_profiles, plan_profile_candidates
@@ -55,6 +57,11 @@ def plan_command(
     ),
     output_root: Path = typer.Option(Path("data/synthetic")),
     seed: int = typer.Option(20260831),
+    serial_offset: int = typer.Option(
+        0,
+        min=0,
+        help="Add this value to generated serials and filenames.",
+    ),
     approved_batch_dir: Optional[Path] = typer.Option(None, exists=True),
     bin_counts: Optional[str] = typer.Option(
         None, help="Optional comma-separated 19-bin top-up request counts."
@@ -98,6 +105,7 @@ def plan_command(
         seed,
         approved_batch_dir,
         bin_counts=counts,
+        serial_offset=serial_offset,
         direct_production=direct_production,
         single_batch=single_batch,
         sequential_batches=sequential_batches,
@@ -109,6 +117,7 @@ def plan_command(
             "batch_dir": str(run_dir),
             "stage": stage,
             "requests": state["request_count"],
+            "serial_offset": state["serial_offset"],
             "shards": len(state["shards"]),
             "quality": state["api_request"]["quality"],
             "model": state["api_request"]["model"],
@@ -151,6 +160,24 @@ def edit_plan_command(
             "the minimum number of future edit Batches."
         ),
     ),
+    generation_token_evidence_run: Optional[Path] = typer.Option(
+        None,
+        "--generation-token-evidence-run",
+        exists=True,
+        file_okay=False,
+        help=(
+            "Completed image-generation run whose observed input-token mean "
+            "determines regeneration Batch sizing."
+        ),
+    ),
+    regenerate_quality_failures: bool = typer.Option(
+        False,
+        "--regenerate-quality-failures",
+        help=(
+            "Regenerate selected QA failures from their original labelled prompt "
+            "instead of editing the failed image. This may follow the final edit round."
+        ),
+    ),
     only_reason: Optional[list[str]] = typer.Option(
         None,
         "--only-reason",
@@ -168,7 +195,9 @@ def edit_plan_command(
         planning_cost_per_request_usd=planning_cost_per_request_usd,
         include_pitch_calibration_tail=include_pitch_calibration_tail,
         edit_token_evidence_run_dir=edit_token_evidence_run,
+        generation_token_evidence_run_dir=generation_token_evidence_run,
         only_edit_reasons=set(only_reason) if only_reason else None,
+        regenerate_quality_failures=regenerate_quality_failures,
     )
     state = load_state(run_dir)
     _print(
@@ -180,6 +209,9 @@ def edit_plan_command(
             "planning_projected_cost_usd": state["planning_projected_cost_usd"],
             "planning_cost_basis": state["planning_cost_basis"],
             "forced_edit_policy": state.get("forced_edit_policy"),
+            "regenerate_quality_failures": state.get(
+                "regenerate_quality_failures", False
+            ),
             "edit_reason_filter": state.get("edit_reason_filter"),
             "paid_request_submitted": False,
         }
@@ -286,6 +318,14 @@ def advance_sequential_command(
 @app.command("collect")
 def collect_command(batch_dir: Path = typer.Option(..., exists=True)) -> None:
     _print(collect_results(batch_dir))
+
+
+@app.command("seal-collected-prefix")
+def seal_collected_prefix_command(
+    batch_dir: Path = typer.Option(..., exists=True, file_okay=False),
+) -> None:
+    """Archive and remove only a never-submitted planned shard tail."""
+    _print(seal_collected_prefix(batch_dir))
 
 
 @app.command("resume-plan")
@@ -430,6 +470,24 @@ def materialize_command(
             seed=seed,
         )
     )
+
+
+@app.command("materialize-yawpose")
+def materialize_yawpose_command(
+    batch_dir: list[Path] = typer.Option(
+        ...,
+        "--batch-dir",
+        exists=True,
+        file_okay=False,
+        help="Fully promoted source run. Repeat to merge multiple yawpose runs.",
+    ),
+    output_root: Path = typer.Option(
+        Path("data/synthetic_interp/synthetic_004"),
+        help="Standalone output containing fixed 320x320 head crops.",
+    ),
+) -> None:
+    """Materialize promoted yawpose runs without TownCentre integration."""
+    _print(materialize_yawpose_runs(batch_dir, output_root=output_root))
 
 
 @app.command("top-up-plan")

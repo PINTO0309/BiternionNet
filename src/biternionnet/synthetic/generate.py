@@ -35,6 +35,7 @@ COMPLETION_WINDOW = "24h"
 BATCH_IMAGE_MODEL = "gpt-image-2"
 BATCH_ENQUEUED_TOKEN_LIMIT = 1_000_000
 ALLOWED_SIZES = {"1024x1536", "1024x1024", "1536x1024"}
+YAWPOSE_ALLOWED_BIN_STARTS = tuple(range(0, 360, 10))
 DEIM_CROP_MARGIN = 0.05
 PITCH_EDIT_REASONS = {
     "head_looks_up_at_camera",
@@ -57,9 +58,24 @@ MASK_VARIANTS = (
     "a plain white cup-shaped respirator mask without a valve",
     "a plain light-grey cup-shaped respirator mask without a valve",
 )
+ACCESSORY_VARIANTS = {
+    "sunglasses": (
+        "realistic non-reflective dark sunglasses, correctly seated on the nose and both ears",
+        "realistic thin-framed grey sunglasses with clearly tinted lenses, correctly worn",
+        "realistic plain black sunglasses with modest frames and non-mirrored lenses",
+        "realistic brown-tinted sunglasses with simple frames, correctly aligned on the face",
+    ),
+    "ear_piercing": (
+        "a single small silver stud piercing on the ear exposed by this head orientation",
+        "a single small gold stud piercing on the ear exposed by this head orientation",
+        "a single small plain silver hoop earring on the ear exposed by this head orientation",
+        "a single small plain gold hoop earring on the ear exposed by this head orientation",
+    ),
+}
 STATE_NAME = "batch_state.json"
 PLAN_NAME = "generation_plan.jsonl"
 STANDALONE_PROVENANCE_DIR = "standalone_provenance"
+SUPERSEDED_UNSUBMITTED_DIR = "superseded_unsubmitted"
 TERMINAL_STATUSES = {"completed", "failed", "expired", "cancelled"}
 ACTIVE_STATUSES = {"validating", "in_progress", "finalizing", "cancelling"}
 
@@ -240,15 +256,34 @@ def load_config(path: Path) -> dict[str, Any]:
             raise PipelineError(
                 f"models.{name}.sha256 must be a lowercase SHA-256 digest"
             )
-    targets = config.get("targets") or {}
-    bins = list(targets.get("abs_pan_bins") or [])
-    if bins != list(range(0, 181, 10)):
-        raise PipelineError("targets.abs_pan_bins must be 0..180 in 10-degree steps")
-    validation = config.get("validation") or []
-    if len(validation) != 19 or [int(row["abs_pan"]) for row in validation] != bins:
+    generation = config.get("generation") or {}
+    convention = generation.get("label_convention", "towncentre_pan")
+    if convention not in {"towncentre_pan", "yawpose"}:
         raise PipelineError(
-            "validation must contain exactly one ordered record per absolute pan bin"
+            "generation.label_convention must be towncentre_pan or yawpose"
         )
+    targets = config.get("targets") or {}
+    if convention == "yawpose":
+        bins = list(map(int, targets.get("yaw_bins") or []))
+        if (
+            not bins
+            or bins != sorted(set(bins))
+            or any(value not in YAWPOSE_ALLOWED_BIN_STARTS for value in bins)
+        ):
+            raise PipelineError(
+                "targets.yaw_bins must be unique sorted 10-degree starts in [0, 350]"
+            )
+    else:
+        bins = list(targets.get("abs_pan_bins") or [])
+        if bins != list(range(0, 181, 10)):
+            raise PipelineError(
+                "targets.abs_pan_bins must be 0..180 in 10-degree steps"
+            )
+        validation = config.get("validation") or []
+        if len(validation) != 19 or [int(row["abs_pan"]) for row in validation] != bins:
+            raise PipelineError(
+                "validation must contain exactly one ordered record per absolute pan bin"
+            )
     stages = config.get("stages") or {}
     for stage, stage_config in stages.items():
         count = int(stage_config["count"])
@@ -257,20 +292,47 @@ def load_config(path: Path) -> dict[str, Any]:
             raise PipelineError(f"invalid stage size for {stage}")
         bin_counts = stage_config.get("bin_counts")
         if bin_counts is not None and (
-            len(bin_counts) != 19 or sum(map(int, bin_counts)) != count
+            len(bin_counts) != len(bins) or sum(map(int, bin_counts)) != count
         ):
             raise PipelineError(f"invalid bin_counts for {stage}")
         mask_bin_counts = stage_config.get("mask_bin_counts")
+        masks = [0] * len(bins)
         if mask_bin_counts is not None:
             masks = list(map(int, mask_bin_counts))
             counts = list(map(int, bin_counts or []))
             if (
-                len(masks) != 19
+                len(masks) != len(bins)
                 or not counts
                 or any(mask < 0 or mask > total for mask, total in zip(masks, counts))
             ):
                 raise PipelineError(f"invalid mask_bin_counts for {stage}")
-    elevation = (config.get("generation") or {}).get("camera_elevation") or {}
+        accessory_bin_counts = stage_config.get("accessory_bin_counts")
+        if accessory_bin_counts is not None:
+            if not isinstance(accessory_bin_counts, dict) or not accessory_bin_counts:
+                raise PipelineError(f"invalid accessory_bin_counts for {stage}")
+            unknown = set(accessory_bin_counts) - set(ACCESSORY_VARIANTS)
+            if unknown:
+                raise PipelineError(
+                    f"unsupported accessory types for {stage}: {sorted(unknown)}"
+                )
+            accessory_counts: list[list[int]] = []
+            for accessory_type, values in accessory_bin_counts.items():
+                per_bin = list(map(int, values))
+                if len(per_bin) != len(bins) or any(value < 0 for value in per_bin):
+                    raise PipelineError(
+                        f"invalid accessory_bin_counts.{accessory_type} for {stage}"
+                    )
+                accessory_counts.append(per_bin)
+            counts = list(map(int, bin_counts or []))
+            if not counts or any(
+                masks[index] + sum(values[index] for values in accessory_counts)
+                > counts[index]
+                for index in range(len(bins))
+            ):
+                raise PipelineError(
+                    f"mask and accessory counts exceed bin_counts for {stage}"
+                )
+    elevation = generation.get("camera_elevation") or {}
     minimum = int(elevation.get("min", 0))
     maximum = int(elevation.get("max", 0))
     if minimum > maximum:
@@ -280,11 +342,20 @@ def load_config(path: Path) -> dict[str, Any]:
         raise PipelineError(
             "generation.camera_elevation.schedule must be random_integer or balanced_integer"
         )
-    if config.get("generation", {}).get("camera_regime", "high_angle") not in {
+    if generation.get("camera_regime", "high_angle") not in {
         "high_angle",
         "near_level",
+        "yawpose_rear",
     }:
-        raise PipelineError("generation.camera_regime must be high_angle or near_level")
+        raise PipelineError(
+            "generation.camera_regime must be high_angle, near_level, or yawpose_rear"
+        )
+    if convention == "yawpose":
+        if generation.get("camera_regime") != "yawpose_rear":
+            raise PipelineError("yawpose generation requires camera_regime=yawpose_rear")
+        zero_share = int(elevation.get("zero_share", 70))
+        if not 0 <= zero_share <= 100:
+            raise PipelineError("yawpose camera zero_share must be in [0, 100]")
     return config
 
 
@@ -404,6 +475,281 @@ def _balanced_integer_schedule(
         raise PipelineError("balanced camera schedule did not match the target count")
     rng.shuffle(schedule)
     return schedule
+
+
+def _balanced_discrete_schedule(
+    values: list[int], total: int, rng: random.Random
+) -> list[int]:
+    """Repeat discrete values as evenly as possible in deterministic random order."""
+    if not values or total < 0:
+        raise PipelineError("balanced discrete schedule has invalid inputs")
+    quotient, remainder = divmod(total, len(values))
+    extras = values[:]
+    rng.shuffle(extras)
+    counts = {value: quotient for value in values}
+    for value in extras[:remainder]:
+        counts[value] += 1
+    schedule = [value for value in values for _ in range(counts[value])]
+    rng.shuffle(schedule)
+    return schedule
+
+
+def _yawpose_camera_schedule(
+    config: dict[str, Any], total: int, rng: random.Random
+) -> list[int]:
+    elevation = config["generation"]["camera_elevation"]
+    minimum = int(elevation["min"])
+    maximum = int(elevation["max"])
+    if minimum >= 0 or maximum <= 0:
+        raise PipelineError("yawpose camera schedule requires negative and positive angles")
+    zero_count = round(total * int(elevation.get("zero_share", 70)) / 100)
+    nonzero_values = [*range(minimum, 0), *range(1, maximum + 1)]
+    schedule = [0] * zero_count + _balanced_discrete_schedule(
+        nonzero_values, total - zero_count, rng
+    )
+    rng.shuffle(schedule)
+    return schedule
+
+
+def _yawpose_pitch_schedule(
+    config: dict[str, Any], total: int, rng: random.Random
+) -> list[int]:
+    pitch = config["generation"]["head_pitch"]
+    inner_values = list(range(int(pitch["min"]), int(pitch["max"]) + 1))
+    outer_count = int(pitch.get("outer_count", 0))
+    if not 0 <= outer_count <= total:
+        raise PipelineError("yawpose pitch outer_count must be in [0, stage count]")
+    schedule = _balanced_discrete_schedule(
+        inner_values, total - outer_count, rng
+    )
+    if outer_count:
+        outer_min = int(pitch.get("outer_min_abs", 11))
+        outer_max = int(pitch.get("outer_max_abs", 25))
+        if not 0 < outer_min <= outer_max:
+            raise PipelineError("yawpose outer pitch bounds are invalid")
+        outer_values = [
+            *range(-outer_max, -outer_min + 1),
+            *range(outer_min, outer_max + 1),
+        ]
+        schedule.extend(_balanced_discrete_schedule(outer_values, outer_count, rng))
+        rng.shuffle(schedule)
+    return schedule
+
+
+def _yawpose_visible_side(yaw: int) -> tuple[str, str]:
+    """Return the required side label and literal visual anchor from the s004 spec."""
+    if 20 <= yaw < 80:
+        return (
+            "three_quarter_left",
+            "A front three-quarter view facing screen-left: both eyes remain visible, the farther eye lies close to the facial outline, the nose bridge begins to overlap the cheek, and the ear on the turned-toward side is visible.",
+        )
+    if 90 <= yaw < 110:
+        return (
+            "profile_left",
+            "A complete to shallow-rear profile facing screen-left: show one ear and the nose-tip silhouette; at most one eye is barely visible.",
+        )
+    if 110 <= yaw < 140:
+        return (
+            "left_ear",
+            "A left-rear quarter view: show the left ear and only the left cheek and jaw outline; no eye, nose, or mouth may be visible.",
+        )
+    if 140 <= yaw < 175:
+        return (
+            "left_ear",
+            "An almost pure rear view reached through the left side: the back of the skull dominates and only part of the left ear may remain visible; show no facial feature.",
+        )
+    if 175 <= yaw < 185:
+        return (
+            "none",
+            "A pure centered back-of-head view: ears are absent or barely visible, with no face at all; use the nape and natural hair flow to establish anatomy.",
+        )
+    if 185 <= yaw < 220:
+        return (
+            "right_ear",
+            "An almost pure rear view reached through the right side: the back of the skull dominates and only part of the right ear may remain visible; show no facial feature.",
+        )
+    if 220 <= yaw < 250:
+        return (
+            "right_ear",
+            "A right-rear quarter view: show the right ear and only the right cheek and jaw outline; no eye, nose, or mouth may be visible.",
+        )
+    if 250 <= yaw < 270:
+        return (
+            "profile_right",
+            "A shallow-rear to complete profile facing screen-right: show one ear and the nose-tip silhouette; at most one eye is barely visible.",
+        )
+    if 280 <= yaw < 340:
+        return (
+            "three_quarter_right",
+            "A front three-quarter view facing screen-right: both eyes remain visible, the farther eye lies close to the facial outline, the nose bridge begins to overlap the cheek, and the ear on the turned-toward side is visible.",
+        )
+    raise PipelineError(f"yawpose angle has no configured visual anchor: {yaw}")
+
+
+def _yawpose_prompt(record: dict[str, Any]) -> str:
+    mask = (
+        f"The subject correctly wears {record['mask_description']} over the nose, mouth, and chin, naturally foreshortened for this profile."
+        if record.get("mask_description")
+        else "The subject wears no face mask."
+    )
+    accessory = (
+        f"Required additional accessory: {record['accessory_description']}. Keep this accessory clearly visible, physically plausible, and unchanged by the requested head orientation."
+        if record.get("accessory_description")
+        else ""
+    )
+    return " ".join(
+        [
+            "Create one photorealistic, unedited-looking natural surveillance or smartphone photograph of exactly one fictional adult who resembles no real person.",
+            "Use the yawpose label convention: +90 degrees faces screen-left, +180 degrees is the centered back of the head, and +270 degrees faces screen-right.",
+            f"Set yaw_yawpose to exactly {int(record['yaw_yawpose']):+d} degrees in bin {record['bin']}; do not mirror the image or swap left and right.",
+            record["anchor"],
+            f"{record['camera_detail']} Keep the person's own head pitch near {int(record['pitch']):+d} degrees and image-plane roll at 0 degrees.",
+            f"Subject: a fictional {record['gender']} aged {record['age']}, {record['skin_tone']}, {record['hair']}, wearing {record['clothing']}; headwear or accessory: {record['headwear']}.",
+            accessory,
+            mask,
+            f"Natural context: {record['context']}. Background: {record['background']}; lighting: {record['lighting']}; camera feel: {record['lens_feel']}.",
+            "Show the complete hair, crown, skull, chin when visible, neck, and parts of both shoulders. Keep the head about 30% to 42% of image height and leave generous clear margin on all four sides so a square head crop with 5% margin cannot leave the canvas.",
+            "Keep the head, neck, shoulders, and visible upper torso anatomically coherent. Lower-body detail is unimportant. No other person, face, mannequin, poster face, human reflection, text, watermark, border, collage, illustration, CGI, beauty filter, or visible AI artifact.",
+        ]
+    )
+
+
+def _yawpose_filename(yaw: int, pitch: int, camera: int, serial: int) -> str:
+    return (
+        f"yawp{yaw:+04d}_pitch{pitch:+03d}_cam{camera:+03d}_{serial:06d}.jpg"
+    )
+
+
+def _build_yawpose_plan(
+    config: dict[str, Any],
+    stage: str,
+    seed: int,
+    *,
+    bin_counts: list[int] | None,
+    serial_offset: int,
+) -> list[dict[str, Any]]:
+    rng = random.Random(seed)
+    stage_config = config["stages"][stage]
+    starts = list(map(int, config["targets"]["yaw_bins"]))
+    counts = list(map(int, bin_counts or stage_config["bin_counts"]))
+    masks = list(map(int, stage_config.get("mask_bin_counts") or [0] * len(starts)))
+    accessory_bin_counts = {
+        str(accessory_type): list(map(int, values))
+        for accessory_type, values in (
+            stage_config.get("accessory_bin_counts") or {}
+        ).items()
+    }
+    if accessory_bin_counts and bin_counts is not None and counts != list(
+        map(int, stage_config["bin_counts"])
+    ):
+        raise PipelineError(
+            "bin_counts overrides are not supported for accessory yawpose stages"
+        )
+    assignments: list[dict[str, Any]] = []
+    for bin_index, (start, count, mask_count) in enumerate(
+        zip(starts, counts, masks, strict=True)
+    ):
+        yaw_values = _balanced_discrete_schedule(list(range(start, start + 10)), count, rng)
+        augmentation_types: list[str | None] = ["face_mask"] * mask_count
+        for accessory_type, values in accessory_bin_counts.items():
+            augmentation_types.extend([accessory_type] * values[bin_index])
+        augmentation_types.extend([None] * (count - len(augmentation_types)))
+        rng.shuffle(augmentation_types)
+        assignments.extend(
+            {
+                "yaw_bin_start": start,
+                "yaw_yawpose": yaw,
+                "native_mask": augmentation_type == "face_mask",
+                "accessory_type": (
+                    augmentation_type
+                    if augmentation_type in ACCESSORY_VARIANTS
+                    else None
+                ),
+            }
+            for yaw, augmentation_type in zip(
+                yaw_values, augmentation_types, strict=True
+            )
+        )
+    rng.shuffle(assignments)
+    sizes = _exact_schedule(config["generation"]["size_schedule"], len(assignments), rng)
+    cameras = _yawpose_camera_schedule(config, len(assignments), rng)
+    pitches = _yawpose_pitch_schedule(config, len(assignments), rng)
+    prompt = config["prompt"]
+    mask_serial = 0
+    accessory_serials = {key: 0 for key in ACCESSORY_VARIANTS}
+    records: list[dict[str, Any]] = []
+    for index, assignment in enumerate(assignments):
+        serial = serial_offset + index + 1
+        yaw = int(assignment["yaw_yawpose"])
+        signed_yaw = int(wrap180(yaw))
+        pitch = pitches[index]
+        camera = cameras[index]
+        visible_side, anchor = _yawpose_visible_side(yaw)
+        mask_description = None
+        if assignment["native_mask"]:
+            mask_description = MASK_VARIANTS[mask_serial % len(MASK_VARIANTS)]
+            mask_serial += 1
+        accessory_type = assignment["accessory_type"]
+        accessory_description = None
+        if accessory_type is not None:
+            variants = ACCESSORY_VARIANTS[accessory_type]
+            accessory_description = variants[
+                accessory_serials[accessory_type] % len(variants)
+            ]
+            accessory_serials[accessory_type] += 1
+        attribute_index = serial - 1
+        filename = _yawpose_filename(yaw, pitch, camera, serial)
+        record: dict[str, Any] = {
+            "serial": serial,
+            "stage": stage,
+            "label_convention": "yawpose",
+            "bin": f"yaw_{int(assignment['yaw_bin_start'])}_{int(assignment['yaw_bin_start']) + 10}",
+            "yaw_yawpose": yaw,
+            "yaw_signed": signed_yaw,
+            "abs_pan_bin": abs(signed_yaw),
+            "signed_pan": signed_yaw,
+            "intent_pan_deg": float(yaw),
+            "pitch": pitch,
+            "head_pitch": pitch,
+            "cam": camera,
+            "camera_elevation": camera,
+            "camera_regime": "yawpose_rear",
+            "camera_detail": _camera_detail(camera),
+            "roll": 0,
+            "visible_side": visible_side,
+            "anchor": anchor,
+            "expected_direction": expected_direction((-yaw) % 360),
+            "orientation": anchor,
+            "pan_detail": anchor,
+            "size": sizes[index],
+            "context": prompt["contexts"][attribute_index % len(prompt["contexts"])],
+            "background": prompt["backgrounds"][attribute_index % len(prompt["backgrounds"])],
+            "scene": prompt["backgrounds"][attribute_index % len(prompt["backgrounds"])],
+            "lighting": prompt["lighting"][attribute_index % len(prompt["lighting"])],
+            "lens_feel": prompt["lens_feels"][attribute_index % len(prompt["lens_feels"])],
+            "gender": prompt["gender_presentations"][attribute_index % len(prompt["gender_presentations"])],
+            "age": prompt["ages"][attribute_index % len(prompt["ages"])],
+            "skin_tone": prompt["skin_tones"][attribute_index % len(prompt["skin_tones"])],
+            "hair": prompt["hair"][attribute_index % len(prompt["hair"])],
+            "clothing": prompt["clothing"][attribute_index % len(prompt["clothing"])],
+            "headwear": prompt["headwear"][attribute_index % len(prompt["headwear"])],
+            "accessory": prompt["headwear"][attribute_index % len(prompt["headwear"])],
+            "custom_id": filename.removesuffix(".jpg"),
+            "filename": filename,
+        }
+        if mask_description is not None:
+            record["augmentation_type"] = "face_mask"
+            record["mask_description"] = mask_description
+        if accessory_description is not None:
+            record["augmentation_type"] = "accessory"
+            record["accessory_type"] = accessory_type
+            record["accessory_description"] = accessory_description
+        record["prompt"] = _yawpose_prompt(record)
+        records.append(record)
+    custom_ids = [row["custom_id"] for row in records]
+    if len(custom_ids) != len(set(custom_ids)):
+        raise PipelineError("yawpose planner produced duplicate custom IDs")
+    return records
 
 
 def _exact_schedule(
@@ -575,6 +921,14 @@ def build_plan(
 ) -> list[dict[str, Any]]:
     if stage not in config["stages"]:
         raise PipelineError(f"unknown stage: {stage}")
+    if config["generation"].get("label_convention") == "yawpose":
+        return _build_yawpose_plan(
+            config,
+            stage,
+            seed,
+            bin_counts=bin_counts,
+            serial_offset=serial_offset,
+        )
     rng = random.Random(seed)
     generation = config["generation"]
     stage_config = config["stages"][stage]
@@ -584,8 +938,8 @@ def build_plan(
         assignments = [dict(row) for row in config["validation"]]
     else:
         counts = list(map(int, bin_counts or stage_config["bin_counts"]))
-        if len(counts) != 19:
-            raise PipelineError("bin_counts must contain 19 values")
+        if len(counts) != len(config["targets"]["abs_pan_bins"]):
+            raise PipelineError("bin_counts length must match configured target bins")
         mask_counts = list(map(int, stage_config.get("mask_bin_counts") or [0] * 19))
         assignments = []
         odd_sign_index = 0
@@ -869,6 +1223,7 @@ def create_plan(
     approved_batch_dir: Path | None = None,
     *,
     bin_counts: list[int] | None = None,
+    serial_offset: int = 0,
     direct_production: bool = False,
     single_batch: bool = False,
     sequential_batches: bool = False,
@@ -930,19 +1285,33 @@ def create_plan(
             raise PipelineError(
                 f"{stage} planning requires the approved {required_parent} run's actual account cost"
             )
-    records = build_plan(config, stage, seed, bin_counts=bin_counts)
+    if serial_offset < 0:
+        raise PipelineError("serial offset must be non-negative")
+    records = build_plan(
+        config,
+        stage,
+        seed,
+        bin_counts=bin_counts,
+        serial_offset=serial_offset,
+    )
     if compact_prompts:
+        if config["generation"].get("label_convention") == "yawpose":
+            raise PipelineError(
+                "yawpose generation keeps its explicit left/right anchor prompts; do not compact"
+            )
         for record in records:
             record["prompt"] = _make_compact_production_prompt(record)
+    yawpose = config["generation"].get("label_convention") == "yawpose"
     for record in records:
         record["custom_id"] = f"{batch_id}--{record['custom_id']}"
-        record["filename"] = _image_filename(
-            int(record["signed_pan"]),
-            int(record["camera_elevation"]),
-            int(record["head_pitch"]),
-            int(record["serial"]),
-            batch_id=batch_id,
-        )
+        if not yawpose:
+            record["filename"] = _image_filename(
+                int(record["signed_pan"]),
+                int(record["camera_elevation"]),
+                int(record["head_pitch"]),
+                int(record["serial"]),
+                batch_id=batch_id,
+            )
     run_dir = output_root / "batches" / batch_id
     if run_dir.exists():
         raise PipelineError(f"refusing to overwrite existing run: {run_dir}")
@@ -1017,6 +1386,7 @@ def create_plan(
         ),
         "target_count": len(records),
         "request_count": len(records),
+        "serial_offset": serial_offset,
         "reference_cost_per_request_usd": reference_cost,
         "reference_projected_cost_usd": round(reference_cost * len(records), 6),
         "planning_cost_per_request_usd": planning_cost,
@@ -1025,7 +1395,14 @@ def create_plan(
         "direct_production": direct_production,
         "single_batch": single_batch,
         "sequential_batches": sequential_batches,
-        "prompt_profile": "compact_direct_v1" if compact_prompts else "full_v4",
+        "prompt_profile": (
+            "yawpose_rear_full_v1"
+            if yawpose
+            else ("compact_direct_v1" if compact_prompts else "full_v4")
+        ),
+        "label_convention": config["generation"].get(
+            "label_convention", "towncentre_pan"
+        ),
         "approval_policy": (
             "operator_direct_no_human_review"
             if direct_production
@@ -1075,6 +1452,129 @@ def save_state(run_dir: Path, state: dict[str, Any]) -> None:
         state["status"] = "terminal_with_failures"
     state["updated_at"] = utc_now()
     _atomic_json(run_dir / STATE_NAME, state)
+
+
+def seal_collected_prefix(run_dir: Path) -> dict[str, Any]:
+    """Discard only an unsubmitted shard tail after preserving its original plan."""
+    run_dir = run_dir.resolve()
+    state = load_state(run_dir)
+    if state.get("scope_revision"):
+        raise PipelineError("run scope has already been revised")
+    if any(
+        attempt.get("status") in ACTIVE_STATUSES
+        for shard in state["shards"]
+        for attempt in shard["attempts"]
+    ):
+        raise PipelineError("cannot revise scope while a remote Batch is active")
+    plan = read_plan(run_dir, state)
+    kept_shards: list[dict[str, Any]] = []
+    dropped_shards: list[dict[str, Any]] = []
+    tail_started = False
+    for shard in sorted(state["shards"], key=lambda value: int(value["index"])):
+        ids = [str(value) for value in shard["custom_ids"]]
+        all_success = all(
+            state["items"].get(custom_id, {}).get("status") == "success"
+            and _valid_image(
+                run_dir / "images" / plan[custom_id]["filename"],
+                plan[custom_id]["size"],
+            )
+            for custom_id in ids
+        )
+        if all_success:
+            if tail_started:
+                raise PipelineError("collected shards are not a contiguous prefix")
+            kept_shards.append(shard)
+            continue
+        tail_started = True
+        if any(
+            attempt.get("batch_id")
+            or attempt.get("status") != "planned"
+            for attempt in shard["attempts"]
+        ):
+            raise PipelineError(
+                "scope revision may discard only never-submitted planned shards"
+            )
+        if any(state["items"].get(custom_id, {}).get("status") == "success" for custom_id in ids):
+            raise PipelineError("scope revision cannot discard a partially collected shard")
+        dropped_shards.append(shard)
+    if not kept_shards or not dropped_shards:
+        raise PipelineError("scope revision requires collected prefix and unsubmitted tail")
+
+    archive = run_dir / SUPERSEDED_UNSUBMITTED_DIR
+    if archive.exists():
+        raise PipelineError(f"scope revision archive already exists: {archive}")
+    archive.mkdir()
+    shutil.copy2(run_dir / STATE_NAME, archive / "original_batch_state.json")
+    shutil.copy2(run_dir / PLAN_NAME, archive / "original_generation_plan.jsonl")
+    archived_inputs: list[dict[str, Any]] = []
+    for shard in dropped_shards:
+        for attempt in shard["attempts"]:
+            source = run_dir / str(attempt["input_path"])
+            if not source.is_file() or sha256_file(source) != attempt["input_sha256"]:
+                raise PipelineError(f"unsubmitted Batch input is missing or changed: {source}")
+            target = archive / source.name
+            source.replace(target)
+            archived_inputs.append(
+                {
+                    "shard": int(shard["index"]),
+                    "input": target.name,
+                    "sha256": sha256_file(target),
+                    "requests": len(attempt["custom_ids"]),
+                }
+            )
+
+    kept_ids = {
+        str(custom_id) for shard in kept_shards for custom_id in shard["custom_ids"]
+    }
+    kept_plan = sorted(
+        (plan[custom_id] for custom_id in kept_ids), key=lambda row: int(row["serial"])
+    )
+    original_target = int(state["target_count"])
+    original_plan_sha256 = str(state["plan_sha256"])
+    write_jsonl(run_dir / PLAN_NAME, kept_plan)
+    state["items"] = {
+        custom_id: state["items"][custom_id] for custom_id in sorted(kept_ids)
+    }
+    state["shards"] = kept_shards
+    state["target_count"] = len(kept_ids)
+    state["request_count"] = len(kept_ids)
+    state["plan_sha256"] = sha256_file(run_dir / PLAN_NAME)
+    state["reference_projected_cost_usd"] = round(
+        float(state["reference_cost_per_request_usd"]) * len(kept_ids), 6
+    )
+    state["planning_projected_cost_usd"] = round(
+        float(state["planning_cost_per_request_usd"]) * len(kept_ids), 6
+    )
+    revision_manifest = {
+        "schema_version": 1,
+        "created_at": utc_now(),
+        "reason": "generation specification changed before the remaining shards were submitted",
+        "original_target_count": original_target,
+        "sealed_target_count": len(kept_ids),
+        "discarded_unsubmitted_requests": original_target - len(kept_ids),
+        "original_plan_sha256": original_plan_sha256,
+        "sealed_plan_sha256": state["plan_sha256"],
+        "original_state_snapshot": "original_batch_state.json",
+        "original_plan_snapshot": "original_generation_plan.jsonl",
+        "archived_inputs": archived_inputs,
+    }
+    _atomic_json(archive / "scope_revision.json", revision_manifest)
+    state["scope_revision"] = {
+        **revision_manifest,
+        "archive": str(archive),
+        "archive_manifest_sha256": sha256_file(archive / "scope_revision.json"),
+    }
+    _hash_manifest(run_dir, state)
+    save_state(run_dir, state)
+    return {
+        "batch_dir": str(run_dir),
+        "status": state["status"],
+        "sealed_target_count": len(kept_ids),
+        "discarded_unsubmitted_requests": original_target - len(kept_ids),
+        "kept_shards": len(kept_shards),
+        "archived_shards": len(dropped_shards),
+        "archive": str(archive),
+    }
 
 
 def prepare_standalone_run(run_dir: Path) -> dict[str, Any]:
@@ -1791,16 +2291,32 @@ def _edit_prompt(
             "translation explicitly overrides any generic target instruction not to translate; "
             "it does not override the target head pose, mask, identity, or scene requirements."
         )
-    if any(reason in reasons for reason in ("pan_out_of_tolerance", "pose_unusable")):
+    pan_reasons = {
+        "pan_out_of_tolerance",
+        "pose_unusable",
+        "yawpose_out_of_tolerance",
+        "yawpose_pose_unusable",
+    }
+    if pan_reasons.intersection(reasons):
         if row.get("pose_status") == "ok" and row.get("estimated_pan_deg") is not None:
             current_pan = float(row["estimated_pan_deg"])
             target_pan = float(record["intent_pan_deg"])
             relative_correction = wrap180(target_pan - current_pan)
             if abs(relative_correction) >= 1.0:
+                positive_side = (
+                    "image-left"
+                    if record.get("label_convention") == "yawpose"
+                    else "image-right"
+                )
+                negative_side = (
+                    "image-right"
+                    if record.get("label_convention") == "yawpose"
+                    else "image-left"
+                )
                 correction_direction = (
-                    "toward image-right"
+                    f"toward {positive_side}"
                     if relative_correction > 0
-                    else "toward image-left"
+                    else f"toward {negative_side}"
                 )
                 corrections.append(
                     f"The current image is estimated at pan {wrap180(current_pan):+.1f} degrees. "
@@ -1810,10 +2326,20 @@ def _edit_prompt(
                     "from the supplied image, not an instruction to turn farther in its current direction."
                 )
         corrections.append(record["pan_detail"])
+        if record.get("label_convention") == "yawpose":
+            corrections.append(
+                f"The final yaw_yawpose must be {int(record['yaw_yawpose']):+d} degrees under the convention +90=screen-left profile, +180=back, +270=screen-right profile. Do not mirror or reverse the named visible side."
+            )
+        else:
+            corrections.append(
+                f"The final head pan must be {int(record['signed_pan']):+d} degrees; do not mirror the "
+                "image or reverse left and right."
+            )
+    if "rear_face_visible" in reasons:
         corrections.append(
-            f"The final head pan must be {int(record['signed_pan']):+d} degrees; do not mirror the "
-            "image or reverse left and right."
+            "The previous rear-view image exposed a face where none is allowed. Rotate only the head farther toward the back until no eye, nose, or mouth is visible, while preserving the requested yaw bin and the explicitly named left/right ear or pure-back anchor. Do not mirror the image."
         )
+        corrections.append(record["anchor"])
     if any(reason in reasons for reason in PITCH_EDIT_REASONS):
         if pitch_reference is not None:
             corrections.append(str(pitch_reference["instruction"]))
@@ -1866,6 +2392,121 @@ def _edit_prompt(
             *corrections,
             "All requirements from the target remain binding:",
             record["prompt"],
+        ]
+    )
+
+
+def _regeneration_prompt(
+    record: dict[str, Any], row: dict[str, Any], reasons: list[str]
+) -> str:
+    corrections: list[str] = []
+    if "rear_face_visible" in reasons:
+        corrections.append(
+            "The failed candidate showed forbidden facial features. Render the head as a strict "
+            "rear or rear-oblique view: no eye, eyebrow, nose bridge, nostril, cheek, lips, mouth, "
+            "chin front, or facial reflection may be visible. Show only the back/side of the skull, "
+            "hair, and the explicitly requested ear anchor. Do not solve this with a mask, hand, "
+            "object, blur, darkness, or crop; use the correct physical head rotation."
+        )
+        if record.get("anchor"):
+            corrections.append(str(record["anchor"]))
+        if record.get("label_convention") == "yawpose":
+            labelled_yaw = int(record["yaw_yawpose"]) % 360
+            toward_back = wrap180(180.0 - labelled_yaw)
+            rearward_shift = math.copysign(
+                min(25.0, abs(toward_back)), toward_back
+            )
+            retry_yaw = int(round((labelled_yaw + rearward_shift) % 360))
+            corrections.append(
+                f"For this retry, make the physical head yaw visually {retry_yaw:+d} degrees, "
+                f"which moves {abs(int(round(rearward_shift)))} degrees toward the full-back "
+                f"anchor from the labelled yaw {labelled_yaw:+d}. This retry aim remains within "
+                "the allowed 30-degree label tolerance and is mandatory so the rear skull "
+                "surface dominates and the face disappears; keep the annotation label unchanged."
+            )
+    if any(
+        reason
+        in {
+            "pan_out_of_tolerance",
+            "pose_unusable",
+            "yawpose_out_of_tolerance",
+            "yawpose_pose_unusable",
+        }
+        for reason in reasons
+    ):
+        corrections.append(str(record["pan_detail"]))
+        if record.get("label_convention") == "yawpose":
+            labelled_yaw = int(record["yaw_yawpose"]) % 360
+            signed_labelled_yaw = wrap180(labelled_yaw)
+            if abs(signed_labelled_yaw) <= 45.0:
+                corrections.append(
+                    "Use an unmistakably near-front facial geometry: both eyes and both cheeks "
+                    "must be visible, the nose bridge must stay near the facial centreline, and "
+                    "the turn must remain subtle. Do not render a profile or rear-oblique pose."
+                )
+            elif 70.0 <= abs(signed_labelled_yaw) <= 110.0:
+                screen_side = "screen-left" if signed_labelled_yaw > 0 else "screen-right"
+                corrections.append(
+                    f"Use an unmistakable strict side profile facing {screen_side}: show no more "
+                    "than one eye, keep the nose as a side silhouette, and do not expose the "
+                    "front plane of the face or turn toward a three-quarter frontal view."
+                )
+            estimated_pan = row.get("estimated_pan_deg")
+            if row.get("pose_status") == "ok" and isinstance(
+                estimated_pan, (int, float)
+            ):
+                relative_correction = wrap180(labelled_yaw - float(estimated_pan))
+                retry_shift = math.copysign(
+                    min(25.0, abs(relative_correction)), relative_correction
+                )
+                retry_yaw = int(round((labelled_yaw + retry_shift) % 360))
+                corrections.append(
+                    f"The failed candidate was estimated at yaw_yawpose "
+                    f"{float(estimated_pan):+.1f} degrees for the labelled target "
+                    f"{labelled_yaw:+d}. Counter that observed generation bias by aiming the "
+                    f"physical head visually at {retry_yaw:+d} degrees for this retry. This "
+                    f"internal retry aim is {abs(int(round(retry_shift)))} degrees from the "
+                    "label, remains within the allowed 30-degree tolerance, and overrides only "
+                    "the exact rendered-yaw wording in the original prompt; keep the annotation "
+                    f"label at {labelled_yaw:+d} degrees and never mirror the requested side."
+                )
+            else:
+                corrections.append(
+                    f"The head yaw must be {labelled_yaw:+d} degrees under yaw_yawpose "
+                    "(+90=screen-left profile, +180=back, +270=screen-right profile); never "
+                    "mirror the requested side."
+                )
+    if any(reason in reasons for reason in ("head_not_detected", "head_count_not_one")):
+        corrections.append(
+            "Show exactly one complete foreground human head. Include no other person, face, "
+            "head, mannequin, statue, poster, screen portrait, silhouette, or human reflection."
+        )
+    if "head_crop_outside_image" in reasons:
+        corrections.append(
+            "Place the complete head safely near the image centre so a square centred on the "
+            "detected head with side 1.10 times max(head width, head height) remains fully inside "
+            "the canvas."
+        )
+    if any(reason in reasons for reason in PITCH_EDIT_REASONS):
+        corrections.append(
+            f"Keep camera elevation {int(record['camera_elevation']):+d} degrees and set the "
+            f"person's own head pitch to {int(record['head_pitch']):+d} degrees relative to the "
+            "ground without changing yaw."
+        )
+    if not corrections:
+        corrections.append(
+            "Correct every recorded QA failure while preserving the exact requested labels."
+        )
+    return " ".join(
+        [
+            "Generate a completely new independent image; do not reproduce or edit the failed "
+            "candidate. The following QA corrections are mandatory and override any conflicting "
+            "visual tendency while preserving the requested yaw, pitch, camera, accessory, mask, "
+            "and scene labels.",
+            f"Recorded QA failures: {', '.join(reasons)}.",
+            *corrections,
+            "All original target requirements remain binding:",
+            str(record["prompt"]),
         ]
     )
 
@@ -2234,7 +2875,9 @@ def create_edit_cycle(
     planning_cost_per_request_usd: float,
     include_pitch_calibration_tail: bool = False,
     edit_token_evidence_run_dir: Path | None = None,
+    generation_token_evidence_run_dir: Path | None = None,
     only_edit_reasons: set[str] | None = None,
+    regenerate_quality_failures: bool = False,
 ) -> Path:
     if not batch_id or any(character in batch_id for character in "/\\"):
         raise PipelineError("batch-id must be one safe path component")
@@ -2254,7 +2897,7 @@ def create_edit_cycle(
             "auto QA rows do not exactly match the parent generation plan"
         )
     edit_round = int(parent_state.get("edit_round", 0)) + 1
-    if edit_round > max_edit_rounds:
+    if edit_round > max_edit_rounds and not regenerate_quality_failures:
         raise PipelineError(
             f"edit round {edit_round} exceeds configured maximum {max_edit_rounds}; discard or regenerate"
         )
@@ -2289,19 +2932,28 @@ def create_edit_cycle(
 
     records: list[dict[str, Any]] = []
     old_to_new: dict[str, str] = {}
+    yawpose = config["generation"].get("label_convention") == "yawpose"
     for parent_record in sorted(
         parent_plan.values(), key=lambda value: int(value["serial"])
     ):
         record = dict(parent_record)
         core_id = str(parent_record["custom_id"]).split("--", 1)[-1]
         record["custom_id"] = f"{batch_id}--{core_id}"
-        record["filename"] = _image_filename(
-            int(record["signed_pan"]),
-            int(record["camera_elevation"]),
-            int(record["head_pitch"]),
-            int(record["serial"]),
-            batch_id=batch_id,
-        )
+        if yawpose:
+            record["filename"] = _yawpose_filename(
+                int(record["yaw_yawpose"]),
+                int(record["head_pitch"]),
+                int(record["camera_elevation"]),
+                int(record["serial"]),
+            )
+        else:
+            record["filename"] = _image_filename(
+                int(record["signed_pan"]),
+                int(record["camera_elevation"]),
+                int(record["head_pitch"]),
+                int(record["serial"]),
+                batch_id=batch_id,
+            )
         record["edit_round"] = edit_round
         record["parent_custom_id"] = parent_record["custom_id"]
         records.append(record)
@@ -2369,7 +3021,7 @@ def create_edit_cycle(
             lineage.append({"custom_id": record["custom_id"], **item})
             items[record["custom_id"]] = item
             continue
-        if source_valid:
+        if source_valid and not regenerate_quality_failures:
             edit_source = run_dir / "edit_inputs" / parent_record["filename"]
             shutil.copy2(source, edit_source)
             prompt = _edit_prompt(record, row, reasons, pitch_reference=pitch_reference)
@@ -2377,8 +3029,17 @@ def create_edit_cycle(
             operation = "edit"
             item["edit_prompt"] = prompt
         else:
-            request = batch_request(record, config["api"])
-            operation = "regenerate_missing_source"
+            request_record = dict(record)
+            if regenerate_quality_failures:
+                regeneration_prompt = _regeneration_prompt(record, row, reasons)
+                request_record["prompt"] = regeneration_prompt
+                item["regeneration_prompt"] = regeneration_prompt
+            request = batch_request(request_record, config["api"])
+            operation = (
+                "regenerate_quality_failure"
+                if regenerate_quality_failures
+                else "regenerate_missing_source"
+            )
         requests_by_endpoint[request["url"]].append(request)
         item.update({"status": "planned", "operation": operation})
         lineage.append({"custom_id": record["custom_id"], **item})
@@ -2396,7 +3057,7 @@ def create_edit_cycle(
             if not requests:
                 continue
             evidence_run = (
-                parent_run_dir
+                (generation_token_evidence_run_dir or parent_run_dir)
                 if endpoint == ENDPOINT
                 else (edit_token_evidence_run_dir or parent_run_dir)
             )
@@ -2405,7 +3066,12 @@ def create_edit_cycle(
                 len(requests), profile["observed_mean_input_tokens"]
             )
             token_batch_plans[endpoint] = {**profile, **plan}
-            max_records_by_endpoint[endpoint] = int(plan["max_records_per_batch"])
+            configured_shard_size = int(
+                config["stages"][parent_state["stage"]]["shard_size"]
+            )
+            max_records_by_endpoint[endpoint] = min(
+                configured_shard_size, int(plan["max_records_per_batch"])
+            )
     else:
         configured_shard_size = int(
             config["stages"][parent_state["stage"]]["shard_size"]
@@ -2472,12 +3138,18 @@ def create_edit_cycle(
         "parent_qa_sha256": sha256_file(qa_path),
         "parent_approval_sha256": None,
         "direct_production": direct_production,
+        "single_batch": False,
+        "sequential_batches": bool(parent_state.get("sequential_batches")),
+        "label_convention": parent_state.get(
+            "label_convention", config["generation"].get("label_convention")
+        ),
         "approval_policy": parent_state.get("approval_policy"),
         "intermediate_stages_waived": bool(
             parent_state.get("intermediate_stages_waived")
         ),
         "edit_round": edit_round,
         "max_edit_rounds": max_edit_rounds,
+        "regenerate_quality_failures": regenerate_quality_failures,
         "target_count": len(records),
         "request_count": selected_count,
         "reference_cost_per_request_usd": float(

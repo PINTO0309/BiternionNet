@@ -248,3 +248,25 @@ Batch-3 trim variant (user request, iterated 1,100 -> **1,000 adopted**): `manif
 `--current-cap-effective 1000` on the new data. 16 of 19 pair bins at the 1,000 ceiling, valleys
 894-926 (max/min 1.12), 6,680 of 22,993 neighbours dropped, train 35,296 (353 steps/epoch). The old
 `manifest_capped600.jsonl` snapshot (batch-2 data, §12 runs) is kept unchanged for reproducibility.
+
+## 14. Batch-3 results (2026-09-01): the eye-level batch helps test, hurts test_neighbor
+
+Both batch-3 arms (350/301/50, swish, no jitter) vs their batch-2 counterparts:
+
+| run | steps | test last7 | test macro | test_nb | test_nb macro | 90 | 225 | 270 |
+|---|---|---|---|---|---|---|---|---|
+| balanced batch2 (T=1,313) | 165k | 18.32 +- 0.12 | 18.80 | **20.74** | **22.48** | 24.1 | **37.0** | **22.4** |
+| balanced batch3 (T=1,576, `synth-biternion-vonmises-swish-v2`) | 199k | **18.04 +- 0.08** | 19.75 | 21.06 | 23.13 | 24.7 | 40.0 | 23.7 |
+| capped600 batch2 | 76k | 18.63 +- 0.23 | 19.90 | 20.88 | 22.77 | 27.2 | 38.3 | 23.6 |
+| capped1100 batch3 | 133k | 19.06 +- 0.19 | 20.84 | 21.27 | 23.98 | 29.2 | 39.3 | 26.4 |
+
+Two independent arms agree: adding the 8,400 eye-level near-level heads improves the small original
+test slightly (balanced: 18.32 -> 18.04, the best test value so far) but **worsens the 8,418-head
+test_neighbor consistently** (+0.3 / +0.4 overall, macro +0.65 / +1.2, rear 225 deg +3 / +1). The 005
+viewpoint-mismatch caveat appears to bind: in the valley bins the eye-level synthetic now outweighs the
+real oblique-view data. Batch 3 as delivered is judged **net-negative for the enlarged real test**.
+
+Next: a no-batch-3 control on the batch-3 pipeline state (filter
+`generation_run == production-nearlevel8400-v005-edit04-quality` out of the combined manifest, rebuild,
+retrain the balanced arm) to close the loop, and/or regenerate the batch with the camera_high profile
+(30-60 deg elevation) that 006 §3 specified.

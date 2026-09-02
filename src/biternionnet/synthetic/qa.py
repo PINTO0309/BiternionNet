@@ -16,7 +16,7 @@ import numpy as np
 import yaml
 from PIL import Image, ImageDraw, ImageFont, UnidentifiedImageError
 
-from .detector import CLASS_BODY, CLASS_HEAD, DIR8_CLASSES, Deimv2Detector
+from .detector import CLASS_BODY, CLASS_FACE, CLASS_HEAD, DIR8_CLASSES, Deimv2Detector
 from .generate import (
     DEIM_CROP_MARGIN,
     DIR8_BY_CENTRE,
@@ -61,7 +61,9 @@ INTENT_VALUES = {"match", "off-by-one-bin", "wrong"}
 ELEVATION_VALUES = {"high_angle_match", "eye_level_or_low_angle", "unresolved"}
 LANDMARK_ALIGNMENT_VALUES = {"match", "mismatch", "unresolved"}
 QA_POLICY_SCHEMA_VERSION = 1
-QA_IMPLEMENTATION_VERSION = 4
+QA_IMPLEMENTATION_VERSION = 7
+REUSABLE_PARENT_QA_IMPLEMENTATION_VERSIONS = {4, 5, 6, 7}
+REAR_FACE_GATE_MIN_ABS_YAW_DEG = 110.0
 DIRECT_ALL_QUALITY_LABEL_POLICY = "direct_all_quality_pass_intent_fallback_v1"
 QA_POLICY_KEYS = {
     "schema_version",
@@ -234,7 +236,10 @@ def _load_reusable_parent_qa(
 
     parent_report = json.loads(parent_report_path.read_text(encoding="utf-8"))
     incompatibilities: list[str] = []
-    if parent_report.get("qa_implementation_version") != QA_IMPLEMENTATION_VERSION:
+    if (
+        parent_report.get("qa_implementation_version")
+        not in REUSABLE_PARENT_QA_IMPLEMENTATION_VERSIONS
+    ):
         incompatibilities.append("QA implementation version")
     if parent_report.get("qa_policy") != qa_policy:
         incompatibilities.append("QA policy")
@@ -315,11 +320,14 @@ def _detection_annotation(
     height, width = image.shape[:2]
     heads = [row for row in detections if int(row[0]) == CLASS_HEAD]
     bodies = [row for row in detections if int(row[0]) == CLASS_BODY]
+    faces = [row for row in detections if int(row[0]) == CLASS_FACE]
     if not heads:
         return {
             "detector_status": "no_head",
             "head_count": 0,
             "body_count": len(bodies),
+            "face_count": len(faces),
+            "face_max_score": max((float(row[5]) for row in faces), default=None),
             "direction": None,
         }
     head = max(heads, key=lambda row: row[5])
@@ -341,6 +349,8 @@ def _detection_annotation(
         "detector_status": "ok",
         "head_count": len(heads),
         "body_count": len(bodies),
+        "face_count": len(faces),
+        "face_max_score": max((float(row[5]) for row in faces), default=None),
         "head_box_xyxy": [round(value, 2) for value in box],
         "head_square_crop_box_xyxy": [
             round(float(value), 3) for value in square_crop_box
@@ -364,6 +374,38 @@ def _detection_annotation(
         "direction": DIR8_CLASSES[int(direction[0])] if direction else None,
         "direction_score": float(direction[5]) if direction else None,
     }
+
+
+def _apply_detection_annotations(
+    rows: list[dict[str, Any]],
+    plan: list[dict[str, Any]],
+    images: dict[str, np.ndarray],
+    detector: Deimv2Detector,
+    *,
+    crop_margin: float,
+) -> None:
+    """Annotate rows by stable ID; production shards may use offset serials."""
+    rows_by_custom_id: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        custom_id = str(row["custom_id"])
+        if custom_id in rows_by_custom_id:
+            raise PipelineError(f"duplicate QA row custom_id: {custom_id}")
+        rows_by_custom_id[custom_id] = row
+    for record in plan:
+        custom_id = str(record["custom_id"])
+        image = images.get(custom_id)
+        if image is None:
+            continue
+        row = rows_by_custom_id.get(custom_id)
+        if row is None:
+            raise PipelineError(f"QA row missing for plan record: {custom_id}")
+        row.update(
+            _detection_annotation(
+                image,
+                detector.infer(image),
+                crop_margin=crop_margin,
+            )
+        )
 
 
 def quality_reasons(
@@ -399,10 +441,44 @@ def quality_reasons(
         # Lower-body anatomy is outside this head-crop QA contract.
         if qa["require_body_detection"] and not row.get("body_count"):
             reasons.append("body_not_detected")
+        if row.get("label_convention") == "yawpose":
+            signed_yaw = abs(wrap180(float(row["yaw_yawpose"])))
+            face_score = row.get("face_max_score")
+            if (
+                signed_yaw > REAR_FACE_GATE_MIN_ABS_YAW_DEG
+                and isinstance(face_score, (int, float))
+                and float(face_score) >= 0.5
+                and not (
+                    row.get("landmark_status") == "ok"
+                    and int(row.get("hrffa_core_face_high_conf_visible_count") or 0)
+                    == 0
+                )
+            ):
+                reasons.append("rear_face_visible")
         # DEIM direction remains a recorded diagnostic. It is not an
         # acceptance gate because image-generation direction classes are too
         # unstable for production filtering.
     return reasons, detector_complete
+
+
+def confirm_rear_face_candidate(row: dict[str, Any]) -> None:
+    """Resolve a DEIM rear-face candidate after HRFFA landmark inference."""
+    reasons = row.get("quality_gate_reasons")
+    if not isinstance(reasons, list) or "rear_face_visible" not in reasons:
+        return
+    if row.get("landmark_status") != "ok":
+        return
+    if int(row.get("hrffa_core_face_high_conf_visible_count") or 0) != 0:
+        return
+    row["quality_gate_reasons"] = [
+        reason for reason in reasons if reason != "rear_face_visible"
+    ]
+    row["quality_gate_pass"] = bool(
+        row.get("quality_gate_complete") and not row["quality_gate_reasons"]
+    )
+    row["rear_face_candidate_confirmation"] = (
+        "deim_false_positive_hrffa_no_core_face_landmarks"
+    )
 
 
 def calibrate_pitch(
@@ -743,8 +819,16 @@ def run_auto_qa(
                     "intent_pan_deg": record["intent_pan_deg"],
                     "camera_elevation": record["camera_elevation"],
                     "camera_regime": record.get("camera_regime", "high_angle"),
+                    "label_convention": record.get(
+                        "label_convention", "towncentre_pan"
+                    ),
+                    "yaw_yawpose": record.get("yaw_yawpose"),
+                    "yaw_bin": record.get("bin"),
+                    "visible_side": record.get("visible_side"),
                     "augmentation_type": record.get("augmentation_type"),
                     "mask_description": record.get("mask_description"),
+                    "accessory_type": record.get("accessory_type"),
+                    "accessory_description": record.get("accessory_description"),
                     "expected_direction": record["expected_direction"],
                     "qa_reused_from_parent": True,
                     "qa_reused_parent_custom_id": parent_row["custom_id"],
@@ -759,8 +843,14 @@ def run_auto_qa(
             "intent_pan_deg": record["intent_pan_deg"],
             "camera_elevation": record["camera_elevation"],
             "camera_regime": record.get("camera_regime", "high_angle"),
+            "label_convention": record.get("label_convention", "towncentre_pan"),
+            "yaw_yawpose": record.get("yaw_yawpose"),
+            "yaw_bin": record.get("bin"),
+            "visible_side": record.get("visible_side"),
             "augmentation_type": record.get("augmentation_type"),
             "mask_description": record.get("mask_description"),
+            "accessory_type": record.get("accessory_type"),
+            "accessory_description": record.get("accessory_description"),
             "expected_direction": record["expected_direction"],
             "exists": path.exists(),
             "image_valid": False,
@@ -787,16 +877,13 @@ def run_auto_qa(
                 pass
         rows.append(row)
     if detector is not None:
-        present = [record for record in plan if record["custom_id"] in images]
-        for record in present:
-            found = detector.infer(images[record["custom_id"]])
-            rows[record["serial"] - 1].update(
-                _detection_annotation(
-                    images[record["custom_id"]],
-                    found,
-                    crop_margin=float(config["qa"]["deim_crop_margin"]),
-                )
-            )
+        _apply_detection_annotations(
+            rows,
+            plan,
+            images,
+            detector,
+            crop_margin=float(config["qa"]["deim_crop_margin"]),
+        )
     else:
         for row in rows:
             if not row["qa_reused_from_parent"]:
@@ -835,7 +922,11 @@ def run_auto_qa(
                 images[row["custom_id"]], row["head_box_xyxy"]
             )
             if all(math.isfinite(value) for value in (yaw, pitch, roll)):
-                estimated = (-yaw) % 360.0
+                estimated = (
+                    yaw % 360.0
+                    if row.get("label_convention") == "yawpose"
+                    else (-yaw) % 360.0
+                )
                 row.update(
                     {
                         "pose_status": "ok",
@@ -854,6 +945,19 @@ def run_auto_qa(
                 )
             else:
                 row["pose_status"] = "invalid"
+        if row.get("label_convention") == "yawpose" and abs(
+            wrap180(float(row["yaw_yawpose"]))
+        ) <= 95.0:
+            yawpose_reason = None
+            if row.get("pose_status") != "ok":
+                yawpose_reason = "yawpose_pose_unusable"
+            elif float(row.get("pan_error_deg", 999.0)) > float(
+                config["qa"]["pan_tolerance_deg"]
+            ):
+                yawpose_reason = "yawpose_out_of_tolerance"
+            if yawpose_reason and yawpose_reason not in row["quality_gate_reasons"]:
+                row["quality_gate_reasons"].append(yawpose_reason)
+                row["quality_gate_pass"] = False
         if (
             landmarks is not None
             and row.get("head_box_xyxy")
@@ -876,6 +980,7 @@ def run_auto_qa(
             except ValueError as exc:
                 row["landmark_status"] = "invalid"
                 row["landmark_error"] = str(exc)
+        confirm_rear_face_candidate(row)
     if state["stage"] == "validation":
         calibration = calibrate_pitch(rows, config)
         calibration.update(
@@ -950,7 +1055,13 @@ def run_auto_qa(
         row["label_acceptance_policy_auto"] = (
             DIRECT_ALL_QUALITY_LABEL_POLICY if direct_production else "strict"
         )
-        if int(row["abs_pan_bin"]) <= 90:
+        yawpose_profile = row.get("label_convention") == "yawpose" and abs(
+            wrap180(float(row["yaw_yawpose"]))
+        ) <= 95.0
+        if yawpose_profile or (
+            row.get("label_convention") != "yawpose"
+            and int(row["abs_pan_bin"]) <= 90
+        ):
             pose_pan_pass = (
                 row.get("pose_status") == "ok"
                 and float(row["pan_error_deg"]) <= tolerance
@@ -983,7 +1094,13 @@ def run_auto_qa(
                 and float(row.get("pan_error_deg", 999.0)) <= tolerance
             )
             row["label_source_auto"] = (
-                "sixdrepnet360_rear_pilot_validated" if use_sixd else "intent_rear"
+                "sixdrepnet360_rear_pilot_validated"
+                if use_sixd
+                else (
+                    "intent_s004"
+                    if row.get("label_convention") == "yawpose"
+                    else "intent_rear"
+                )
             )
             row["angle_deg_auto"] = (
                 row.get("estimated_pan_deg") if use_sixd else row["intent_pan_deg"]
@@ -1001,6 +1118,14 @@ def run_auto_qa(
         ),
         "quality_reason_counts": dict(
             Counter(reason for row in rows for reason in row["quality_gate_reasons"])
+        ),
+        "rear_face_gate_min_abs_yaw_deg": REAR_FACE_GATE_MIN_ABS_YAW_DEG,
+        "rear_face_confirmation": (
+            "DEIM face score >=0.5 and HRFFA core-face high-confidence visibility "
+            "is nonzero or unavailable"
+        ),
+        "yaw_bin_counts": dict(
+            Counter(str(row["yaw_bin"]) for row in rows if row.get("yaw_bin"))
         ),
         "head_square_crop_gate": {
             "margin_per_side": float(config["qa"]["deim_crop_margin"]),
@@ -1112,10 +1237,10 @@ def promote_direct_production_labels(run_dir: Path) -> dict[str, Any]:
     report = json.loads(report_path.read_text(encoding="utf-8"))
     if report.get("direct_production") is not True:
         raise PipelineError("QA report is not for direct production")
-    if report.get("qa_implementation_version") not in {
-        QA_IMPLEMENTATION_VERSION - 1,
-        QA_IMPLEMENTATION_VERSION,
-    }:
+    if (
+        report.get("qa_implementation_version")
+        not in REUSABLE_PARENT_QA_IMPLEMENTATION_VERSIONS
+    ):
         raise PipelineError("QA report implementation is not promotion-compatible")
 
     config = load_config(Path(state["config_path"]))
