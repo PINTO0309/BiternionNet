@@ -14,6 +14,7 @@ from biternionnet.synthetic.generate import (
     _edit_prompt,
     _pitch_calibration_tail_candidates,
     _qa_edit_reasons,
+    _refresh_yawpose_regeneration_prompt,
     _regeneration_prompt,
     _token_based_batch_plan,
     advance_sequential_batches,
@@ -63,6 +64,11 @@ YAWPOSE_ACCESSORY_CONFIG = (
     Path(__file__).resolve().parents[1]
     / "configs"
     / "synthetic_yawpose_accessories680_batch.yaml"
+)
+YAWPOSE_S005_CONFIG = (
+    Path(__file__).resolve().parents[1]
+    / "configs"
+    / "synthetic_yawpose_s005_5710_batch.yaml"
 )
 
 
@@ -359,9 +365,7 @@ def test_near_level_plan_preserves_pan_distribution_and_submits_serially(tmp_pat
     assert state["request_count"] == 8400
     assert state["single_batch"] is False
     assert state["sequential_batches"] is True
-    assert [len(shard["custom_ids"]) for shard in state["shards"]] == [500] * 16 + [
-        400
-    ]
+    assert [len(shard["custom_ids"]) for shard in state["shards"]] == [500] * 16 + [400]
     assert Counter(row["abs_pan_bin"] for row in rows) == Counter(
         {
             0: 182,
@@ -423,12 +427,15 @@ def test_near_level_plan_preserves_pan_distribution_and_submits_serially(tmp_pat
     assert advance["submitted_batch_ids"] == ["batch-1"]
     assert advance["retry_requests"] == 0
     assert pending_request_count(load_state(run)) == 7900
-    assert submit_pending(
-        run,
-        approved_request_count=7900,
-        spend_cap_usd=100.0,
-        client=client,
-    ) == []
+    assert (
+        submit_pending(
+            run,
+            approved_request_count=7900,
+            spend_cap_usd=100.0,
+            client=client,
+        )
+        == []
+    )
     assert client.batches.created == 1
 
 
@@ -562,9 +569,7 @@ def test_yawpose_v11_remainder_adds_front_bins_and_continues_serials(tmp_path):
     assert state["serial_offset"] == 1000
     assert min(row["serial"] for row in rows) == 1001
     assert max(row["serial"] for row in rows) == 11382
-    assert [len(shard["custom_ids"]) for shard in state["shards"]] == [500] * 20 + [
-        382
-    ]
+    assert [len(shard["custom_ids"]) for shard in state["shards"]] == [500] * 20 + [382]
     assert sum(row["visible_side"] == "three_quarter_left" for row in rows) == 1718
     assert sum(row["visible_side"] == "three_quarter_right" for row in rows) == 552
     assert sum(abs(row["pitch"]) > 10 for row in rows) == 2276
@@ -623,13 +628,133 @@ def test_yawpose_accessories_are_uniform_per_eligible_bin(tmp_path):
     assert all("Required additional accessory:" in row["prompt"] for row in rows)
     assert all(row["accessory_description"] in row["prompt"] for row in rows)
 
-    ear_piercings = [
-        row for row in rows if row["accessory_type"] == "ear_piercing"
-    ]
-    assert not {
-        int(row["bin"].split("_")[1]) for row in ear_piercings
-    }.intersection({170, 180})
+    ear_piercings = [row for row in rows if row["accessory_type"] == "ear_piercing"]
+    assert not {int(row["bin"].split("_")[1]) for row in ear_piercings}.intersection(
+        {170, 180}
+    )
     assert set(Counter(row["bin"] for row in ear_piercings).values()) == {20}
+
+
+def test_yawpose_s005_plan_matches_spec_and_accessory_policy(tmp_path):
+    run = create_plan(
+        YAWPOSE_S005_CONFIG,
+        "yawpose_s005_5710",
+        "production-yawpose-s005-v001",
+        tmp_path,
+        seed=20260903,
+        direct_production=True,
+        sequential_batches=True,
+    )
+    state = load_state(run)
+    rows = list(read_plan(run, state).values())
+    starts = [120, 130, 140, 150, 160, 170, 210, 220, 230, 240, 250, 260]
+    expected = [495, 458, 389, 400, 494, 359, 450, 494, 603, 642, 569, 357]
+
+    assert state["target_count"] == 5710
+    assert state["sequential_batches"] is True
+    assert state["api_request"]["quality"] == "low"
+    assert [len(shard["custom_ids"]) for shard in state["shards"]] == [500] * 11 + [210]
+    assert Counter(row["bin"] for row in rows) == Counter(
+        {
+            f"yaw_{start}_{start + 10}": count
+            for start, count in zip(starts, expected, strict=True)
+        }
+    )
+    for start, count in zip(starts, expected, strict=True):
+        integer_counts = Counter(
+            row["yaw_yawpose"]
+            for row in rows
+            if row["bin"] == f"yaw_{start}_{start + 10}"
+        )
+        assert set(integer_counts) == set(range(start, start + 10))
+        assert max(integer_counts.values()) - min(integer_counts.values()) <= 1
+        assert sum(integer_counts.values()) == count
+
+    assert sum(abs(row["pitch"]) > 10 for row in rows) == 1142
+    assert Counter(row["size"] for row in rows) == {
+        "1024x1536": 2855,
+        "1536x1024": 2855,
+    }
+    assert Counter(
+        row.get("accessory_type") for row in rows if row.get("accessory_type")
+    ) == {
+        "eyeglasses": 120,
+        "sunglasses": 120,
+        "earring": 330,
+    }
+    assert sum(row.get("augmentation_type") == "face_mask" for row in rows) == 120
+    assert {
+        int(row["bin"].split("_")[1])
+        for row in rows
+        if row.get("augmentation_type") == "face_mask"
+    } == {250, 260}
+    assert {
+        int(row["bin"].split("_")[1])
+        for row in rows
+        if row.get("accessory_type") in {"eyeglasses", "sunglasses"}
+    } == {120, 130, 250, 260}
+    assert 170 not in {
+        int(row["bin"].split("_")[1])
+        for row in rows
+        if row.get("accessory_type") == "earring"
+    }
+    assert all(
+        "Never rotate the head" in row["prompt"]
+        for row in rows
+        if row.get("accessory_type")
+    )
+    assert all(
+        "mask silhouette may replace the bare nose or mouth outline" in row["prompt"]
+        for row in rows
+        if row.get("augmentation_type") == "face_mask"
+    )
+
+
+def test_yawpose_regeneration_uses_fresh_prompt_and_scene_attributes():
+    config = load_config(YAWPOSE_S005_CONFIG)
+    record = build_plan(config, "yawpose_s005_5710", seed=20260903)[0]
+    original = dict(record)
+    original_prompt = str(record["prompt"])
+    invariant_fields = (
+        "yaw_yawpose",
+        "head_pitch",
+        "camera_elevation",
+        "size",
+        "headwear",
+        "augmentation_type",
+        "accessory_type",
+        "accessory_description",
+        "mask_description",
+    )
+
+    changes = _refresh_yawpose_regeneration_prompt(record, config, edit_round=13)
+
+    expected_changed = {
+        "context",
+        "background",
+        "lighting",
+        "lens_feel",
+        "gender",
+        "age",
+        "skin_tone",
+        "hair",
+        "clothing",
+    }
+    assert set(changes) == expected_changed
+    assert all(record[field] != original[field] for field in expected_changed)
+    assert record["scene"] == record["background"]
+    assert record["prompt"] != original_prompt
+    assert all(record.get(field) == original.get(field) for field in invariant_fields)
+
+    wrapped = _regeneration_prompt(
+        record,
+        {"pose_status": "ok", "estimated_pan_deg": 303.2},
+        ["yawpose_out_of_tolerance"],
+    )
+    assert original_prompt not in wrapped
+    assert str(record["prompt"]) in wrapped
+    assert "Do not reuse the failed candidate's person" in wrapped
+    assert "newly sampled complete target prompt" in wrapped
 
 
 def test_seal_collected_prefix_archives_only_never_submitted_tail(tmp_path):
@@ -677,7 +802,9 @@ def test_seal_collected_prefix_archives_only_never_submitted_tail(tmp_path):
     assert len(sealed["shards"]) == len(sealed["items"]) == 1
     archive = run / "superseded_unsubmitted"
     assert (archive / "original_batch_state.json").is_file()
-    assert len((archive / "original_generation_plan.jsonl").read_text().splitlines()) == 2
+    assert (
+        len((archive / "original_generation_plan.jsonl").read_text().splitlines()) == 2
+    )
     assert len((run / "generation_plan.jsonl").read_text().splitlines()) == 1
 
 
@@ -1210,9 +1337,7 @@ def test_standalone_conversion_archives_parent_evidence_and_requires_full_qa(
     assert prepared["parent_detached"] is True
     assert detached["parent_batch_dir"] is None
     assert detached["standalone_conversion"]["status"] == "prepared_for_full_qa"
-    local_usage = Path(
-        detached["token_batch_plans"]["/v1/images/edits"]["usage_path"]
-    )
+    local_usage = Path(detached["token_batch_plans"]["/v1/images/edits"]["usage_path"])
     assert local_usage.is_file()
     assert run.resolve() in local_usage.parents
     provenance = json.loads(
@@ -1240,6 +1365,76 @@ def test_standalone_conversion_archives_parent_evidence_and_requires_full_qa(
     finalized = finalize_standalone_run(run)
     assert finalized["status"] == "verified_standalone"
     assert finalized["evaluated_current_run_records"] == count
+
+
+def test_standalone_conversion_can_preserve_hash_bound_passed_qa(tmp_path):
+    run = create_plan(CONFIG, "validation", "validation-reused-qa", tmp_path, seed=3)
+    state = load_state(run)
+    state.update(
+        {
+            "direct_production": True,
+            "approval_policy": "operator_direct_no_human_review",
+            "edit_round": 1,
+            "parent_batch_dir": str(tmp_path / "parent"),
+            "parent_state_sha256": "state-hash",
+            "parent_plan_sha256": "plan-hash",
+            "parent_qa_sha256": "qa-hash",
+            "parent_approval_sha256": None,
+        }
+    )
+    for item in state["items"].values():
+        item["status"] = "success"
+    for shard in state["shards"]:
+        for attempt in shard["attempts"]:
+            attempt["status"] = "completed"
+    save_state(run, state)
+    plan = read_plan(run, state)
+    qa_rows = []
+    for record in plan.values():
+        image_path = run / "images" / record["filename"]
+        image_path.write_bytes(f"image:{record['custom_id']}".encode())
+        qa_rows.append(
+            {
+                "custom_id": record["custom_id"],
+                "filename": record["filename"],
+                "quality_gate_pass": True,
+                "pan_quality_pass_auto": True,
+                "sha256": sha256_file(image_path),
+            }
+        )
+    write_jsonl(run / "auto_qa.jsonl", qa_rows)
+    write_jsonl(
+        run / "accepted_annotations.jsonl",
+        ({"custom_id": row["custom_id"]} for row in qa_rows),
+    )
+    count = len(qa_rows)
+    reused = count - 2
+    (run / "qa_report.json").write_text(
+        json.dumps(
+            {
+                "total": count,
+                "quality_pass": count,
+                "pan_quality_pass_auto": count,
+                "qa_reuse": {
+                    "compatibility": "matched",
+                    "reused_passed_records": reused,
+                    "evaluated_current_run_records": 2,
+                },
+                "operator_label_promotion": {"total_accepted": count},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    prepare_standalone_run(run)
+    with pytest.raises(PipelineError, match="allow_reused_passed_qa"):
+        finalize_standalone_run(run)
+    finalized = finalize_standalone_run(run, allow_reused_passed_qa=True)
+
+    assert finalized["status"] == "verified_standalone"
+    assert finalized["qa_verification_mode"] == "hash_bound_passed_qa_reuse"
+    assert finalized["reused_passed_records"] == reused
+    assert finalized["evaluated_current_run_records"] == 2
 
 
 def test_pilot_cost_projection_uses_hash_bound_validation_account_cost(tmp_path):

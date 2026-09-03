@@ -59,6 +59,12 @@ MASK_VARIANTS = (
     "a plain light-grey cup-shaped respirator mask without a valve",
 )
 ACCESSORY_VARIANTS = {
+    "eyeglasses": (
+        "realistic thin-framed clear prescription eyeglasses, correctly seated on the nose and ears",
+        "realistic plain dark-framed clear eyeglasses, correctly aligned on the head",
+        "realistic rimless clear prescription eyeglasses with natural transparent lenses",
+        "realistic modest tortoiseshell clear eyeglasses, correctly worn",
+    ),
     "sunglasses": (
         "realistic non-reflective dark sunglasses, correctly seated on the nose and both ears",
         "realistic thin-framed grey sunglasses with clearly tinted lenses, correctly worn",
@@ -68,6 +74,12 @@ ACCESSORY_VARIANTS = {
     "ear_piercing": (
         "a single small silver stud piercing on the ear exposed by this head orientation",
         "a single small gold stud piercing on the ear exposed by this head orientation",
+        "a single small plain silver hoop earring on the ear exposed by this head orientation",
+        "a single small plain gold hoop earring on the ear exposed by this head orientation",
+    ),
+    "earring": (
+        "a single small silver stud earring on the ear exposed by this head orientation",
+        "a single small gold stud earring on the ear exposed by this head orientation",
         "a single small plain silver hoop earring on the ear exposed by this head orientation",
         "a single small plain gold hoop earring on the ear exposed by this head orientation",
     ),
@@ -352,7 +364,9 @@ def load_config(path: Path) -> dict[str, Any]:
         )
     if convention == "yawpose":
         if generation.get("camera_regime") != "yawpose_rear":
-            raise PipelineError("yawpose generation requires camera_regime=yawpose_rear")
+            raise PipelineError(
+                "yawpose generation requires camera_regime=yawpose_rear"
+            )
         zero_share = int(elevation.get("zero_share", 70))
         if not 0 <= zero_share <= 100:
             raise PipelineError("yawpose camera zero_share must be in [0, 100]")
@@ -501,7 +515,9 @@ def _yawpose_camera_schedule(
     minimum = int(elevation["min"])
     maximum = int(elevation["max"])
     if minimum >= 0 or maximum <= 0:
-        raise PipelineError("yawpose camera schedule requires negative and positive angles")
+        raise PipelineError(
+            "yawpose camera schedule requires negative and positive angles"
+        )
     zero_count = round(total * int(elevation.get("zero_share", 70)) / 100)
     nonzero_values = [*range(minimum, 0), *range(1, maximum + 1)]
     schedule = [0] * zero_count + _balanced_discrete_schedule(
@@ -519,9 +535,7 @@ def _yawpose_pitch_schedule(
     outer_count = int(pitch.get("outer_count", 0))
     if not 0 <= outer_count <= total:
         raise PipelineError("yawpose pitch outer_count must be in [0, stage count]")
-    schedule = _balanced_discrete_schedule(
-        inner_values, total - outer_count, rng
-    )
+    schedule = _balanced_discrete_schedule(inner_values, total - outer_count, rng)
     if outer_count:
         outer_min = int(pitch.get("outer_min_abs", 11))
         outer_max = int(pitch.get("outer_max_abs", 25))
@@ -588,12 +602,12 @@ def _yawpose_visible_side(yaw: int) -> tuple[str, str]:
 
 def _yawpose_prompt(record: dict[str, Any]) -> str:
     mask = (
-        f"The subject correctly wears {record['mask_description']} over the nose, mouth, and chin, naturally foreshortened for this profile."
+        f"The subject correctly wears {record['mask_description']} over the nose, mouth, and chin, naturally foreshortened for this orientation. Only the portion physically visible from the requested yaw may appear; the mask silhouette may replace the bare nose or mouth outline, but must not rotate the head or reveal a forbidden facial feature."
         if record.get("mask_description")
         else "The subject wears no face mask."
     )
     accessory = (
-        f"Required additional accessory: {record['accessory_description']}. Keep this accessory clearly visible, physically plausible, and unchanged by the requested head orientation."
+        f"Required additional accessory: {record['accessory_description']}. Keep its naturally visible portion recognizable and physically plausible from the requested yaw. Never rotate the head, expose a forbidden eye, nose, or mouth, mirror the image, or invent transparent anatomy merely to display the accessory."
         if record.get("accessory_description")
         else ""
     )
@@ -614,10 +628,46 @@ def _yawpose_prompt(record: dict[str, Any]) -> str:
     )
 
 
+def _refresh_yawpose_regeneration_prompt(
+    record: dict[str, Any], config: dict[str, Any], edit_round: int
+) -> dict[str, dict[str, str]]:
+    """Replace every non-label scene attribute before a fresh regeneration."""
+    prompt_config = config["prompt"]
+    attribute_options = {
+        "context": prompt_config["contexts"],
+        "background": prompt_config["backgrounds"],
+        "lighting": prompt_config["lighting"],
+        "lens_feel": prompt_config["lens_feels"],
+        "gender": prompt_config["gender_presentations"],
+        "age": prompt_config["ages"],
+        "skin_tone": prompt_config["skin_tones"],
+        "hair": prompt_config["hair"],
+        "clothing": prompt_config["clothing"],
+    }
+    seed_material = (
+        f"{record['custom_id']}|fresh-yawpose-regeneration|{edit_round}"
+    ).encode("utf-8")
+    rng = random.Random(int.from_bytes(hashlib.sha256(seed_material).digest()[:8]))
+    changes: dict[str, dict[str, str]] = {}
+    for field, configured_options in attribute_options.items():
+        previous = str(record[field])
+        alternatives = [
+            str(option) for option in configured_options if str(option) != previous
+        ]
+        if not alternatives:
+            raise PipelineError(
+                f"fresh yawpose regeneration requires an alternative {field} value"
+            )
+        replacement = rng.choice(alternatives)
+        record[field] = replacement
+        changes[field] = {"from": previous, "to": replacement}
+    record["scene"] = record["background"]
+    record["prompt"] = _yawpose_prompt(record)
+    return changes
+
+
 def _yawpose_filename(yaw: int, pitch: int, camera: int, serial: int) -> str:
-    return (
-        f"yawp{yaw:+04d}_pitch{pitch:+03d}_cam{camera:+03d}_{serial:06d}.jpg"
-    )
+    return f"yawp{yaw:+04d}_pitch{pitch:+03d}_cam{camera:+03d}_{serial:06d}.jpg"
 
 
 def _build_yawpose_plan(
@@ -639,8 +689,10 @@ def _build_yawpose_plan(
             stage_config.get("accessory_bin_counts") or {}
         ).items()
     }
-    if accessory_bin_counts and bin_counts is not None and counts != list(
-        map(int, stage_config["bin_counts"])
+    if (
+        accessory_bin_counts
+        and bin_counts is not None
+        and counts != list(map(int, stage_config["bin_counts"]))
     ):
         raise PipelineError(
             "bin_counts overrides are not supported for accessory yawpose stages"
@@ -649,7 +701,9 @@ def _build_yawpose_plan(
     for bin_index, (start, count, mask_count) in enumerate(
         zip(starts, counts, masks, strict=True)
     ):
-        yaw_values = _balanced_discrete_schedule(list(range(start, start + 10)), count, rng)
+        yaw_values = _balanced_discrete_schedule(
+            list(range(start, start + 10)), count, rng
+        )
         augmentation_types: list[str | None] = ["face_mask"] * mask_count
         for accessory_type, values in accessory_bin_counts.items():
             augmentation_types.extend([accessory_type] * values[bin_index])
@@ -671,7 +725,9 @@ def _build_yawpose_plan(
             )
         )
     rng.shuffle(assignments)
-    sizes = _exact_schedule(config["generation"]["size_schedule"], len(assignments), rng)
+    sizes = _exact_schedule(
+        config["generation"]["size_schedule"], len(assignments), rng
+    )
     cameras = _yawpose_camera_schedule(config, len(assignments), rng)
     pitches = _yawpose_pitch_schedule(config, len(assignments), rng)
     prompt = config["prompt"]
@@ -723,13 +779,23 @@ def _build_yawpose_plan(
             "pan_detail": anchor,
             "size": sizes[index],
             "context": prompt["contexts"][attribute_index % len(prompt["contexts"])],
-            "background": prompt["backgrounds"][attribute_index % len(prompt["backgrounds"])],
-            "scene": prompt["backgrounds"][attribute_index % len(prompt["backgrounds"])],
+            "background": prompt["backgrounds"][
+                attribute_index % len(prompt["backgrounds"])
+            ],
+            "scene": prompt["backgrounds"][
+                attribute_index % len(prompt["backgrounds"])
+            ],
             "lighting": prompt["lighting"][attribute_index % len(prompt["lighting"])],
-            "lens_feel": prompt["lens_feels"][attribute_index % len(prompt["lens_feels"])],
-            "gender": prompt["gender_presentations"][attribute_index % len(prompt["gender_presentations"])],
+            "lens_feel": prompt["lens_feels"][
+                attribute_index % len(prompt["lens_feels"])
+            ],
+            "gender": prompt["gender_presentations"][
+                attribute_index % len(prompt["gender_presentations"])
+            ],
             "age": prompt["ages"][attribute_index % len(prompt["ages"])],
-            "skin_tone": prompt["skin_tones"][attribute_index % len(prompt["skin_tones"])],
+            "skin_tone": prompt["skin_tones"][
+                attribute_index % len(prompt["skin_tones"])
+            ],
             "hair": prompt["hair"][attribute_index % len(prompt["hair"])],
             "clothing": prompt["clothing"][attribute_index % len(prompt["clothing"])],
             "headwear": prompt["headwear"][attribute_index % len(prompt["headwear"])],
@@ -1487,18 +1553,24 @@ def seal_collected_prefix(run_dir: Path) -> dict[str, Any]:
             continue
         tail_started = True
         if any(
-            attempt.get("batch_id")
-            or attempt.get("status") != "planned"
+            attempt.get("batch_id") or attempt.get("status") != "planned"
             for attempt in shard["attempts"]
         ):
             raise PipelineError(
                 "scope revision may discard only never-submitted planned shards"
             )
-        if any(state["items"].get(custom_id, {}).get("status") == "success" for custom_id in ids):
-            raise PipelineError("scope revision cannot discard a partially collected shard")
+        if any(
+            state["items"].get(custom_id, {}).get("status") == "success"
+            for custom_id in ids
+        ):
+            raise PipelineError(
+                "scope revision cannot discard a partially collected shard"
+            )
         dropped_shards.append(shard)
     if not kept_shards or not dropped_shards:
-        raise PipelineError("scope revision requires collected prefix and unsubmitted tail")
+        raise PipelineError(
+            "scope revision requires collected prefix and unsubmitted tail"
+        )
 
     archive = run_dir / SUPERSEDED_UNSUBMITTED_DIR
     if archive.exists():
@@ -1511,7 +1583,9 @@ def seal_collected_prefix(run_dir: Path) -> dict[str, Any]:
         for attempt in shard["attempts"]:
             source = run_dir / str(attempt["input_path"])
             if not source.is_file() or sha256_file(source) != attempt["input_sha256"]:
-                raise PipelineError(f"unsubmitted Batch input is missing or changed: {source}")
+                raise PipelineError(
+                    f"unsubmitted Batch input is missing or changed: {source}"
+                )
             target = archive / source.name
             source.replace(target)
             archived_inputs.append(
@@ -1595,7 +1669,9 @@ def prepare_standalone_run(run_dir: Path) -> dict[str, Any]:
     if len(state.get("items") or {}) != int(state["target_count"]) or not all(
         item.get("status") == "success" for item in state["items"].values()
     ):
-        raise PipelineError("standalone preparation requires every image locally collected")
+        raise PipelineError(
+            "standalone preparation requires every image locally collected"
+        )
 
     required = ["auto_qa.jsonl", "qa_report.json", "accepted_annotations.jsonl"]
     for name in required:
@@ -1609,7 +1685,9 @@ def prepare_standalone_run(run_dir: Path) -> dict[str, Any]:
         or report.get("quality_pass") != target_count
         or promotion.get("total_accepted") != target_count
     ):
-        raise PipelineError("standalone preparation requires fully accepted automatic QA")
+        raise PipelineError(
+            "standalone preparation requires fully accepted automatic QA"
+        )
 
     final_dir = run_dir / STANDALONE_PROVENANCE_DIR
     staging_dir = run_dir / f".{STANDALONE_PROVENANCE_DIR}.tmp"
@@ -1714,8 +1792,10 @@ def prepare_standalone_run(run_dir: Path) -> dict[str, Any]:
     }
 
 
-def finalize_standalone_run(run_dir: Path) -> dict[str, Any]:
-    """Verify full non-reused QA and seal a prepared standalone conversion."""
+def finalize_standalone_run(
+    run_dir: Path, *, allow_reused_passed_qa: bool = False
+) -> dict[str, Any]:
+    """Seal a detached run after full QA or verified passed-QA reuse."""
     run_dir = run_dir.resolve()
     state = load_state(run_dir)
     conversion = state.get("standalone_conversion")
@@ -1730,6 +1810,13 @@ def finalize_standalone_run(run_dir: Path) -> dict[str, Any]:
         "provenance_manifest_sha256"
     ):
         raise PipelineError("standalone provenance is unavailable or changed")
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    for backup in provenance.get("backups") or []:
+        snapshot = provenance_path.parent / str(backup["snapshot"])
+        if not snapshot.is_file() or sha256_file(snapshot) != backup.get("sha256"):
+            raise PipelineError(
+                "standalone provenance backup is unavailable or changed"
+            )
     qa_path = run_dir / "auto_qa.jsonl"
     report_path = run_dir / "qa_report.json"
     if not qa_path.is_file() or not report_path.is_file():
@@ -1738,30 +1825,74 @@ def finalize_standalone_run(run_dir: Path) -> dict[str, Any]:
     target_count = int(state["target_count"])
     reuse = report.get("qa_reuse") or {}
     promotion = report.get("operator_label_promotion") or {}
-    if (
-        report.get("total") != target_count
-        or report.get("quality_pass") != target_count
-        or reuse.get("compatibility") != "not_applicable"
-        or reuse.get("reused_passed_records") != 0
-        or reuse.get("evaluated_current_run_records") != target_count
-        or promotion.get("total_accepted") != target_count
-    ):
+    fully_quality_passed = (
+        report.get("total") == target_count
+        and report.get("quality_pass") == target_count
+        and promotion.get("total_accepted") == target_count
+    )
+    full_non_reused = fully_quality_passed and (
+        reuse.get("compatibility") == "not_applicable"
+        and reuse.get("reused_passed_records") == 0
+        and reuse.get("evaluated_current_run_records") == target_count
+    )
+    reused_passed = fully_quality_passed and (
+        report.get("pan_quality_pass_auto") == target_count
+        and reuse.get("compatibility") == "matched"
+        and int(reuse.get("reused_passed_records", -1))
+        + int(reuse.get("evaluated_current_run_records", -1))
+        == target_count
+    )
+    if not full_non_reused and not (allow_reused_passed_qa and reused_passed):
         raise PipelineError(
-            "standalone finalization requires fully accepted, non-reused automatic QA"
+            "standalone finalization requires fully accepted, non-reused automatic QA; "
+            "pass allow_reused_passed_qa only when previously passed records must not be re-evaluated"
         )
-    if (
+    if reused_passed:
+        rows = read_jsonl(qa_path)
+        plan = read_plan(run_dir, state)
+        if len(rows) != target_count or {str(row["custom_id"]) for row in rows} != set(
+            plan
+        ):
+            raise PipelineError("standalone automatic QA rows do not match the plan")
+        for row in rows:
+            if (
+                row.get("quality_gate_pass") is not True
+                or row.get("pan_quality_pass_auto") is not True
+            ):
+                raise PipelineError(
+                    f"standalone QA row is not accepted: {row['custom_id']}"
+                )
+            image_path = run_dir / "images" / str(row["filename"])
+            if not image_path.is_file() or row.get("sha256") != sha256_file(image_path):
+                raise PipelineError(
+                    f"standalone QA-bound image changed: {row['custom_id']}"
+                )
+        accepted_path = run_dir / "accepted_annotations.jsonl"
+        if (
+            not accepted_path.is_file()
+            or sum(1 for line in accepted_path.open(encoding="utf-8") if line.strip())
+            != target_count
+        ):
+            raise PipelineError("standalone accepted annotations are incomplete")
+    elif (
         sum(1 for line in qa_path.open(encoding="utf-8") if line.strip())
         != target_count
     ):
         raise PipelineError("standalone automatic QA row count is incomplete")
+    verification_mode = (
+        "full_non_reused_qa" if full_non_reused else "hash_bound_passed_qa_reuse"
+    )
     conversion.update(
         {
             "status": "verified_standalone",
             "verified_at": utc_now(),
+            "qa_verification_mode": verification_mode,
             "auto_qa_sha256": sha256_file(qa_path),
             "qa_report_sha256": sha256_file(report_path),
-            "evaluated_current_run_records": target_count,
-            "reused_passed_records": 0,
+            "evaluated_current_run_records": int(
+                reuse["evaluated_current_run_records"]
+            ),
+            "reused_passed_records": int(reuse["reused_passed_records"]),
         }
     )
     save_state(run_dir, state)
@@ -1770,9 +1901,8 @@ def finalize_standalone_run(run_dir: Path) -> dict[str, Any]:
         "status": conversion["status"],
         "target_count": target_count,
         "quality_pass": int(report["quality_pass"]),
-        "evaluated_current_run_records": int(
-            reuse["evaluated_current_run_records"]
-        ),
+        "qa_verification_mode": verification_mode,
+        "evaluated_current_run_records": int(reuse["evaluated_current_run_records"]),
         "reused_passed_records": int(reuse["reused_passed_records"]),
         "provenance_manifest": str(provenance_path),
     }
@@ -2413,9 +2543,7 @@ def _regeneration_prompt(
         if record.get("label_convention") == "yawpose":
             labelled_yaw = int(record["yaw_yawpose"]) % 360
             toward_back = wrap180(180.0 - labelled_yaw)
-            rearward_shift = math.copysign(
-                min(25.0, abs(toward_back)), toward_back
-            )
+            rearward_shift = math.copysign(min(25.0, abs(toward_back)), toward_back)
             retry_yaw = int(round((labelled_yaw + rearward_shift) % 360))
             corrections.append(
                 f"For this retry, make the physical head yaw visually {retry_yaw:+d} degrees, "
@@ -2445,7 +2573,9 @@ def _regeneration_prompt(
                     "the turn must remain subtle. Do not render a profile or rear-oblique pose."
                 )
             elif 70.0 <= abs(signed_labelled_yaw) <= 110.0:
-                screen_side = "screen-left" if signed_labelled_yaw > 0 else "screen-right"
+                screen_side = (
+                    "screen-left" if signed_labelled_yaw > 0 else "screen-right"
+                )
                 corrections.append(
                     f"Use an unmistakable strict side profile facing {screen_side}: show no more "
                     "than one eye, keep the nose as a side silhouette, and do not expose the "
@@ -2467,7 +2597,7 @@ def _regeneration_prompt(
                     f"physical head visually at {retry_yaw:+d} degrees for this retry. This "
                     f"internal retry aim is {abs(int(round(retry_shift)))} degrees from the "
                     "label, remains within the allowed 30-degree tolerance, and overrides only "
-                    "the exact rendered-yaw wording in the original prompt; keep the annotation "
+                    "the exact rendered-yaw wording in the newly sampled target; keep the annotation "
                     f"label at {labelled_yaw:+d} degrees and never mirror the requested side."
                 )
             else:
@@ -2499,13 +2629,15 @@ def _regeneration_prompt(
         )
     return " ".join(
         [
-            "Generate a completely new independent image; do not reproduce or edit the failed "
-            "candidate. The following QA corrections are mandatory and override any conflicting "
-            "visual tendency while preserving the requested yaw, pitch, camera, accessory, mask, "
-            "and scene labels.",
+            "Generate a completely new independent image from the newly sampled target below; "
+            "do not reproduce or edit the failed candidate. Do not reuse the failed candidate's "
+            "person, age, skin appearance, hair, clothing, context, background, lighting, camera "
+            "feel, or prompt wording. The following QA corrections are mandatory and override "
+            "any conflicting visual tendency while preserving the requested yaw, pitch, camera, "
+            "accessory, mask, and headwear labels.",
             f"Recorded QA failures: {', '.join(reasons)}.",
             *corrections,
-            "All original target requirements remain binding:",
+            "Use this newly sampled complete target prompt:",
             str(record["prompt"]),
         ]
     )
@@ -2958,8 +3090,6 @@ def create_edit_cycle(
         record["parent_custom_id"] = parent_record["custom_id"]
         records.append(record)
         old_to_new[parent_record["custom_id"]] = record["custom_id"]
-    write_jsonl(run_dir / PLAN_NAME, records)
-
     lineage: list[dict[str, Any]] = []
     items: dict[str, dict[str, Any]] = {}
     requests_by_endpoint: dict[str, list[dict[str, Any]]] = {
@@ -3031,9 +3161,24 @@ def create_edit_cycle(
         else:
             request_record = dict(record)
             if regenerate_quality_failures:
+                parent_prompt = str(record["prompt"])
+                fresh_attribute_changes = (
+                    _refresh_yawpose_regeneration_prompt(record, config, edit_round)
+                    if yawpose
+                    else {}
+                )
+                request_record = dict(record)
                 regeneration_prompt = _regeneration_prompt(record, row, reasons)
                 request_record["prompt"] = regeneration_prompt
                 item["regeneration_prompt"] = regeneration_prompt
+                item["fresh_prompt"] = yawpose
+                item["parent_prompt_sha256"] = hashlib.sha256(
+                    parent_prompt.encode("utf-8")
+                ).hexdigest()
+                item["fresh_base_prompt_sha256"] = hashlib.sha256(
+                    str(record["prompt"]).encode("utf-8")
+                ).hexdigest()
+                item["fresh_attribute_changes"] = fresh_attribute_changes
             request = batch_request(request_record, config["api"])
             operation = (
                 "regenerate_quality_failure"
@@ -3047,6 +3192,7 @@ def create_edit_cycle(
     selected_count = sum(len(requests) for requests in requests_by_endpoint.values())
     if selected_count == 0:
         raise PipelineError("auto QA found no actionable image edit candidates")
+    write_jsonl(run_dir / PLAN_NAME, records)
     write_jsonl(run_dir / "edit_lineage.jsonl", lineage)
 
     direct_production = bool(parent_state.get("direct_production"))

@@ -296,9 +296,20 @@ def standalone_prepare_command(
 @app.command("standalone-finalize")
 def standalone_finalize_command(
     batch_dir: Path = typer.Option(..., exists=True, file_okay=False),
+    allow_reused_passed_qa: bool = typer.Option(
+        False,
+        "--allow-reused-passed-qa",
+        help=(
+            "Seal hash-bound passed QA without re-evaluating images that already passed."
+        ),
+    ),
 ) -> None:
-    """Seal a detached run after full non-reused QA and label promotion."""
-    _print(finalize_standalone_run(batch_dir))
+    """Seal a detached run after QA and label promotion."""
+    _print(
+        finalize_standalone_run(
+            batch_dir, allow_reused_passed_qa=allow_reused_passed_qa
+        )
+    )
 
 
 @app.command("advance-sequential")
