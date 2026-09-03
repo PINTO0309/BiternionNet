@@ -32,6 +32,7 @@ from biternionnet.synthetic.qa import (
     rear_reliability_policy,
     run_auto_qa,
     summarize_landmarks,
+    yawpose_intent_label_source,
 )
 
 CONFIG = (
@@ -42,6 +43,23 @@ YAWPOSE_CONFIG = (
     / "configs"
     / "synthetic_yawpose_rear8000_batch.yaml"
 )
+YAWPOSE_S006_CONFIG = (
+    Path(__file__).resolve().parents[1]
+    / "configs"
+    / "synthetic_yawpose_s006_712_batch.yaml"
+)
+
+
+def test_yawpose_intent_label_source_is_dataset_specific():
+    assert yawpose_intent_label_source(load_config(YAWPOSE_CONFIG)) == "intent_s004"
+    assert (
+        yawpose_intent_label_source(load_config(YAWPOSE_S006_CONFIG)) == "intent_s006"
+    )
+
+    invalid = load_config(YAWPOSE_S006_CONFIG)
+    invalid["generation"]["intent_label_source"] = "s006"
+    with pytest.raises(PipelineError, match="must start with intent_"):
+        yawpose_intent_label_source(invalid)
 
 
 def test_human_integrity_review_is_scoped_to_head_surroundings():

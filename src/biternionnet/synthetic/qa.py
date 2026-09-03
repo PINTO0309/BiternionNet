@@ -77,6 +77,14 @@ DIRECTION_INDEX = {
 }
 
 
+def yawpose_intent_label_source(config: dict[str, Any]) -> str:
+    """Return the dataset-specific provenance label for yawpose intent."""
+    source = str(config["generation"].get("intent_label_source", "intent_s004"))
+    if not source.startswith("intent_"):
+        raise PipelineError("yawpose intent label source must start with intent_")
+    return source
+
+
 def load_qa_policy(path: Path) -> dict[str, Any]:
     with path.open(encoding="utf-8") as stream:
         policy = yaml.safe_load(stream)
@@ -945,9 +953,10 @@ def run_auto_qa(
                 )
             else:
                 row["pose_status"] = "invalid"
-        if row.get("label_convention") == "yawpose" and abs(
-            wrap180(float(row["yaw_yawpose"]))
-        ) <= 95.0:
+        if (
+            row.get("label_convention") == "yawpose"
+            and abs(wrap180(float(row["yaw_yawpose"]))) <= 95.0
+        ):
             yawpose_reason = None
             if row.get("pose_status") != "ok":
                 yawpose_reason = "yawpose_pose_unusable"
@@ -1055,12 +1064,12 @@ def run_auto_qa(
         row["label_acceptance_policy_auto"] = (
             DIRECT_ALL_QUALITY_LABEL_POLICY if direct_production else "strict"
         )
-        yawpose_profile = row.get("label_convention") == "yawpose" and abs(
-            wrap180(float(row["yaw_yawpose"]))
-        ) <= 95.0
+        yawpose_profile = (
+            row.get("label_convention") == "yawpose"
+            and abs(wrap180(float(row["yaw_yawpose"]))) <= 95.0
+        )
         if yawpose_profile or (
-            row.get("label_convention") != "yawpose"
-            and int(row["abs_pan_bin"]) <= 90
+            row.get("label_convention") != "yawpose" and int(row["abs_pan_bin"]) <= 90
         ):
             pose_pan_pass = (
                 row.get("pose_status") == "ok"
@@ -1097,7 +1106,7 @@ def run_auto_qa(
                 "sixdrepnet360_rear_pilot_validated"
                 if use_sixd
                 else (
-                    "intent_s004"
+                    yawpose_intent_label_source(config)
                     if row.get("label_convention") == "yawpose"
                     else "intent_rear"
                 )

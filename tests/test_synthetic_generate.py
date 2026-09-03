@@ -70,6 +70,11 @@ YAWPOSE_S005_CONFIG = (
     / "configs"
     / "synthetic_yawpose_s005_5710_batch.yaml"
 )
+YAWPOSE_S006_CONFIG = (
+    Path(__file__).resolve().parents[1]
+    / "configs"
+    / "synthetic_yawpose_s006_712_batch.yaml"
+)
 
 
 def test_validation_and_pilot_are_deterministic_and_cover_directions():
@@ -755,6 +760,51 @@ def test_yawpose_regeneration_uses_fresh_prompt_and_scene_attributes():
     assert str(record["prompt"]) in wrapped
     assert "Do not reuse the failed candidate's person" in wrapped
     assert "newly sampled complete target prompt" in wrapped
+
+
+def test_yawpose_s006_plan_matches_spec(tmp_path):
+    run = create_plan(
+        YAWPOSE_S006_CONFIG,
+        "yawpose_s006_712",
+        "production-yawpose-s006-v001",
+        tmp_path,
+        seed=20260904,
+        direct_production=True,
+        sequential_batches=True,
+    )
+    state = load_state(run)
+    rows = list(read_plan(run, state).values())
+
+    assert state["target_count"] == 712
+    assert state["sequential_batches"] is True
+    assert state["api_request"]["quality"] == "low"
+    assert [len(shard["custom_ids"]) for shard in state["shards"]] == [500, 212]
+    assert Counter(row["bin"] for row in rows) == {
+        "yaw_100_110": 242,
+        "yaw_110_120": 470,
+    }
+    for start, count in ((100, 242), (110, 470)):
+        integer_counts = Counter(
+            row["yaw_yawpose"]
+            for row in rows
+            if row["bin"] == f"yaw_{start}_{start + 10}"
+        )
+        assert set(integer_counts) == set(range(start, start + 10))
+        assert max(integer_counts.values()) - min(integer_counts.values()) <= 1
+        assert sum(integer_counts.values()) == count
+    assert Counter(row["visible_side"] for row in rows) == {
+        "profile_left": 242,
+        "left_ear": 470,
+    }
+    assert sum(abs(row["pitch"]) > 10 for row in rows) == 142
+    assert Counter(row["size"] for row in rows) == {
+        "1024x1536": 356,
+        "1536x1024": 356,
+    }
+    assert all(not row.get("augmentation_type") for row in rows)
+    assert all(not row.get("accessory_type") for row in rows)
+    assert all("The subject wears no face mask" in row["prompt"] for row in rows)
+    assert all(row["anchor"] in row["prompt"] for row in rows)
 
 
 def test_seal_collected_prefix_archives_only_never_submitted_tail(tmp_path):
